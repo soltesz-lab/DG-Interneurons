@@ -141,24 +141,24 @@ class PerConnectionSynapticParams:
     # Connection-type specific modulation factors
     connection_modulation: Dict[str, float] = field(default_factory=lambda: {
         # Excitatory connections
-        'mec_gc': 1.381,      # Strong perforant path
-        'mec_pv': 0.5,      # Perforant path to PV
-        'mc_gc': 4.549,       # Strong associational
-        'mc_mc': 0.537,       # Moderate recurrent
-        'gc_mc': 0.623,        # Strong mossy fiber collaterals
-        'gc_pv': 1.767,       # Moderate excitation to PV
-        'gc_sst': 1.366,      # Weaker excitation to SST
-        'mc_pv': 2.119,       # Strong excitation to PV
-        'mc_sst': 0.382,      # Standard excitation to SST
+        'mec_gc': 1.361,      # Strong perforant path
+        'mec_pv': 0.1,        # Perforant path to PV
+        'gc_mc': 1.826,       # Strong mossy fiber collaterals
+        'gc_pv': 0.1,         # Weak excitation to PV
+        'gc_sst': 1.468,      # Strong excitation to SST
+        'mc_gc': 1.41 ,       # Moderate associational
+        'mc_mc': 4.825,       # Strong recurrent
+        'mc_pv': 6.0,         # Very strong excitation to PV
+        'mc_sst': 2.0,        # Strong excitation to SST
         
         # Inhibitory connections  
-        'pv_gc': 0.928,       # Strong perisomatic inhibition
-        'pv_mc': 1.574,       # Moderate inhibition of MC
-        'pv_pv': 1.216,       # Very strong PV lateral inhibition
-        'sst_gc': 0.626,      # Moderate dendritic inhibition
-        'sst_mc': 0.463,      # Weak inhibition of MC
-        'sst_pv': 1.204,      # Strong disinhibition
-        'sst_sst': 2.647     # SST lateral inhibition
+        'pv_gc': 3.662,       # Strong perisomatic inhibition
+        'pv_mc': 4.127,       # Strong inhibition of MC
+        'pv_pv': 1.875,       # Moderate PV lateral inhibition
+        'sst_gc': 1.22,       # Moderate dendritic inhibition
+        'sst_mc': 1.065,      # Moderate inhibition of MC
+        'sst_pv': 1.51,       # Moderate disinhibition
+        'sst_sst': 4.369      # SST lateral inhibition
     })
     
     # Reversal potentials (mV)
@@ -194,12 +194,12 @@ class ConductanceMatrix:
         self.conductances = self.conductances * self.connectivity
 
 def generate_conductance_distribution(n_connections: int, 
-                                    mean_conductance: float,
-                                    std_conductance: float,
-                                    min_conductance: float,
-                                    max_conductance: float,
-                                    distribution: str = 'lognormal',
-                                    connection_modulation: float = 1.0) -> torch.Tensor:
+                                      mean_conductance: float,
+                                      std_conductance: float,
+                                      min_conductance: float,
+                                      max_conductance: float,
+                                      distribution: str = 'lognormal',
+                                      connection_modulation: float = 1.0) -> torch.Tensor:
     """
     Generate heterogeneous conductance values for connections
     
