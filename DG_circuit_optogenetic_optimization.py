@@ -6,12 +6,14 @@ Adds optogenetic stimulation objectives to the circuit optimization,
 targeting the paradoxical excitation effects observed by Hainmueller et al.
 """
 import sys
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 import torch
 import numpy as np
 from functools import partial
 import tqdm
+import json
+from datetime import datetime
 
 # Import existing optimization components
 from DG_circuit_optimization import (
@@ -88,7 +90,7 @@ def calculate_gini_coefficient(values: np.ndarray) -> float:
 def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation,
                                      target_pop: str, light_intensity: float,
                                      mec_current: float = 80.0,
-                                     opsin_current: float = 100.0) -> Dict:
+                                     opsin_current: float = 200.0) -> Dict:
     """
     Run optogenetic stimulation experiment on circuit
     
@@ -532,12 +534,13 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
             'n_iterations': result.nit,
             'success': result.success,
             'history': history,
-            'method': 'differential_evolution'
+            'method': 'differential_evolution',
+            'targets': targets
         }
     
     elif method == 'particle_swarm':
         # Use Particle Swarm Optimization
-        n_particles = 20
+        n_particles = 10
         n_dimensions = len(connection_names)
         max_iterations = optimization_config.max_iterations
         
@@ -615,23 +618,12 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
             'best_loss': global_best_score,
             'n_evaluations': max_iterations * n_particles,
             'history': history,
-            'method': 'particle_swarm'
+            'method': 'particle_swarm',
+            'targets': targets
         }
     
     else:
         raise ValueError(f"Unknown method: {method}")
-
-
-#!/usr/bin/env python3
-"""
-Save extended optimization results including optogenetic objectives
-"""
-
-import json
-from datetime import datetime
-from typing import Dict, List, Optional
-import torch
-import numpy as np
 
 
 def evaluate_best_parameters(circuit_factory_data, 
@@ -735,8 +727,48 @@ def evaluate_best_parameters(circuit_factory_data,
     return results
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder for numpy/torch types"""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy().tolist()
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        return super().default(obj)
+
+
+def convert_to_native_types(obj: Any) -> Any:
+    """
+    Recursively convert numpy/torch types to native Python types
+    
+    This ensures JSON serialization works correctly
+    """
+    if isinstance(obj, dict):
+        return {key: convert_to_native_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_native_types(item) for item in obj]
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().numpy().tolist()
+    elif isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    else:
+        return obj
+
+
 def save_optimization_results_to_json(results: Dict,
-                                      targets: ExtendedOptimizationTargets,
+                                      targets: CombinedOptimizationTargets,
                                       circuit_factory_data: tuple,
                                       filename: str,
                                       mec_drive_levels: List[float] = [80.0, 150.0, 200.0]):
@@ -745,7 +777,7 @@ def save_optimization_results_to_json(results: Dict,
     
     Args:
         results: Output from run_extended_global_optimization
-        targets: ExtendedOptimizationTargets used in optimization
+        targets: CombinedOptimizationTargets used in optimization
         circuit_factory_data: Tuple of (circuit_params, base_params_dict, opsin_params)
         filename: Output JSON filename
         mec_drive_levels: MEC drive levels to test
@@ -830,7 +862,9 @@ def save_optimization_results_to_json(results: Dict,
     output_data['performance_summary'] = create_performance_summary(
         performance_data, targets, mec_drive_levels
     )
-    
+
+    output_data = convert_to_native_types(output_data)
+
     # Save to file
     with open(filename, 'w') as f:
         json.dump(output_data, f, indent=2)
@@ -844,7 +878,7 @@ def save_optimization_results_to_json(results: Dict,
 
 
 def create_performance_summary(performance_data: Dict,
-                               targets: ExtendedOptimizationTargets,
+                               targets: CombinedOptimizationTargets,
                                mec_drive_levels: List[float]) -> Dict:
     """Create human-readable performance summary"""
     
@@ -1029,7 +1063,7 @@ if __name__ == "__main__":
     
     save_optimization_results_to_json(
         results,
-        targets,
+        results['targets'],
         circuit_factory_data,
         'DG_optogenetic_optimization_results.json',
         mec_drive_levels=[80.0, 150.0, 200.0]
