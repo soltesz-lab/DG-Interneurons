@@ -1700,7 +1700,7 @@ def create_default_config() -> OptimizationConfig:
     return OptimizationConfig(
         learning_rate=0.1,
         max_iterations=300,
-        mec_drive_levels=[200.0],
+        mec_drive_levels=[40.0],
         n_trials=2,  # Reduce for faster iteration
         simulation_duration=600,
         warmup_duration=100,

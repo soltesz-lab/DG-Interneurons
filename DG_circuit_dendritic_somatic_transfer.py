@@ -313,7 +313,7 @@ class OpsinParams:
     """Opsin expression and light activation parameters"""
     expression_mean: float = 0.8
     expression_std: float = 0.2
-    failure_rate: float = 0.5
+    failure_rate: float = 0.4
     light_decay: float = 0.3          # mm^-1
     hill_coeff: float = 2.5
     half_sat: float = 0.4

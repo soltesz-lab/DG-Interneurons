@@ -191,7 +191,8 @@ class OptogeneticExperiment:
                              light_intensity: float,
                              duration: float = 1550.0,
                              stim_start: float = 550.0,
-                             mec_current: float = 80.0, # MEC drive current in pA
+                             mec_current: float = 100.0, # MEC drive current in pA
+                             opsin_current: float = 100.0,
                              include_dentate_spikes: bool = False,
                              ds_times: Optional[List[float]] = None,
                              plot_activity: bool = False) -> Dict:
@@ -241,7 +242,7 @@ class OptogeneticExperiment:
             direct_activation = {}
             if t >= stim_start_step:
                 # Convert to strong current injection
-                direct_activation[target_population] = activation_prob * 200.0
+                direct_activation[target_population] = activation_prob * opsin_current
                 
             # Calculate MEC external drive (dentate spikes + baseline)
             external_drive = {}
@@ -643,7 +644,11 @@ def analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
     
     return analysis
 
-def run_comparative_experiment(optimization_json_file=None, intensities = [0.5, 1.0, 2.0], plot_activity=True):
+def run_comparative_experiment(optimization_json_file=None,
+                               intensities = [0.5, 1.0, 2.0],
+                               mec_current = 100.0,
+                               opsin_current = 100.0,
+                               plot_activity=True):
     """Compare PV vs SST stimulation with anatomical connectivity"""
     circuit_params = CircuitParams()
     opsin_params = OpsinParams()
@@ -689,7 +694,9 @@ def run_comparative_experiment(optimization_json_file=None, intensities = [0.5, 
             print(f"  Intensity: {intensity}")
             result = experiment.simulate_stimulation(target, intensity, stim_start=stim_start,
                                                      duration = stim_start + 1000.0,
-                                                     plot_activity=plot_activity)
+                                                     plot_activity=plot_activity,
+                                                     mec_current = mec_current,
+                                                     opsin_current = opsin_current)
             
             # Analyze network effects
             time = result['time']
@@ -1172,7 +1179,8 @@ def enhanced_protocol():
                   f"(CV={stats['cv_conductance']:.2f}, n={stats['n_connections']})")
     
     # Run comparative experiment
-    results, connectivity_analysis, conductance_analysis = run_comparative_experiment()
+    results, connectivity_analysis, conductance_analysis = run_comparative_experiment(mec_current = 40.0,
+                                                                                      opsin_current = 100.0)
     
     print("\n" + "="*60)
     print("EXPERIMENTAL RESULTS")
@@ -1228,7 +1236,9 @@ if __name__ == "__main__":
         optimization_json_file=None
         
     # Run comparative experiment
-    results, connectivity_analysis, conductance_analysis = run_comparative_experiment(optimization_json_file=optimization_json_file)
+    results, connectivity_analysis, conductance_analysis = run_comparative_experiment(optimization_json_file=optimization_json_file,
+                                                                                      mec_current=40.0,
+                                                                                      opsin_current=200.0)
 
 
     mec_conn = connectivity_analysis['mec_connectivity']

@@ -87,7 +87,8 @@ def calculate_gini_coefficient(values: np.ndarray) -> float:
 
 def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation,
                                      target_pop: str, light_intensity: float,
-                                     mec_current: float = 80.0) -> Dict:
+                                     mec_current: float = 80.0,
+                                     opsin_current: float = 100.0) -> Dict:
     """
     Run optogenetic stimulation experiment on circuit
     
@@ -145,7 +146,7 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
         # Optogenetic activation
         direct_activation = {}
         if t >= stim_start_step:
-            direct_activation[target_pop] = activation_prob * 200.0
+            direct_activation[target_pop] = activation_prob * opsin_current
         
         # MEC drive
         external_drive = {'mec': torch.ones(circuit_params.n_mec, device=device) * mec_current}
@@ -621,6 +622,363 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
         raise ValueError(f"Unknown method: {method}")
 
 
+#!/usr/bin/env python3
+"""
+Save extended optimization results including optogenetic objectives
+"""
+
+import json
+from datetime import datetime
+from typing import Dict, List, Optional
+import torch
+import numpy as np
+
+
+def evaluate_best_parameters(circuit_factory_data, 
+                             connection_modulation: Dict[str, float],
+                             mec_drive_levels: List[float] = [80.0, 150.0, 200.0],
+                             activity_threshold: float = 1.0) -> Dict:
+    """
+    Evaluation of optimized parameters
+    
+    Returns baseline performance and optogenetic effects for all MEC drives
+    """
+    from DG_circuit_dendritic_somatic_transfer import (
+        DentateCircuit, PerConnectionSynapticParams
+    )
+    
+    # Unpack circuit factory data
+    circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
+    
+    # Create synaptic parameters with optimized connection modulation
+    synaptic_params = PerConnectionSynapticParams(
+        ampa_g_mean=base_synaptic_params_dict['ampa_g_mean'],
+        ampa_g_std=base_synaptic_params_dict['ampa_g_std'],
+        gaba_g_mean=base_synaptic_params_dict['gaba_g_mean'],
+        gaba_g_std=base_synaptic_params_dict['gaba_g_std'],
+        distribution=base_synaptic_params_dict['distribution'],
+        connection_modulation=connection_modulation
+    )
+    
+    results = {}
+    
+    for mec_drive in mec_drive_levels:
+        drive_results = {
+            'baseline': {},
+            'pv_stimulation': {},
+            'sst_stimulation': {}
+        }
+        
+        # === BASELINE PERFORMANCE ===
+        circuit = DentateCircuit(circuit_params, synaptic_params, opsin_params)
+        circuit.reset_state()
+        
+        device = torch.device('cpu')
+        simulation_duration = 600
+        warmup_duration = 150
+        
+        mec_input = torch.ones(circuit_params.n_mec, device=device) * mec_drive
+        activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+        
+        for t in range(simulation_duration):
+            external_drive = {'mec': mec_input}
+            activities = circuit({}, external_drive)
+            
+            if t >= warmup_duration:
+                for pop in activities_over_time:
+                    if pop in activities:
+                        activities_over_time[pop].append(activities[pop].clone().cpu())
+        
+        # Calculate baseline metrics
+        for pop in activities_over_time:
+            if len(activities_over_time[pop]) > 0:
+                pop_time_series = torch.stack(activities_over_time[pop])
+                mean_rates = torch.mean(pop_time_series, dim=0)
+                
+                actual_rate = torch.mean(mean_rates).item()
+                sparsity = (torch.sum(mean_rates > activity_threshold) / len(mean_rates)).item()
+                
+                drive_results['baseline'][pop] = {
+                    'mean_rate': actual_rate,
+                    'std_rate': torch.std(mean_rates).item(),
+                    'max_rate': torch.max(mean_rates).item(),
+                    'min_rate': torch.min(mean_rates).item(),
+                    'sparsity': sparsity
+                }
+        
+        # === OPTOGENETIC STIMULATION EFFECTS ===
+        for target_pop in ['pv', 'sst']:
+            opto_results = simulate_optogenetic_stimulation(
+                circuit_factory_data,
+                connection_modulation,
+                target_pop,
+                light_intensity=1.0,
+                mec_current=mec_drive
+            )
+            
+            # Store comprehensive optogenetic results
+            drive_results[f'{target_pop}_stimulation'] = {
+                pop: {
+                    'baseline_mean': data['baseline_mean'],
+                    'stim_mean': data['stim_mean'],
+                    'mean_change': data['mean_change'],
+                    'activated_fraction': data['activated_fraction'],
+                    'baseline_gini': data['baseline_gini'],
+                    'stim_gini': data['stim_gini'],
+                    'gini_change': data['gini_change']
+                }
+                for pop, data in opto_results.items()
+            }
+        
+        results[f'mec_{mec_drive}'] = drive_results
+    
+    return results
+
+
+def save_optimization_results_to_json(results: Dict,
+                                      targets: ExtendedOptimizationTargets,
+                                      circuit_factory_data: tuple,
+                                      filename: str,
+                                      mec_drive_levels: List[float] = [80.0, 150.0, 200.0]):
+    """
+    Save comprehensive optimization results to JSON
+    
+    Args:
+        results: Output from run_extended_global_optimization
+        targets: ExtendedOptimizationTargets used in optimization
+        circuit_factory_data: Tuple of (circuit_params, base_params_dict, opsin_params)
+        filename: Output JSON filename
+        mec_drive_levels: MEC drive levels to test
+    """
+    
+    circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
+    
+    print("Evaluating optimized parameters across conditions...")
+    performance_data = evaluate_best_parameters(
+        circuit_factory_data,
+        results['optimized_connection_modulation'],
+        mec_drive_levels,
+        targets.activity_threshold
+    )
+    
+    output_data = {
+        'optimization_info': {
+            'timestamp': datetime.now().isoformat(),
+            'method': results.get('method', 'unknown'),
+            'best_loss': float(results['best_loss']),
+            'n_evaluations': results.get('n_evaluations', 0),
+            'n_iterations': results.get('n_iterations', 0),
+            'success': results.get('success', True),
+        },
+        
+        'optimization_weights': {
+            'baseline_weight': targets.baseline_weight,
+            'optogenetic_weight': targets.optogenetic_weight,
+        },
+        
+        'baseline_targets': {
+            'firing_rates': targets.target_rates,
+            'rate_tolerances': targets.rate_tolerance,
+            'sparsity_targets': targets.sparsity_targets,
+            'activity_threshold': targets.activity_threshold,
+            'rate_ordering_constraints': [
+                {
+                    'constraint': f'{pop1} >= {pop2} + {margin}',
+                    'pop1': pop1,
+                    'pop2': pop2,
+                    'margin': margin
+                }
+                for pop1, pop2, margin in targets.rate_ordering_constraints
+            ]
+        },
+        
+        'optogenetic_targets': {
+            'target_rate_increases': targets.optogenetic_targets.target_rate_increases,
+            'target_gini_increases': targets.optogenetic_targets.target_gini_increase,
+            'stimulation_intensity': targets.optogenetic_targets.stimulation_intensity,
+            'activation_threshold': targets.optogenetic_targets.activation_threshold,
+        },
+        
+        'optimized_parameters': {
+            'connection_modulation': results['optimized_connection_modulation'],
+            'base_conductances': {
+                'ampa_g_mean': base_synaptic_params_dict['ampa_g_mean'],
+                'ampa_g_std': base_synaptic_params_dict['ampa_g_std'],
+                'gaba_g_mean': base_synaptic_params_dict['gaba_g_mean'],
+                'gaba_g_std': base_synaptic_params_dict['gaba_g_std'],
+                'distribution': base_synaptic_params_dict['distribution'],
+            }
+        },
+        
+        'circuit_config': {
+            'n_gc': circuit_params.n_gc,
+            'n_mc': circuit_params.n_mc,
+            'n_pv': circuit_params.n_pv,
+            'n_sst': circuit_params.n_sst,
+            'n_mec': circuit_params.n_mec,
+        },
+        
+        'performance': performance_data,
+        
+        'optimization_history': {
+            'n_evaluations': len(results['history']['loss']),
+            'loss_trajectory': results['history']['loss'][-100:],  # Last 100 points
+            'best_loss_found_at': int(np.argmin(results['history']['loss'])),
+        }
+    }
+    
+    output_data['performance_summary'] = create_performance_summary(
+        performance_data, targets, mec_drive_levels
+    )
+    
+    # Save to file
+    with open(filename, 'w') as f:
+        json.dump(output_data, f, indent=2)
+    
+    print(f"\nOptimization results saved to {filename}")
+    
+    # Print summary
+    print_results_summary(output_data)
+    
+    return output_data
+
+
+def create_performance_summary(performance_data: Dict,
+                               targets: ExtendedOptimizationTargets,
+                               mec_drive_levels: List[float]) -> Dict:
+    """Create human-readable performance summary"""
+    
+    summary = {}
+    
+    # Use middle MEC drive level for summary
+    middle_drive = mec_drive_levels[len(mec_drive_levels) // 2]
+    drive_key = f'mec_{middle_drive}'
+    
+    if drive_key in performance_data:
+        data = performance_data[drive_key]
+        
+        # Baseline performance
+        summary['baseline'] = {}
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            if pop in data['baseline']:
+                target_rate = targets.target_rates.get(pop, None)
+                actual_rate = data['baseline'][pop]['mean_rate']
+                
+                if target_rate is not None:
+                    error_pct = ((actual_rate - target_rate) / target_rate * 100) if target_rate > 0 else 0
+                else:
+                    error_pct = None
+                
+                summary['baseline'][pop] = {
+                    'target_rate': target_rate,
+                    'actual_rate': actual_rate,
+                    'error_percent': error_pct,
+                    'sparsity': data['baseline'][pop]['sparsity'],
+                    'target_sparsity': targets.sparsity_targets.get(pop, None)
+                }
+        
+        # Optogenetic effects
+        summary['optogenetic_effects'] = {}
+        
+        for stim_target in ['pv', 'sst']:
+            stim_key = f'{stim_target}_stimulation'
+            summary['optogenetic_effects'][stim_target] = {}
+            
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop != stim_target and pop in data[stim_key]:
+                    pop_data = data[stim_key][pop]
+                    
+                    # Get targets
+                    target_increase = None
+                    target_gini = None
+                    if stim_target in targets.optogenetic_targets.target_rate_increases:
+                        target_increase = targets.optogenetic_targets.target_rate_increases[stim_target].get(pop)
+                    if stim_target in targets.optogenetic_targets.target_gini_increase:
+                        target_gini = targets.optogenetic_targets.target_gini_increase[stim_target].get(pop)
+                    
+                    summary['optogenetic_effects'][stim_target][pop] = {
+                        'activated_fraction': pop_data['activated_fraction'],
+                        'target_activated_fraction': target_increase,
+                        'mean_rate_change': pop_data['mean_change'],
+                        'gini_change': pop_data['gini_change'],
+                        'target_gini_change': target_gini,
+                        'baseline_rate': pop_data['baseline_mean'],
+                        'stim_rate': pop_data['stim_mean']
+                    }
+    
+    return summary
+
+
+def print_results_summary(output_data: Dict):
+    """Print human-readable summary of results"""
+    
+    # Optimization info
+    info = output_data['optimization_info']
+    print(f"\nOptimization Method: {info['method']}")
+    print(f"Best Loss: {info['best_loss']:.6f}")
+    print(f"Total Evaluations: {info['n_evaluations']}")
+    
+    # Weights
+    weights = output_data['optimization_weights']
+    print(f"\nObjective Weights:")
+    print(f"  Baseline: {weights['baseline_weight']:.1%}")
+    print(f"  Optogenetic: {weights['optogenetic_weight']:.1%}")
+    
+    # Performance summary
+    if 'performance_summary' in output_data:
+        summary = output_data['performance_summary']
+        
+        print(f"\n{'='*70}")
+        print("BASELINE PERFORMANCE")
+        print("=" * 70)
+        print(f"{'Population':<12} {'Target':<10} {'Actual':<10} {'Error':<10} {'Sparsity'}")
+        print("-" * 70)
+        
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            if pop in summary['baseline']:
+                data = summary['baseline'][pop]
+                target = data['target_rate']
+                actual = data['actual_rate']
+                error = data['error_percent']
+                sparsity = data['sparsity']
+                target_sparsity = data['target_sparsity']
+                
+                if target is not None and error is not None:
+                    print(f"{pop.upper():<12} {target:<10.2f} {actual:<10.2f} {error:>+8.1f}% "
+                          f"{sparsity:.3f}/{target_sparsity:.3f}")
+                else:
+                    print(f"{pop.upper():<12} {'N/A':<10} {actual:<10.2f} {'N/A':<10} {sparsity:.3f}")
+        
+        print(f"\n{'='*70}")
+        print("OPTOGENETIC EFFECTS")
+        print("=" * 70)
+        
+        for stim_target in ['pv', 'sst']:
+            print(f"\n{stim_target.upper()} Stimulation:")
+            print("-" * 70)
+            print(f"{'Pop':<8} {'Activated':<12} {'Target':<12} {'Gini Δ':<12} {'Target Δ':<12} {'Rate Δ'}")
+            print("-" * 70)
+            
+            if stim_target in summary['optogenetic_effects']:
+                effects = summary['optogenetic_effects'][stim_target]
+                
+                for pop in ['gc', 'mc', 'pv', 'sst']:
+                    if pop in effects:
+                        data = effects[pop]
+                        activated = data['activated_fraction']
+                        target_act = data['target_activated_fraction']
+                        gini = data['gini_change']
+                        target_gini = data['target_gini_change']
+                        rate_change = data['mean_rate_change']
+                        
+                        target_act_str = f"{target_act:.2%}" if target_act is not None else "N/A"
+                        target_gini_str = f"{target_gini:+.3f}" if target_gini is not None else "N/A"
+                        
+                        print(f"{pop.upper():<8} {activated:<11.2%} {target_act_str:<12} "
+                              f"{gini:>+11.3f} {target_gini_str:<12} {rate_change:>+7.2f}")
+    
+
+
 if __name__ == "__main__":
     from DG_circuit_optimization import create_default_global_opt_config
     
@@ -629,7 +987,28 @@ if __name__ == "__main__":
     
     # Create configuration
     config = create_default_global_opt_config()
+
+    from DG_circuit_dendritic_somatic_transfer import (
+        CircuitParams, PerConnectionSynapticParams, OpsinParams
+    )
+
+    circuit_params = CircuitParams()
+    base_synaptic_params = PerConnectionSynapticParams()
+    opsin_params = OpsinParams()
     
+    # Circuit factory data
+    circuit_factory_data = (
+        circuit_params,
+        {
+            'ampa_g_mean': base_synaptic_params.ampa_g_mean,
+            'ampa_g_std': base_synaptic_params.ampa_g_std,
+            'gaba_g_mean': base_synaptic_params.gaba_g_mean,
+            'gaba_g_std': base_synaptic_params.gaba_g_std,
+            'distribution': base_synaptic_params.distribution,
+        },
+        opsin_params
+    )
+
     # Run optimization
     results = run_global_optimization(
         config,
@@ -647,3 +1026,11 @@ if __name__ == "__main__":
     print("\nOptimized connection modulation:")
     for conn, value in sorted(results['optimized_connection_modulation'].items()):
         print(f"  {conn}: {value:.3f}")
+    
+    save_optimization_results_to_json(
+        results,
+        targets,
+        circuit_factory_data,
+        'DG_optogenetic_optimization_results.json',
+        mec_drive_levels=[80.0, 150.0, 200.0]
+    )
