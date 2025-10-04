@@ -1245,7 +1245,7 @@ class OptogeneticOptimizationAnalyzer(OptimizationAnalyzer):
         
         plt.tight_layout()
         if save_fig:
-            plt.savefig('optogenetic_validation.png', dpi=300, bbox_inches='tight')
+            plt.savefig('optogenetic_optimization_validation.png', dpi=300, bbox_inches='tight')
         plt.show()
     
     def compare_baseline_vs_combined_optimization(self, 

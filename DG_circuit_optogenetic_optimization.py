@@ -990,7 +990,7 @@ def print_results_summary(output_data: Dict):
         for stim_target in ['pv', 'sst']:
             print(f"\n{stim_target.upper()} Stimulation:")
             print("-" * 70)
-            print(f"{'Pop':<8} {'Activated':<12} {'Target':<12} {'Gini Δ':<12} {'Target Δ':<12} {'Rate Δ'}")
+            print(f"{'Pop':<8} {'Activated':<12} {'Target':<12} {'Gini change':<12} {'Target change':<12} {'Rate change'}")
             print("-" * 70)
             
             if stim_target in summary['optogenetic_effects']:

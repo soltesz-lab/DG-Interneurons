@@ -444,7 +444,7 @@ def analyze_conductance_patterns(experiment: OptogeneticExperiment) -> Dict:
     return analysis
 
 
-def enhanced_analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
+def analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
     """Analyze how MEC -> PV (but not SST) asymmetry affects circuit dynamics"""
     
     # Reset circuit state
@@ -774,11 +774,13 @@ def get_opsin_expression_mask(target_pop: str,
     
     return expressing_mask
 
+
 def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                                         stimulation_level: float = 1.0,
                                         save_path: Optional[str] = None) -> None:
     """
     Create visualizations from comparative experiment results.
+    NOTE: This shows results from a single trial
     
     Args:
         results: Results from run_comparative_experiment()
@@ -794,50 +796,51 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         'mc': '#FFEAA7',   # Yellow
     }
     
-    # Create comprehensive figure
+    # Create summary figure
     fig = plt.figure(figsize=(16, 12))
     
-    # Panel A: Firing ratio violin plots
+    # Panel A: Firing ratio bar plots
     ax1 = plt.subplot(3, 4, (1, 2))
     
     targets = ['pv', 'sst']
     populations = ['gc', 'mc', 'pv', 'sst']
     
-    violin_data = []
-    violin_labels = []
-    violin_colors = []
+    bar_data = []
+    bar_labels = []
+    bar_colors = []
     
     for target in targets:
         for pop in populations:
-            if pop != target and f'{pop}_mean_change' in results[target][1.0]:
-                # Simulate firing ratio data based on mean changes
-                mean_change = results[target][1.0][f'{pop}_mean_change']
-                baseline_rate = results[target][1.0][f'{pop}_mean_baseline_rate']
-                stim_rate = results[target][1.0][f'{pop}_mean_stim_rate']
+            if pop != target and f'{pop}_mean_change' in results[target][stimulation_level]:
+                baseline_rate = results[target][stimulation_level][f'{pop}_mean_baseline_rate']
+                stim_rate = results[target][stimulation_level][f'{pop}_mean_stim_rate']
                 
-                # Create synthetic ratio distribution
+                # Calculate modulation ratio
                 if baseline_rate > 0:
                     ratio = np.log2(stim_rate / baseline_rate)
-                    # Add some noise to create distribution
-                    ratio_dist = np.random.normal(ratio, 0.3, 50)
-                    violin_data.append(ratio_dist)
-                    violin_labels.append(f'{target.upper()}-{pop.upper()}')
-                    violin_colors.append(colors[pop])
+                    bar_data.append(ratio)
+                    bar_labels.append(f'{target.upper()}→{pop.upper()}')
+                    bar_colors.append(colors[pop])
     
-    if violin_data:
-        parts = ax1.violinplot(violin_data, positions=range(len(violin_labels)), 
-                              showmeans=True, showextrema=True)
+    if bar_data:
+        x_pos = np.arange(len(bar_labels))
+        bars = ax1.bar(x_pos, bar_data, color=bar_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
         
-        for i, pc in enumerate(parts['bodies']):
-            pc.set_facecolor(violin_colors[i])
-            pc.set_alpha(0.7)
+        # Add value labels on bars
+        for i, (bar, value) in enumerate(zip(bars, bar_data)):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{value:.2f}', ha='center', 
+                    va='bottom' if height > 0 else 'top',
+                    fontsize=9, fontweight='bold')
     
-    ax1.set_xticks(range(len(violin_labels)))
-    ax1.set_xticklabels(violin_labels, rotation=45, ha='right')
-    ax1.set_ylabel('Modulation Ratio (log₂)')
-    ax1.set_title('Firing Rate Modulation')
-    ax1.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(bar_labels, rotation=45, ha='right', fontsize=10)
+    ax1.set_ylabel(r'Modulation Ratio ($\log_2$)', fontsize=11)
+    ax1.set_title('Firing Rate Modulation (Single Trial)', fontsize=12, fontweight='bold')
+    ax1.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=2)
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.set_axisbelow(True)
     
     # Panel B: Network effects summary
     ax2 = plt.subplot(3, 4, (3, 4))
@@ -849,9 +852,9 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         for pop in populations:
             if pop != target:
                 excited_key = f'{pop}_excited'
-                if excited_key in results[target][1.0]:
-                    excited_frac = results[target][1.0][excited_key]
-                    inhibited_frac = results[target][1.0][f'{pop}_inhibited']
+                if excited_key in results[target][stimulation_level]:
+                    excited_frac = results[target][stimulation_level][excited_key]
+                    inhibited_frac = results[target][stimulation_level][f'{pop}_inhibited']
                     
                     effect_data.append([excited_frac, inhibited_frac])
                     effect_labels.append(f'{target.upper()}→{pop.upper()}')
@@ -859,18 +862,28 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     if effect_data:
         effect_array = np.array(effect_data)
         x_pos = np.arange(len(effect_labels))
+        width = 0.35
         
-        ax2.bar(x_pos - 0.2, effect_array[:, 0], 0.4, 
-               label='Excited', color='red', alpha=0.7)
-        ax2.bar(x_pos + 0.2, effect_array[:, 1], 0.4, 
-               label='Inhibited', color='blue', alpha=0.7)
+        bars1 = ax2.bar(x_pos - width/2, effect_array[:, 0], width, 
+               label='Excited', color='red', alpha=0.7, edgecolor='black')
+        bars2 = ax2.bar(x_pos + width/2, effect_array[:, 1], width, 
+               label='Inhibited', color='blue', alpha=0.7, edgecolor='black')
+        
+        # Add value labels
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}', ha='center', va='bottom',
+                        fontsize=8)
         
         ax2.set_xticks(x_pos)
-        ax2.set_xticklabels(effect_labels, rotation=45, ha='right')
-        ax2.set_ylabel('Fraction of Cells')
-        ax2.set_title('Network Effects')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
+        ax2.set_xticklabels(effect_labels, rotation=45, ha='right', fontsize=10)
+        ax2.set_ylabel('Fraction of Cells', fontsize=11)
+        ax2.set_title('Network Effects (Single Trial)', fontsize=12, fontweight='bold')
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3, axis='y')
+        ax2.set_axisbelow(True)
     
     # Panel C: Connectivity analysis
     ax3 = plt.subplot(3, 4, (5, 6))
@@ -881,13 +894,14 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         mec_conn['mec_to_gc'], 
         mec_conn['mec_to_sst']
     ]
-    conn_labels = ['MEC→PV', 'MEC→GC', 'MEC→SST']
+    conn_labels = ['MEC -> PV', 'MEC -> GC', 'MEC -> SST']
     conn_colors = [colors['pv'], colors['gc'], colors['sst']]
     
-    bars = ax3.bar(conn_labels, conn_data, color=conn_colors, alpha=0.7)
-    ax3.set_ylabel('Number of Connections')
-    ax3.set_title('MEC Connectivity Asymmetry')
-    ax3.grid(True, alpha=0.3)
+    bars = ax3.bar(conn_labels, conn_data, color=conn_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+    ax3.set_ylabel('Number of Connections', fontsize=11)
+    ax3.set_title('MEC Connectivity Asymmetry', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3, axis='y')
+    ax3.set_axisbelow(True)
     
     # Add fraction labels on bars
     for i, (bar, label) in enumerate(zip(bars, conn_labels)):
@@ -899,132 +913,143 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         else:
             frac = 0.0
         
-        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                f'{frac:.3f}', ha='center', va='bottom')
+        ax3.text(bar.get_x() + bar.get_width()/2., height + max(conn_data)*0.02,
+                f'{frac:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
     
-    # Panel D: Gini coefficient analysis
+    # Panel D: Firing rate changes bar plot
     ax4 = plt.subplot(3, 4, (7, 8))
     
-    # Calculate synthetic Gini coefficients based on results
-    gini_changes = []
-    gini_labels = []
+    change_data = []
+    change_labels = []
+    change_colors = []
     
     for target in targets:
         for pop in ['gc', 'mc']:
-            if f'{pop}_mean_change' in results[target][1.0]:
-                mean_change = results[target][1.0][f'{pop}_mean_change']
-                # Approximate Gini change based on firing rate changes
-                gini_change = abs(mean_change)
+            if f'{pop}_mean_change' in results[target][stimulation_level]:
+                mean_change = results[target][stimulation_level][f'{pop}_mean_change']
                 
-                gini_changes.append(gini_change)
-                gini_labels.append(f'{target.upper()}→{pop.upper()}')
+                change_data.append(mean_change)
+                change_labels.append(f'{target.upper()}→{pop.upper()}')
+                change_colors.append(colors['pv'] if target == 'pv' else colors['sst'])
     
-    if gini_changes:
-        bars = ax4.bar(range(len(gini_labels)), gini_changes, 
-                      color=[colors['pv'] if 'PV' in label else colors['sst'] 
-                            for label in gini_labels], alpha=0.7)
+    if change_data:
+        bars = ax4.bar(range(len(change_labels)), change_data, 
+                      color=change_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
         
-        ax4.set_xticks(range(len(gini_labels)))
-        ax4.set_xticklabels(gini_labels)
-        ax4.set_ylabel('Change Gini Coefficient')
-        ax4.set_title('Firing Rate Inequality Changes')
-        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-        ax4.grid(True, alpha=0.3)
+        # Add value labels
+        for bar, value in zip(bars, change_data):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{value:.2f}', ha='center', 
+                    va='bottom' if height > 0 else 'top',
+                    fontsize=9, fontweight='bold')
         
-        # Add significance markers for large effects
-        for i, (bar, change) in enumerate(zip(bars, gini_changes)):
-            if abs(change) > 0.05:
-                height = bar.get_height()
-                ax4.text(bar.get_x() + bar.get_width()/2., 
-                        height + 0.01 if height > 0 else height - 0.01,
-                        '***', ha='center', va='bottom' if height > 0 else 'top')
+        ax4.set_xticks(range(len(change_labels)))
+        ax4.set_xticklabels(change_labels, fontsize=10)
+        ax4.set_ylabel(r'$\Delta$ Firing Rate (Hz)', fontsize=11)
+        ax4.set_title('Mean Rate Changes (Single Trial)', fontsize=12, fontweight='bold')
+        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=2)
+        ax4.grid(True, alpha=0.3, axis='y')
+        ax4.set_axisbelow(True)
     
-    # Panel E: Rate change correlations
+    # Panel E: Scatter plots showing correlation (single trial)
     for i, target in enumerate(targets):
         ax = plt.subplot(3, 4, 9 + i * 2)
         
-        opsin_expression = results[target][1.0]['opsin_expression']
-        stim_rates = results[target][1.0][f'{target}_stim_rates'][opsin_expression <= 0.2] # non-opsin expressing
-        baseline_rates = results[target][1.0][f'{target}_baseline_rates'][opsin_expression <= 0.2]
+        opsin_expression = results[target][stimulation_level]['opsin_expression']
+        stim_rates = results[target][stimulation_level][f'{target}_stim_rates'][opsin_expression <= 0.2]
+        baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates'][opsin_expression <= 0.2]
         
-        ax.scatter(baseline_rates, stim_rates, c=colors[target], alpha=0.6, s=20)
+        ax.scatter(baseline_rates, stim_rates, c=colors[target], alpha=0.6, s=30, edgecolors='black', linewidth=0.5)
         
         # Add correlation line
         from scipy import stats
         slope, intercept, r_value, p_value, std_err = stats.linregress(baseline_rates, stim_rates)
         line = slope * baseline_rates + intercept
-        ax.plot(baseline_rates, line, 'r--', alpha=0.8)
+        ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, label=f'Fit (R={r_value:.2f})')
         
         # Identity line
         max_rate = max(np.max(baseline_rates), np.max(stim_rates))
-        ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5)
+        ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5, linewidth=1.5, label='Identity')
         
-        ax.set_xlabel('Baseline Rate (Hz)')
-        ax.set_ylabel('Stimulation Rate (Hz)')
-        ax.set_title(f'{target.upper()} Stimulation')
+        ax.set_xlabel('Baseline Rate (Hz)', fontsize=10)
+        ax.set_ylabel('Stimulation Rate (Hz)', fontsize=10)
+        ax.set_title(f'{target.upper()} Stimulation\n(Non-expressing cells)', fontsize=11, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        
-        # Add correlation info
-        ax.text(0.05, 0.95, f'R = {r_value:.2f}', transform=ax.transAxes, va='top',
-               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        ax.legend(fontsize=8)
+        ax.set_axisbelow(True)
     
     # Panel F: Summary statistics
     ax6 = plt.subplot(3, 4, 12)
     ax6.axis('off')
     
+    summary_text = "Single Trial Summary\n"
+    summary_text += "=" * 30 + "\n\n"
+    
     # MEC asymmetry
-    summary_text = f"MEC Connectivity Asymmetry:\n"
-    summary_text += f"• MEC->PV: {mec_conn['mec_to_pv']} connections ({mec_conn['pv_fraction']:.1%})\n"
-    summary_text += f"• MEC->SST: {mec_conn['mec_to_sst']} connections\n\n"
+    summary_text += "MEC Connectivity:\n"
+    summary_text += f"  MEC -> PV: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.1%})\n"
+    summary_text += f"  MEC -> SST: {mec_conn['mec_to_sst']} (none)\n\n"
     
     # Network effects
     summary_text += "Optogenetic Effects:\n"
     for target in targets:
-        summary_text += f"• {target.upper()} stimulation:\n"
+        summary_text += f"{target.upper()} stimulation:\n"
         for pop in ['gc', 'mc']:
-            if f'{pop}_excited' in results[target][1.0]:
-                excited = results[target][1.0][f'{pop}_excited']
-                summary_text += f"  - {pop.upper()}: {excited:.1%} cells excited w.r.t baseline\n"
+            if f'{pop}_excited' in results[target][stimulation_level]:
+                excited = results[target][stimulation_level][f'{pop}_excited']
+                summary_text += f"  {pop.upper()}: {excited:.1%} excited\n"
+        summary_text += "\n"
     
-    ax6.text(-0.5, 0.95, summary_text, transform=ax6.transAxes, va='top', ha='left',
-            fontsize=10, fontfamily='monospace',
+    
+    ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes, va='top', ha='left',
+            fontsize=9, fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
     
-    plt.suptitle('Dentate Gyrus Interneuron Effects', 
+    plt.suptitle('Dentate Gyrus Interneuron Effects (Representative Single Trial)', 
                 fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     
     if save_path:
-        plt.savefig(f"{save_path}/DG_comparative_experiment_analysis.pdf", dpi=300, bbox_inches='tight')
-        plt.savefig(f"{save_path}/DG_comparative_experiment_analysis.png", dpi=300, bbox_inches='tight')
+        plt.savefig(f"{save_path}/DG_comparative_experiment_single_trial.pdf", dpi=300, bbox_inches='tight')
+        plt.savefig(f"{save_path}/DG_comparative_experiment_single_trial.png", dpi=300, bbox_inches='tight')
     
     plt.show()
     
     # Print summary
-    print("\nComparative Experiment Analysis Summary:")
-    print("=" * 50)
+    print("\n" + "=" * 70)
+    print("Single trial results (use statistical_testing.py for robust analysis)")
+    print("=" * 70)
     print(f"MEC -> PV connections: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
     print(f"MEC -> SST connections: {mec_conn['mec_to_sst']} ")
     
     for target in targets:
         print(f"\n{target.upper()} stimulation effects:")
         for pop in ['gc', 'mc', 'pv', 'sst']:
-            if pop != target and f'{pop}_excited' in results[target][1.0]:
-                excited = results[target][1.0][f'{pop}_excited']
-                inhibited = results[target][1.0][f'{pop}_inhibited']
+            if pop != target and f'{pop}_excited' in results[target][stimulation_level]:
+                excited = results[target][stimulation_level][f'{pop}_excited']
+                inhibited = results[target][stimulation_level][f'{pop}_inhibited']
                 print(f"  {pop.upper()}: {excited:.1%} excited, {inhibited:.1%} inhibited")
-
+    
+    print("\n" + "=" * 70)
+    print("NOTE: This is a single trial. Run statistical_testing.py for")
+    print("multi-trial analysis with statistical inference.")
+    print("=" * 70)
 
 def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
                                   target_population: str, 
-                                  light_intensity: float) -> Dict:
+                                  light_intensity: float,
+                                  mec_current = 40.0,
+                                  opsin_current = 100.0) -> Dict:
     """Analyze disinhibition mechanisms with fixed connectivity access"""
     
     # Store original synaptic parameters
     original_synaptic_params = experiment.synaptic_params
     
     # Run simulation with full network
-    result_full = experiment.simulate_stimulation(target_population, light_intensity)
+    result_full = experiment.simulate_stimulation(target_population, light_intensity,
+                                                  mec_current = mec_current,
+                                                  opsin_current = opsin_current)
     
     # Create modified synaptic parameters with reduced inhibition
     modified_synaptic_params = PerConnectionSynapticParams(
@@ -1082,7 +1107,7 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
         stim_no_inh = torch.mean(activity_no_inh[:, stim_mask], dim=1)
         change_no_inh = stim_no_inh - baseline_no_inh
         
-        # Analyze paradoxical excitation
+        # Analyze paradoxical excitation 
         baseline_std_full = torch.std(baseline_full)
         baseline_std_no_inh = torch.std(baseline_no_inh)
         
@@ -1101,13 +1126,16 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
     
     return analysis
 
-def test_disinhibition_hypothesis_fixed():
+def test_disinhibition_hypothesis(optimization_json_file=None,
+                                  mec_current = 100.0,
+                                  opsin_current = 100.0):
     """Test whether disinhibition mechanisms explain paradoxical excitation"""
     circuit_params = CircuitParams()
     opsin_params = OpsinParams()
     synaptic_params = PerConnectionSynapticParams()
     
-    experiment = OptogeneticExperiment(circuit_params, synaptic_params, opsin_params)
+    experiment = OptogeneticExperiment(circuit_params, synaptic_params, opsin_params,
+                                       optimization_json_file=optimization_json_file)
     
     print("Testing Disinhibition Hypothesis")
     print("=" * 40)
@@ -1116,7 +1144,9 @@ def test_disinhibition_hypothesis_fixed():
         print(f"\n{target.upper()} Stimulation:")
         print("-" * 20)
         
-        analysis = analyze_disinhibition_effects_fixed(experiment, target, 1.0)
+        analysis = analyze_disinhibition_effects(experiment, target, 1.0,
+                                                 mec_current = mec_current,
+                                                 opsin_current = opsin_current)
         
         for pop in ['gc', 'mc', 'pv', 'sst']:
             if f'{pop}_paradoxical_excitation' in analysis:
@@ -1131,7 +1161,7 @@ def test_disinhibition_hypothesis_fixed():
 
                 
     
-def enhanced_protocol():
+def run_protocol():
     """Main experimental protocol"""
     
     # Set random seed for reproducibility
@@ -1146,7 +1176,7 @@ def enhanced_protocol():
     experiment = OptogeneticExperiment(circuit_params, synaptic_params, opsin_params)
     
     # Analyze MEC asymmetry effects with analysis
-    print("\nMEC ASYMMETRY ANALYSIS")
+    print("\nMEC asymmetry analysis")
     print("=" * 60)
     
     mec_analysis = analyze_mec_asymmetry_effects(experiment)
@@ -1166,16 +1196,16 @@ def enhanced_protocol():
     print(f"  Asymmetry ratio: {asymmetry['asymmetry_ratio']:.1f}")
     
     if asymmetry['asymmetry_ratio'] > 2.0:
-        print("  → MEC -> PV asymmetry creates differential activation")
+        print("  - MEC -> PV asymmetry creates differential activation")
     else:
-        print("  → Asymmetry effect may be too weak")
+        print("  - Asymmetry effect may be too weak")
     
     # Print conductance statistics
     print("\nConductance Statistics:")
     print("-" * 30)
     for conn_name, stats in mec_analysis['conductance_stats'].items():
         if stats['n_connections'] > 0:
-            print(f"{conn_name}: {stats['mean_conductance']:.3f}±{stats['std_conductance']:.3f} nS "
+            print(f"{conn_name}: {stats['mean_conductance']:.3f} +/- {stats['std_conductance']:.3f} nS "
                   f"(CV={stats['cv_conductance']:.2f}, n={stats['n_connections']})")
     
     # Run comparative experiment
@@ -1183,7 +1213,7 @@ def enhanced_protocol():
                                                                                       opsin_current = 100.0)
     
     print("\n" + "="*60)
-    print("EXPERIMENTAL RESULTS")
+    print("Experimental results")
     print("="*60)
     
     mec_conn = connectivity_analysis['mec_connectivity']
@@ -1211,14 +1241,12 @@ def enhanced_protocol():
                     print(f"    Change: {mean_change:.3f} Hz "
                           f"({mean_baseline_rate:.2f} -> {mean_stim_rate:.2f} Hz)")
     
-    # Create visualizations
     plot_comparative_experiment_results(results, connectivity_analysis, save_path=".")
     
-    # Test disinhibition hypothesis with fixed implementation
     print("\n" + "="*60)
-    print("DISINHIBITION ANALYSIS")
+    print("Disinhibition analysis")
     print("="*60)
-    test_disinhibition_hypothesis_fixed()
+    test_disinhibition_hypothesis()
     
     return results, connectivity_analysis, conductance_analysis, mec_analysis    
 
@@ -1234,7 +1262,8 @@ if __name__ == "__main__":
         optimization_json_file=sys.argv[1]
     else:
         optimization_json_file=None
-        
+
+
     # Run comparative experiment
     results, connectivity_analysis, conductance_analysis = run_comparative_experiment(optimization_json_file=optimization_json_file,
                                                                                       mec_current=40.0,
@@ -1274,8 +1303,10 @@ if __name__ == "__main__":
                     print(f"  {pop.upper()}: {np.mean(opsin_stim_rates)} mean opsin stimulated rates, {np.mean(opsin_baseline_rates)} mean opsin baseline rates, ")
                     print(f"  {pop.upper()}: {np.mean(non_opsin_stim_rates)} mean non-opsin stimulated rates, {np.mean(non_opsin_baseline_rates)} mean non-opsin baseline rates, ")
 
-    plot_comparative_experiment_results(results, connectivity_analysis, save_path=".")
+    plot_comparative_experiment_results(results, connectivity_analysis, save_path="figures")
     
                     
     # Test disinhibition hypothesis
-    #test_disinhibition_hypothesis()
+    #test_disinhibition_hypothesis(optimization_json_file=optimization_json_file,
+    #                              mec_current=40.0,
+    #                              opsin_current=200.0)

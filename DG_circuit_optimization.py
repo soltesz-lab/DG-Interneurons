@@ -1710,7 +1710,7 @@ def create_default_global_opt_config() -> OptimizationConfig:
     """Create default optimization configuration for global optimization"""
     return OptimizationConfig(
         learning_rate=0.1,
-        max_iterations=6,
+        max_iterations=2,
         mec_drive_levels=[40.0],
         n_trials=2,  # Reduce for faster iteration
         simulation_duration=800,
