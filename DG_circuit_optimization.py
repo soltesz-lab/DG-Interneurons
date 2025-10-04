@@ -103,11 +103,11 @@ class OptimizationTargets:
     # Connection strength bounds (multipliers)
     connection_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         'mec_gc': (0.5, 5.0),    # Perforant path can vary widely
-        'mec_pv': (0.5, 5.0),    # Perforant path can vary widely
+        'mec_pv': (0.1, 5.0),    # Perforant path can vary widely
         'gc_mc': (0.1, 5.0),     # Mossy fiber strength
         'mc_gc': (0.1, 5.0),     # Associational pathway  
         'mc_mc': (0.5, 5.0),     # MC-MC excitation  
-        'pv_gc': (0.5, 5.0),     # Strong inhibition possible
+        'pv_gc': (0.1, 5.0),     # Strong inhibition possible
         'sst_gc': (0.1, 3.0),    # Moderate dendritic inhibition
         'gc_pv': (0.1, 5.0),     # Feedforward excitation
         'gc_sst': (0.1, 5.0),    # Weaker SST drive
@@ -1710,7 +1710,7 @@ def create_default_global_opt_config() -> OptimizationConfig:
     """Create default optimization configuration for global optimization"""
     return OptimizationConfig(
         learning_rate=0.1,
-        max_iterations=2,
+        max_iterations=10,
         mec_drive_levels=[40.0],
         n_trials=2,  # Reduce for faster iteration
         simulation_duration=800,

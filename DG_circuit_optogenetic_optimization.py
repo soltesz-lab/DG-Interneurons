@@ -540,7 +540,7 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
     
     elif method == 'particle_swarm':
         # Use Particle Swarm Optimization
-        n_particles = 10
+        n_particles = 72
         n_dimensions = len(connection_names)
         max_iterations = optimization_config.max_iterations
         
@@ -1046,7 +1046,7 @@ if __name__ == "__main__":
     # Run optimization
     results = run_global_optimization(
         config,
-        n_workers=10,
+        n_workers=72,
         n_threads_per_worker=1,
         method='particle_swarm'
     )
