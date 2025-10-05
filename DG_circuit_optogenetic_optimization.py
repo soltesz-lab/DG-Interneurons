@@ -97,9 +97,9 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
     Returns firing rate statistics for all populations
     """
     from DG_circuit_dendritic_somatic_transfer import (
-        DentateCircuit, PerConnectionSynapticParams
+        PerConnectionSynapticParams
     )
-    from DG_protocol import OpsinExpression
+    from DG_protocol import OpsinExpression, OptogeneticExperiment
     
     # Unpack circuit factory data
     circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
@@ -114,71 +114,45 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
         connection_modulation=connection_modulation
     )
     
-    # Create circuit
-    circuit = DentateCircuit(circuit_params, synaptic_params, opsin_params)
-    
-    # Create opsin expression
-    n_cells = getattr(circuit_params, f'n_{target_pop}')
-    opsin = OpsinExpression(opsin_params, n_cells)
-    target_positions = circuit.layout.positions[target_pop]
-    
-    # Calculate activation probabilities
-    activation_prob = opsin.calculate_activation(target_positions, light_intensity)
-    
-    # Simulation parameters
-    dt = circuit_params.dt
-    duration = 1650.0  # ms
-    stim_start = 650.0  # ms
-    warmup = 150.0  # ms
-    
-    n_steps = int(duration / dt)
-    stim_start_step = int(stim_start / dt)
-    warmup_step = int(warmup / dt)
-    
-    # Storage
-    device = torch.device('cpu')
-    activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
-    
-    # Run simulation
-    circuit.reset_state()
+    # Create opto experiment
+    experiment = OptogeneticExperiment(circuit_params,
+                                       synaptic_params,
+                                       opsin_params)
 
-    for t in range(n_steps):
-        current_time = t * dt
-        
-        # Optogenetic activation
-        direct_activation = {}
-        if t >= stim_start_step:
-            direct_activation[target_pop] = activation_prob * opsin_current
-        
-        # MEC drive
-        external_drive = {'mec': torch.ones(circuit_params.n_mec, device=device) * mec_current}
-        
-        # Update circuit
-        current_activity = circuit(direct_activation, external_drive)
-        
-        # Store activities after warmup
-        if t >= warmup_step:
-            for pop in activities_over_time:
-                if pop in current_activity:
-                    activities_over_time[pop].append(current_activity[pop].clone().cpu())
+    stim_start = 550.
+    duration = 1650.
+    warmup = 150.
+    
+    exp_result = experiment.simulate_stimulation(target_pop,
+                                                   light_intensity,
+                                                   duration = duration,
+                                                   stim_start = stim_start,
+                                                   mec_current = mec_current,
+                                                   opsin_current = opsin_current,
+                                                   plot_activity = False)
+
+    time = exp_result['time']
+    activity = exp_result['activity_trace']
+    baseline_mask = (time >= warmup) & (time < stim_start)  # Pre-stimulation
+    stim_mask = time >= stim_start     # During stimulation
 
     # Calculate statistics
     results = {}
     
-    for pop in activities_over_time:
-        if len(activities_over_time[pop]) > 0:
-            pop_time_series = torch.stack(activities_over_time[pop])  # (time, neurons)
+    for pop in activity:
+        if len(activity[pop]) > 0:
+            pop_time_series = activity[pop]  # (time, neurons)
             
             # Baseline and stimulation periods
-            baseline_rates = torch.mean(pop_time_series[warmup_step:stim_start_step], dim=0)
-            stim_rates = torch.mean(pop_time_series[stim_start_step:], dim=0)
+            baseline_rates = torch.mean(pop_time_series[:, baseline_mask], dim=1)
+            stim_rates = torch.mean(pop_time_series[:, stim_mask], dim=1)
             
             # Changes
             rate_changes = stim_rates - baseline_rates
             baseline_std = torch.std(baseline_rates)
             
             # Fraction activated
-            activated_fraction = torch.mean((rate_changes > 2 * baseline_std).float()).item()
+            activated_fraction = torch.mean((rate_changes > baseline_std).float()).item()
             
             # Gini coefficients
             baseline_gini = calculate_gini_coefficient(baseline_rates.numpy())
@@ -539,7 +513,7 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
     
     elif method == 'particle_swarm':
         # Use Particle Swarm Optimization
-        n_particles = 72
+        n_particles = 2
         n_dimensions = len(connection_names)
         max_iterations = optimization_config.max_iterations
         
@@ -1020,7 +994,8 @@ if __name__ == "__main__":
     
     # Create configuration
     config = create_default_global_opt_config()
-
+    config.max_iterations = 2
+    
     from DG_circuit_dendritic_somatic_transfer import (
         CircuitParams, PerConnectionSynapticParams, OpsinParams
     )
@@ -1045,7 +1020,7 @@ if __name__ == "__main__":
     # Run optimization
     results = run_global_optimization(
         config,
-        n_workers=72,
+        n_workers=2,
         n_threads_per_worker=1,
         method='particle_swarm'
     )
