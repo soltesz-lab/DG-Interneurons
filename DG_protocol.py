@@ -234,7 +234,10 @@ class OptogeneticExperiment:
                 ds_times = self._generate_dentate_spike_times(duration, baseline_rate=0.5)  # 0.5 Hz
         else:
             ds_times = []
-            
+
+
+        print(f"opsin_current = {opsin_current}")
+        
         # Run simulation
         for t in tqdm.tqdm(range(n_steps)):
             current_time = t * dt
@@ -648,6 +651,7 @@ def run_comparative_experiment(optimization_json_file=None,
                                intensities = [0.5, 1.0, 2.0],
                                mec_current = 100.0,
                                opsin_current = 100.0,
+                               stim_start = 550,
                                plot_activity=True):
     """Compare PV vs SST stimulation with anatomical connectivity"""
     circuit_params = CircuitParams()
@@ -677,14 +681,13 @@ def run_comparative_experiment(optimization_json_file=None,
         if stats['n_connections'] > 0:
             print(f"{conn_name} ({stats['synapse_type']}):")
             print(f"  Connections: {stats['n_connections']}")
-            print(f"  Conductance: {stats['mean_conductance']:.3f} ± {stats['std_conductance']:.3f} nS")
+            print(f"  Conductance: {stats['mean_conductance']:.3f} +/- {stats['std_conductance']:.3f} nS")
             print(f"  CV: {stats['cv_conductance']:.2f}")
             print(f"  Range: [{stats['min_conductance']:.3f}, {stats['max_conductance']:.3f}] nS")
  
     
     # Test different stimulation intensities
     results = {}
-    stim_start = 550
     
     for target in ['pv', 'sst']:
         results[target] = {}
@@ -692,9 +695,10 @@ def run_comparative_experiment(optimization_json_file=None,
         
         for intensity in intensities:
             print(f"  Intensity: {intensity}")
-            result = experiment.simulate_stimulation(target, intensity, stim_start=stim_start,
+            result = experiment.simulate_stimulation(target, intensity,
+                                                     stim_start=stim_start,
                                                      duration = stim_start + 1000.0,
-                                                     plot_activity=plot_activity,
+                                                     plot_activity = plot_activity,
                                                      mec_current = mec_current,
                                                      opsin_current = opsin_current)
             
@@ -703,7 +707,7 @@ def run_comparative_experiment(optimization_json_file=None,
             activity = result['activity_trace']
             opsin_expression = result['opsin_expression']
             
-            baseline_mask = (time >= 50) & (time < stim_start)  # Pre-stimulation
+            baseline_mask = (time >= 150) & (time < stim_start)  # Pre-stimulation
             stim_mask = time >= stim_start     # During stimulation
             
             analysis = {}
@@ -718,11 +722,11 @@ def run_comparative_experiment(optimization_json_file=None,
                     analysis[f'{pop}_stim_rates'] = stim_rate.numpy()
                     analysis[f'{pop}_baseline_rates'] = baseline_rate.numpy()
                     continue
-                    
+
                 rate_change = stim_rate - baseline_rate
-                
-                excited_fraction = torch.mean((rate_change > torch.std(rate_change)).float())
-                inhibited_fraction = torch.mean((rate_change < -torch.std(rate_change)).float())
+
+                excited_fraction = torch.mean((rate_change > torch.std(baseline_rate)).float())
+                inhibited_fraction = torch.mean((rate_change < -torch.std(baseline_rate)).float())
 
                 analysis[f'{pop}_excited'] = excited_fraction.item()
                 analysis[f'{pop}_inhibited'] = inhibited_fraction.item()
@@ -1266,6 +1270,7 @@ if __name__ == "__main__":
 
     # Run comparative experiment
     results, connectivity_analysis, conductance_analysis = run_comparative_experiment(optimization_json_file=optimization_json_file,
+                                                                                      intensities = [0.5, 1.0, 2.0],
                                                                                       mec_current=40.0,
                                                                                       opsin_current=200.0)
 

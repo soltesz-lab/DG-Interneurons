@@ -276,7 +276,7 @@ class DisinhibitionHypothesisTester:
         opsin_expression = simulation_result['opsin_expression']
         
         # Define time windows
-        baseline_mask = (time >= 50) & (time < stim_start)
+        baseline_mask = (time >= 150) & (time < stim_start)
         stim_mask = time >= stim_start
         
         trial_metrics = {
@@ -318,13 +318,13 @@ class DisinhibitionHypothesisTester:
             stim_rate = torch.mean(pop_activity[:, stim_mask], dim=1)
             rate_change = stim_rate - baseline_rate
             
-            # Define paradoxical excitation threshold (2 SD above baseline mean)
+            # Define paradoxical excitation threshold (1 SD above baseline mean)
             baseline_mean = torch.mean(baseline_rate)
             baseline_std = torch.std(baseline_rate)
-            excitation_threshold = baseline_mean + 2 * baseline_std
+            excitation_threshold = baseline_mean + baseline_std
             
             paradoxically_excited = stim_rate > excitation_threshold
-            paradoxically_inhibited = stim_rate < (baseline_mean - 2 * baseline_std)
+            paradoxically_inhibited = stim_rate < (baseline_mean - baseline_std)
             
             total_cells = len(stim_rate)
             

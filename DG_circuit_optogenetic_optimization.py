@@ -163,7 +163,6 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
                     activities_over_time[pop].append(current_activity[pop].clone().cpu())
 
     # Calculate statistics
-    baseline_end_step = stim_start_step - warmup_step
     results = {}
     
     for pop in activities_over_time:
@@ -171,15 +170,15 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
             pop_time_series = torch.stack(activities_over_time[pop])  # (time, neurons)
             
             # Baseline and stimulation periods
-            baseline_rates = torch.mean(pop_time_series[:baseline_end_step], dim=0)
-            stim_rates = torch.mean(pop_time_series[baseline_end_step:], dim=0)
+            baseline_rates = torch.mean(pop_time_series[warmup_step:stim_start_step], dim=0)
+            stim_rates = torch.mean(pop_time_series[stim_start_step:], dim=0)
             
             # Changes
             rate_changes = stim_rates - baseline_rates
             baseline_std = torch.std(baseline_rates)
             
             # Fraction activated
-            activated_fraction = (torch.sum(rate_changes > 2 * baseline_std) / len(rate_changes)).item()
+            activated_fraction = torch.mean(rate_changes > 2 * baseline_std).item()
             
             # Gini coefficients
             baseline_gini = calculate_gini_coefficient(baseline_rates.numpy())
