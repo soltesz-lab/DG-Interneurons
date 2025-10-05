@@ -47,12 +47,16 @@ class ExperimentalBenchmarks:
     """Experimental data from Hainmueller et al. 2024 for validation"""
     
     # PV stimulation results
-    pv_paradoxical_gc_fraction: float = 0.15  # ~15% of GCs show paradoxical excitation
+    pv_paradoxical_gc_fraction: float = 0.09  # ~8.6% of GCs show paradoxical excitation
     pv_paradoxical_mc_fraction: float = 0.08  # ~8% of MCs
     pv_paradoxical_sst_fraction: float = 0.12
-    pv_response_latency_ms: float = 5.0
     pv_gini_increase: float = 0.15  # Increase in firing rate inequality
-    
+
+    # SST stimulation results  
+    sst_paradoxical_gc_fraction: float = 0.02
+    sst_paradoxical_mc_fraction: float = 0.18
+    sst_paradoxical_pv_fraction: float = 0.11
+
 
 
 @dataclass
@@ -2183,12 +2187,12 @@ if __name__ == "__main__":
     
     # Run analysis
     results = run_statistical_analysis(
-        target_populations=['pv', 'sst'],
-        n_trials=2,
+        target_populations=['sst', 'pv'],
+        n_trials=150,
         light_intensity=1.0,
         mec_current=40.0,
         opsin_current=200.0,
-        n_workers = 4,
+        n_workers = 80,
         optimization_json_file=optimization_file,
         output_dir="./statistical_results"
     )
