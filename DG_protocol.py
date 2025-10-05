@@ -724,9 +724,10 @@ def run_comparative_experiment(optimization_json_file=None,
                     continue
 
                 rate_change = stim_rate - baseline_rate
-
-                excited_fraction = torch.mean((rate_change > torch.std(baseline_rate)).float())
-                inhibited_fraction = torch.mean((rate_change < -torch.std(baseline_rate)).float())
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                inhibited_fraction = torch.mean((rate_change < -baseline_std).float())
 
                 analysis[f'{pop}_excited'] = excited_fraction.item()
                 analysis[f'{pop}_inhibited'] = inhibited_fraction.item()

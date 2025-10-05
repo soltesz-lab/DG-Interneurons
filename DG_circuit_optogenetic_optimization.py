@@ -178,7 +178,7 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
             baseline_std = torch.std(baseline_rates)
             
             # Fraction activated
-            activated_fraction = torch.mean(rate_changes > 2 * baseline_std).item()
+            activated_fraction = torch.mean((rate_changes > 2 * baseline_std).float()).item()
             
             # Gini coefficients
             baseline_gini = calculate_gini_coefficient(baseline_rates.numpy())

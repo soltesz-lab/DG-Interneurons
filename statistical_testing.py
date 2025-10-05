@@ -19,6 +19,7 @@ import multiprocessing as mp
 from functools import partial
 import pickle
 import json
+import pprint
 from pathlib import Path
 import tqdm
 
@@ -202,7 +203,7 @@ class DisinhibitionHypothesisTester:
         
         # Create modified synaptic parameters
         trial_synaptic_params = self.create_modified_synaptic_params(condition_params)
-        
+
         # Create experiment with modified parameters
         experiment = OptogeneticExperiment(
             self.circuit_params,
@@ -214,7 +215,8 @@ class DisinhibitionHypothesisTester:
         # Run simulation
         if condition_params.get('no_stimulation', False):
             light_intensity = 0.0
-        
+            opsin_current = 0.0
+            
         result = experiment.simulate_stimulation(
             target_population,
             light_intensity,
@@ -327,8 +329,8 @@ class DisinhibitionHypothesisTester:
             baseline_std = torch.std(baseline_rate)
             excitation_threshold = baseline_mean + baseline_std
             
-            paradoxically_excited = stim_rate > excitation_threshold
-            paradoxically_inhibited = stim_rate < (baseline_mean - baseline_std)
+            paradoxically_excited = rate_change > baseline_std
+            paradoxically_inhibited = rate_change < -baseline_std
             
             total_cells = len(stim_rate)
             
@@ -336,6 +338,7 @@ class DisinhibitionHypothesisTester:
             trial_metrics[f'{pop}_paradoxical_fraction'] = torch.mean(paradoxically_excited.float()).item()
             trial_metrics[f'{pop}_inhibited_fraction'] = torch.mean(paradoxically_inhibited.float()).item()
             trial_metrics[f'{pop}_mean_baseline'] = baseline_mean.item()
+            trial_metrics[f'{pop}_std_baseline'] = baseline_std.item()
             trial_metrics[f'{pop}_mean_stim'] = torch.mean(stim_rate).item()
             trial_metrics[f'{pop}_mean_rate_change'] = torch.mean(rate_change).item()
             trial_metrics[f'{pop}_std_rate_change'] = torch.std(rate_change).item()
@@ -494,7 +497,7 @@ class DisinhibitionHypothesisTester:
         for condition in conditions.keys():
             success_rate = len(results[condition]) / self.n_trials * 100
             print(f"  {condition}: {len(results[condition])}/{self.n_trials} trials ({success_rate:.1f}%)")
-            
+
         # Statistical analysis
         print("\nPerforming statistical analysis...")
         statistical_analysis = self._analyze_monte_carlo_results(results, target_population)
