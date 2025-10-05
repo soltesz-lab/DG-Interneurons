@@ -429,7 +429,7 @@ class DGCircuitVisualization:
         
         return fig, distance_stats
     
-    def plot_activity_patterns(self, activity_trace, save_path=None):
+    def plot_mean_activity(self, activity_trace, save_path=None):
         """
         Plot circuit activity over time
         
@@ -472,7 +472,102 @@ class DGCircuitVisualization:
         if len(activity_history) < len(axes):
             fig.delaxes(axes[-1])
         
-        plt.suptitle('DG Circuit Activity', fontsize=16, fontweight='bold')
+        plt.suptitle('DG Circuit Mean Activity', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+        
+        return fig, activity_history
+
+    def plot_activity_patterns(self, activity_trace, max_neurons_per_plot=50, 
+                               individual_alpha=0.3, mean_linewidth=3, save_path=None):
+        """
+        Plot circuit activity over time with individual neuron traces and population mean
+        
+        Args:
+            activity_trace: Dictionary with population keys, each containing array of shape (n_cells, timesteps)
+            max_neurons_per_plot: Maximum number of individual neurons to plot per population
+            individual_alpha: Transparency for individual neuron traces
+            mean_linewidth: Line width for population mean trace
+            save_path: Path to save figure
+        """
+        # Determine number of timesteps
+        timesteps = None
+        for pop in activity_trace.keys():
+            timesteps = activity_trace[pop].shape[1]
+            break
+        
+        # Create time axis
+        time_axis = np.arange(timesteps) * self.circuit.circuit_params.dt
+        
+        # Plot results
+        fig, axes = plt.subplots(2, 3, figsize=self.config.figsize_large, dpi=self.config.dpi)
+        axes = axes.flatten()
+        
+        # Storage for mean activity
+        activity_history = {pop: [] for pop in self.pop_sizes.keys()}
+        
+        for idx, (pop, activity) in enumerate(activity_trace.items()):
+            if idx >= len(axes):
+                break
+            
+            ax = axes[idx]
+            
+            # Get activity data (convert from torch tensor if needed)
+            if hasattr(activity, 'cpu'):
+                activity_data = activity.cpu().numpy()
+            else:
+                activity_data = np.array(activity)
+            
+            n_cells = activity_data.shape[0]
+            
+            # Determine which neurons to plot
+            if n_cells > max_neurons_per_plot:
+                # Subsample neurons evenly across the population
+                neuron_indices = np.linspace(0, n_cells-1, max_neurons_per_plot, dtype=int)
+            else:
+                neuron_indices = np.arange(n_cells)
+            
+            # Plot individual neuron traces with transparency
+            for neuron_idx in neuron_indices:
+                ax.plot(time_axis, activity_data[neuron_idx, :], 
+                       color=self.config.colors[pop], 
+                       alpha=individual_alpha, 
+                       linewidth=0.5,
+                       zorder=1)
+            
+            # Compute and plot mean activity
+            mean_activity = np.mean(activity_data, axis=0)
+            activity_history[pop] = mean_activity.tolist()
+            
+            ax.plot(time_axis, mean_activity, 
+                   color=self.config.colors[pop], 
+                   linewidth=mean_linewidth, 
+                   label=f'Mean (n={n_cells})',
+                   zorder=2)
+            
+            # Add shaded region for standard deviation
+            std_activity = np.std(activity_data, axis=0)
+            ax.fill_between(time_axis, 
+                           mean_activity - std_activity, 
+                           mean_activity + std_activity,
+                           color=self.config.colors[pop], 
+                           alpha=0.15,
+                           zorder=0)
+            
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('Firing Rate (Hz)')
+            ax.set_title(f'{pop.upper()} Population Activity\n({n_cells} cells, showing {len(neuron_indices)})')
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
+        
+        # Remove unused subplot
+        if len(activity_trace) < len(axes):
+            fig.delaxes(axes[-1])
+        
+        plt.suptitle('DG Circuit Activity: Individual Neurons and Population Mean', 
+                    fontsize=16, fontweight='bold')
         plt.tight_layout()
         
         if save_path:
@@ -586,7 +681,7 @@ class DGCircuitVisualization:
         
         return fig, G
     
-    def create_summary_report(self, save_dir='./dg_visualization_report'):
+    def create_summary_report(self, save_dir='./DG_visualization_report'):
         """
         Create a comprehensive visualization report
         
@@ -640,9 +735,9 @@ class DGCircuitVisualization:
         plt.close(fig5)
         
         # 6. Activity patterns
-        print("  - Activity patterns...")
-        fig6, activity = self.plot_activity_patterns(save_path=f'{save_dir}/activity_patterns.png')
-        plt.close(fig6)
+        #print("  - Activity patterns...")
+        #fig6, activity = self.plot_activity_patterns(save_path=f'{save_dir}/activity_patterns.png')
+        #plt.close(fig6)
         
         print(f"Report generated in {save_dir}/")
         print("Files created:")
