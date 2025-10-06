@@ -1048,70 +1048,209 @@ def plot_statistical_validity_summary(pv_results: Dict,
         plt.close()
 
 
+
 def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors):
-    """Validate paradoxical excitation: baseline vs stimulation comparison"""
+    """Validate paradoxical excitation: fraction of excited cells"""
     
-    # We need to show that stimulation CAUSES paradoxical excitation
-    # Compare baseline rates vs stimulation rates for cells that show excitation
+    # Show fraction of cells exhibiting paradoxical excitation
+    # Compare: no stimulation baseline vs full network stimulation
     
-    width = 0.2
-    x_base = np.arange(len(populations) * 2) * 1.5  # Space for PV and SST groups
-    
-    baseline_means = []
-    stim_means = []
-    baseline_sems = []
-    stim_sems = []
+    width = 0.25
     labels = []
+    nostim_fracs = []
+    stim_fracs = []
+    nostim_sems = []
+    stim_sems = []
     bar_colors = []
     
     for pop in populations:
         # PV stimulation
-        pv_trials = pv_results['raw_results']['full_network']
-        pv_baseline_rates = []
-        pv_stim_rates = []
+        # No stimulation control (should be near zero)
+        nostim_trials = pv_results['raw_results'].get('no_stimulation', [])
+        pv_nostim = []
+        for trial in nostim_trials:
+            frac = trial.get(f'{pop}_paradoxical_fraction', np.nan)
+            if not np.isnan(frac):
+                pv_nostim.append(frac)
         
-        for trial in pv_trials:
-            baseline = trial.get(f'{pop}_mean_baseline', np.nan)
-            stim = trial.get(f'{pop}_mean_stim', np.nan)
-            if not np.isnan(baseline) and not np.isnan(stim):
-                pv_baseline_rates.append(baseline)
-                pv_stim_rates.append(stim)
+        # Full network with stimulation
+        stim_trials = pv_results['raw_results']['full_network']
+        pv_stim = []
+        for trial in stim_trials:
+            frac = trial.get(f'{pop}_paradoxical_fraction', np.nan)
+            if not np.isnan(frac):
+                pv_stim.append(frac)
         
-        if len(pv_baseline_rates) > 0:
-            baseline_means.append(np.mean(pv_baseline_rates))
-            stim_means.append(np.mean(pv_stim_rates))
-            baseline_sems.append(np.std(pv_baseline_rates) / np.sqrt(len(pv_baseline_rates)))
-            stim_sems.append(np.std(pv_stim_rates) / np.sqrt(len(pv_stim_rates)))
+        if len(pv_stim) > 0:
+            nostim_fracs.append(np.mean(pv_nostim) if len(pv_nostim) > 0 else 0)
+            stim_fracs.append(np.mean(pv_stim))
+            nostim_sems.append(np.std(pv_nostim) / np.sqrt(len(pv_nostim)) if len(pv_nostim) > 0 else 0)
+            stim_sems.append(np.std(pv_stim) / np.sqrt(len(pv_stim)))
             labels.append(f'{pop.upper()}\nPV')
             bar_colors.append(colors['pv'])
         
         # SST stimulation
-        sst_trials = sst_results['raw_results']['full_network']
-        sst_baseline_rates = []
-        sst_stim_rates = []
+        nostim_trials = sst_results['raw_results'].get('no_stimulation', [])
+        sst_nostim = []
+        for trial in nostim_trials:
+            frac = trial.get(f'{pop}_paradoxical_fraction', np.nan)
+            if not np.isnan(frac):
+                sst_nostim.append(frac)
         
-        for trial in sst_trials:
-            baseline = trial.get(f'{pop}_mean_baseline', np.nan)
-            stim = trial.get(f'{pop}_mean_stim', np.nan)
-            if not np.isnan(baseline) and not np.isnan(stim):
-                sst_baseline_rates.append(baseline)
-                sst_stim_rates.append(stim)
+        stim_trials = sst_results['raw_results']['full_network']
+        sst_stim = []
+        for trial in stim_trials:
+            frac = trial.get(f'{pop}_paradoxical_fraction', np.nan)
+            if not np.isnan(frac):
+                sst_stim.append(frac)
         
-        if len(sst_baseline_rates) > 0:
-            baseline_means.append(np.mean(sst_baseline_rates))
-            stim_means.append(np.mean(sst_stim_rates))
-            baseline_sems.append(np.std(sst_baseline_rates) / np.sqrt(len(sst_baseline_rates)))
-            stim_sems.append(np.std(sst_stim_rates) / np.sqrt(len(sst_stim_rates)))
+        if len(sst_stim) > 0:
+            nostim_fracs.append(np.mean(sst_nostim) if len(sst_nostim) > 0 else 0)
+            stim_fracs.append(np.mean(sst_stim))
+            nostim_sems.append(np.std(sst_nostim) / np.sqrt(len(sst_nostim)) if len(sst_nostim) > 0 else 0)
+            stim_sems.append(np.std(sst_stim) / np.sqrt(len(sst_stim)))
             labels.append(f'{pop.upper()}\nSST')
             bar_colors.append(colors['sst'])
     
     x_pos = np.arange(len(labels))
     
     # Create grouped bars
-    bars1 = ax.bar(x_pos - width/2, baseline_means, width, yerr=baseline_sems,
+    bars1 = ax.bar(x_pos - width/2, nostim_fracs, width, yerr=nostim_sems,
+                   label='No Stimulation', color='lightgray', alpha=0.7,
+                   capsize=4, edgecolor='black', linewidth=1.5)
+    bars2 = ax.bar(x_pos + width/2, stim_fracs, width, yerr=stim_sems,
+                   label='With Stimulation', color=bar_colors, alpha=0.8,
+                   capsize=4, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # Add statistical significance
+    for i, label in enumerate(labels):
+        # Determine which dataset
+        if 'PV' in label:
+            pop = label.split('\n')[0].lower()
+            nostim_trials = pv_results['raw_results'].get('no_stimulation', [])
+            stim_trials = pv_results['raw_results']['full_network']
+        else:
+            pop = label.split('\n')[0].lower()
+            nostim_trials = sst_results['raw_results'].get('no_stimulation', [])
+            stim_trials = sst_results['raw_results']['full_network']
+        
+        nostim_vals = [t.get(f'{pop}_paradoxical_fraction', np.nan) 
+                       for t in nostim_trials]
+        stim_vals = [t.get(f'{pop}_paradoxical_fraction', np.nan) 
+                     for t in stim_trials]
+        
+        nostim_vals = [v for v in nostim_vals if not np.isnan(v)]
+        stim_vals = [v for v in stim_vals if not np.isnan(v)]
+        
+        if len(stim_vals) > 0:
+            # Independent t-test (different conditions)
+            if len(nostim_vals) > 0:
+                t_stat, p_value = stats.ttest_ind(nostim_vals, stim_vals)
+            else:
+                # One-sample t-test against zero if no nostim data
+                t_stat, p_value = stats.ttest_1samp(stim_vals, 0)
+            
+            y_max = max(nostim_fracs[i] + nostim_sems[i], 
+                       stim_fracs[i] + stim_sems[i])
+            y_pos = y_max * 1.15
+            
+            if p_value < 0.001:
+                marker = '***'
+            elif p_value < 0.01:
+                marker = '**'
+            elif p_value < 0.05:
+                marker = '*'
+            else:
+                marker = 'ns'
+            
+            # Draw significance bracket
+            x1 = i - width/2
+            x2 = i + width/2
+            ax.plot([x1, x1, x2, x2], [y_pos*0.96, y_pos, y_pos, y_pos*0.96], 
+                   'k-', linewidth=1.2)
+            ax.text(i, y_pos*1.02, marker, ha='center', va='bottom',
+                   fontsize=10, fontweight='bold')
+    
+    ax.set_xlabel('Population & Stimulation Type', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Fraction of Cells with\nParadoxical Excitation', fontsize=11, fontweight='bold')
+    ax.set_title('Validation: Paradoxical Excitation\n(Excited Cell Fraction)', 
+                fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylim([0, None])
+    ax.legend(fontsize=10, frameon=True, fancybox=True, loc='upper left')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+
+
+def plot_gini_comparison(ax, pv_results, sst_results, populations, colors):
+    """Validate inequality increase: baseline vs stimulation Gini coefficients"""
+    
+    width = 0.2
+    labels = []
+    baseline_ginis = []
+    stim_ginis = []
+    baseline_sems = []
+    stim_sems = []
+    bar_colors = []
+    
+    for pop in populations:
+        # PV stimulation
+        pv_trials = pv_results['raw_results']['full_network']
+        pv_baseline = []
+        pv_stim = []
+        
+        for trial in pv_trials:
+            baseline = trial.get(f'{pop}_gini_baseline', np.nan)
+            stim = trial.get(f'{pop}_gini_stim', np.nan)
+            if not np.isnan(baseline) and not np.isnan(stim):
+                pv_baseline.append(baseline)
+                pv_stim.append(stim)
+        
+        if len(pv_baseline) > 0:
+            baseline_ginis.append(np.mean(pv_baseline))
+            stim_ginis.append(np.mean(pv_stim))
+            baseline_sems.append(np.std(pv_baseline) / np.sqrt(len(pv_baseline)))
+            stim_sems.append(np.std(pv_stim) / np.sqrt(len(pv_stim)))
+            labels.append(f'{pop.upper()}\nPV')
+            bar_colors.append(colors['pv'])
+        
+        # SST stimulation
+        sst_trials = sst_results['raw_results']['full_network']
+        sst_baseline = []
+        sst_stim = []
+        
+        for trial in sst_trials:
+            baseline = trial.get(f'{pop}_gini_baseline', np.nan)
+            stim = trial.get(f'{pop}_gini_stim', np.nan)
+            if not np.isnan(baseline) and not np.isnan(stim):
+                sst_baseline.append(baseline)
+                sst_stim.append(stim)
+        
+        if len(sst_baseline) > 0:
+            baseline_ginis.append(np.mean(sst_baseline))
+            stim_ginis.append(np.mean(sst_stim))
+            baseline_sems.append(np.std(sst_baseline) / np.sqrt(len(sst_baseline)))
+            stim_sems.append(np.std(sst_stim) / np.sqrt(len(sst_stim)))
+            labels.append(f'{pop.upper()}\nSST')
+            bar_colors.append(colors['sst'])
+    
+    x_pos = np.arange(len(labels))
+    
+    # Create grouped bars
+    bars1 = ax.bar(x_pos - width/2, baseline_ginis, width, yerr=baseline_sems,
                    label='Baseline', color='gray', alpha=0.6,
                    capsize=4, edgecolor='black', linewidth=1.5)
-    bars2 = ax.bar(x_pos + width/2, stim_means, width, yerr=stim_sems,
+    bars2 = ax.bar(x_pos + width/2, stim_ginis, width, yerr=stim_sems,
                    label='Stimulation', color=bar_colors, alpha=0.8,
                    capsize=4, edgecolor='black', linewidth=1.5)
     
@@ -1120,7 +1259,7 @@ def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors
         for bar in bars:
             height = bar.get_height()
             ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.1f}', ha='center', va='bottom', fontsize=8)
+                   f'{height:.3f}', ha='center', va='bottom', fontsize=8)
     
     # Add statistical significance for paired comparisons
     for i, label in enumerate(labels):
@@ -1135,19 +1274,19 @@ def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors
         baseline_vals = []
         stim_vals = []
         for trial in trials:
-            baseline = trial.get(f'{pop}_mean_baseline', np.nan)
-            stim = trial.get(f'{pop}_mean_stim', np.nan)
+            baseline = trial.get(f'{pop}_gini_baseline', np.nan)
+            stim = trial.get(f'{pop}_gini_stim', np.nan)
             if not np.isnan(baseline) and not np.isnan(stim):
                 baseline_vals.append(baseline)
                 stim_vals.append(stim)
         
         if len(baseline_vals) > 0:
-            # Paired t-test (same cells, baseline vs stim)
+            # Paired t-test
             t_stat, p_value = stats.ttest_rel(baseline_vals, stim_vals)
             
-            y_max = max(baseline_means[i] + baseline_sems[i], 
-                       stim_means[i] + stim_sems[i])
-            y_pos = y_max * 1.1
+            y_max = max(baseline_ginis[i] + baseline_sems[i], 
+                       stim_ginis[i] + stim_sems[i])
+            y_pos = y_max * 1.08
             
             if p_value < 0.001:
                 marker = '***'
@@ -1167,8 +1306,8 @@ def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors
                    fontsize=10, fontweight='bold')
     
     ax.set_xlabel('Population & Stimulation Type', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Mean Firing Rate (Hz)', fontsize=11, fontweight='bold')
-    ax.set_title('Validation: Baseline vs Stimulation\n(Paired Comparison)', 
+    ax.set_ylabel('Gini Coefficient', fontsize=11, fontweight='bold')
+    ax.set_title('Validation: Inequality Increase\n(Baseline vs Stimulation)', 
                 fontsize=12, fontweight='bold')
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, fontsize=9)
@@ -1178,62 +1317,7 @@ def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors
     ax.grid(True, alpha=0.3, axis='y', linestyle='--')
     ax.set_axisbelow(True)
 
-
-def plot_gini_comparison(ax, pv_results, sst_results, populations, colors):
-    """Compare Gini coefficient changes between PV and SST stimulation"""
-    
-    x_pos = np.arange(len(populations))
-    width = 0.35
-    
-    pv_means = []
-    pv_sems = []
-    sst_means = []
-    sst_sems = []
-    
-    for pop in populations:
-        # PV data
-        pv_trials = pv_results['raw_results']['full_network']
-        pv_values = [t.get(f'{pop}_gini_change', np.nan) for t in pv_trials]
-        pv_values = [v for v in pv_values if not np.isnan(v)]
-        pv_means.append(np.mean(pv_values))
-        pv_sems.append(np.std(pv_values) / np.sqrt(len(pv_values)))
         
-        # SST data
-        sst_trials = sst_results['raw_results']['full_network']
-        sst_values = [t.get(f'{pop}_gini_change', np.nan) for t in sst_trials]
-        sst_values = [v for v in sst_values if not np.isnan(v)]
-        sst_means.append(np.mean(sst_values))
-        sst_sems.append(np.std(sst_values) / np.sqrt(len(sst_values)))
-    
-    # Create bars
-    bars1 = ax.bar(x_pos - width/2, pv_means, width, yerr=pv_sems,
-                   label='PV Stimulation', color=colors['pv'], alpha=0.8,
-                   capsize=5, edgecolor='black', linewidth=1.5)
-    bars2 = ax.bar(x_pos + width/2, sst_means, width, yerr=sst_sems,
-                   label='SST Stimulation', color=colors['sst'], alpha=0.8,
-                   capsize=5, edgecolor='black', linewidth=1.5)
-    
-    # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.3f}', ha='center', 
-                   va='bottom' if height > 0 else 'top', fontsize=9)
-    
-    ax.set_xlabel('Population', fontsize=11, fontweight='bold')
-    ax.set_ylabel(r'$\Delta$ Gini Coefficient', fontsize=11, fontweight='bold')
-    ax.set_title('Firing Rate Inequality:\nPV vs SST Stimulation',
-                fontsize=12, fontweight='bold')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([p.upper() for p in populations], fontsize=11)
-    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=2)
-    ax.legend(fontsize=10, frameon=True, fancybox=True)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
-    ax.set_axisbelow(True)
-
 
 def plot_effect_size_heatmap(ax, pv_results, sst_results, populations):
     """Create heatmap of effect sizes (Cohen's d) for primary hypothesis"""
