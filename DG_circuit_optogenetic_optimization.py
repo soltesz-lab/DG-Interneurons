@@ -199,7 +199,11 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
                 
                 # Squared error
                 error = (actual_fraction - target_fraction) ** 2
-                rate_increase_loss += error
+
+                if (target_fraction) > 0 and (np.isclose(actual_fraction, 0.0, 1e-2, 1e-2)):
+                    rate_increase_loss += 1e2
+                else:
+                    rate_increase_loss += error
         
         loss_components['rate_increase'] = rate_increase_loss
         total_loss += rate_increase_loss
