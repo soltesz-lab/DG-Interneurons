@@ -513,7 +513,7 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
     
     elif method == 'particle_swarm':
         # Use Particle Swarm Optimization
-        n_particles = 2
+        n_particles = 120
         n_dimensions = len(connection_names)
         max_iterations = optimization_config.max_iterations
         
@@ -994,7 +994,7 @@ if __name__ == "__main__":
     
     # Create configuration
     config = create_default_global_opt_config()
-    config.max_iterations = 2
+    config.max_iterations = 30
     
     from DG_circuit_dendritic_somatic_transfer import (
         CircuitParams, PerConnectionSynapticParams, OpsinParams
@@ -1020,7 +1020,7 @@ if __name__ == "__main__":
     # Run optimization
     results = run_global_optimization(
         config,
-        n_workers=2,
+        n_workers=120,
         n_threads_per_worker=1,
         method='particle_swarm'
     )
