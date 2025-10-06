@@ -467,6 +467,9 @@ class DisinhibitionHypothesisTester:
             for trial_idx, condition, trial_result in trial_results:
                 if trial_result is not None:
                     results[condition].append(trial_result)
+
+
+            print(f"results = {pprint.pformat(results)}")
         else:
             # Serial execution
             # Run trials for each condition
@@ -911,6 +914,712 @@ class DisinhibitionHypothesisTester:
         return pd.DataFrame(summary_data)
 
 
+def plot_statistical_validity_summary(pv_results: Dict, 
+                                      sst_results: Dict,
+                                      output_dir: str = ".",
+                                      show_plots: bool = True):
+    """
+    Create statistical validity plot comparing PV and SST stimulation effects
+    
+    This function creates a publication-quality figure showing:
+    1. Paradoxical excitation comparison (PV vs SST)
+    2. Firing rate inequality changes (Gini coefficients)
+    3. Statistical validity metrics (effect sizes, p-values, power)
+    4. Comparison to experimental benchmarks
+    5. Multi-trial robustness
+    
+    Args:
+        pv_results: Results dict from monte_carlo_analysis() for PV stimulation
+        sst_results: Results dict from monte_carlo_analysis() for SST stimulation
+        output_dir: Directory to save plots
+        show_plots: Whether to display plots
+    """
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    # Set publication style
+    plt.style.use('seaborn-v0_8-paper')
+    sns.set_context("paper", font_scale=1.2)
+    
+    # Create figure with 3x3 grid
+    fig = plt.figure(figsize=(18, 14))
+    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
+    
+    # Define colors
+    colors = {
+        'pv': '#E69F00',  # Orange
+        'sst': '#56B4E9',  # Sky blue
+        'gc': '#009E73',   # Green
+        'mc': '#F0E442',   # Yellow
+    }
+    
+    populations = ['gc', 'mc']
+    
+    # ============================================================================
+    # PANEL A: Paradoxical Excitation - PV vs SST Comparison (Top Left)
+    # ============================================================================
+    ax_para = fig.add_subplot(gs[0, 0])
+    plot_paradoxical_comparison(ax_para, pv_results, sst_results, populations, colors)
+    ax_para.text(-0.15, 1.05, 'A', transform=ax_para.transAxes, 
+                fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL B: Gini Coefficient Changes - PV vs SST (Top Middle)
+    # ============================================================================
+    ax_gini = fig.add_subplot(gs[0, 1])
+    plot_gini_comparison(ax_gini, pv_results, sst_results, populations, colors)
+    ax_gini.text(-0.15, 1.05, 'B', transform=ax_gini.transAxes,
+                fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL C: Effect Sizes (Cohen's d) Heatmap (Top Right)
+    # ============================================================================
+    ax_effect = fig.add_subplot(gs[0, 2])
+    plot_effect_size_heatmap(ax_effect, pv_results, sst_results, populations)
+    ax_effect.text(-0.15, 1.05, 'C', transform=ax_effect.transAxes,
+                  fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL D: Statistical Power Analysis (Middle Left)
+    # ============================================================================
+    ax_power = fig.add_subplot(gs[1, 0])
+    plot_power_comparison(ax_power, pv_results, sst_results, populations)
+    ax_power.text(-0.15, 1.05, 'D', transform=ax_power.transAxes,
+                 fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL E: P-value Summary (Middle Center)
+    # ============================================================================
+    ax_pval = fig.add_subplot(gs[1, 1])
+    plot_pvalue_comparison(ax_pval, pv_results, sst_results, populations)
+    ax_pval.text(-0.15, 1.05, 'E', transform=ax_pval.transAxes,
+                fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL F: Model Validation vs Experimental Data (Middle Right)
+    # ============================================================================
+    ax_valid = fig.add_subplot(gs[1, 2])
+    plot_validation_comparison(ax_valid, pv_results, sst_results)
+    ax_valid.text(-0.15, 1.05, 'F', transform=ax_valid.transAxes,
+                 fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL G: Distribution Comparison - GC (Bottom Left)
+    # ============================================================================
+    ax_gc = fig.add_subplot(gs[2, 0])
+    plot_population_distributions(ax_gc, pv_results, sst_results, 'gc', colors)
+    ax_gc.text(-0.15, 1.05, 'G', transform=ax_gc.transAxes,
+              fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL H: Distribution Comparison - MC (Bottom Middle)
+    # ============================================================================
+    ax_mc = fig.add_subplot(gs[2, 1])
+    plot_population_distributions(ax_mc, pv_results, sst_results, 'mc', colors)
+    ax_mc.text(-0.15, 1.05, 'H', transform=ax_mc.transAxes,
+              fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # PANEL I: Overall Summary Statistics (Bottom Right)
+    # ============================================================================
+    ax_summary = fig.add_subplot(gs[2, 2])
+    plot_summary_statistics(ax_summary, pv_results, sst_results)
+    ax_summary.text(-0.15, 1.05, 'I', transform=ax_summary.transAxes,
+                   fontsize=20, fontweight='bold', va='top')
+    
+    # Main title
+    n_trials = len(pv_results['raw_results']['full_network'])
+    fig.suptitle(f'Statistical Validity: Paradoxical Excitation and Firing Rate Inequality\n' +
+                f'(n={n_trials} trials per condition per stimulation type)',
+                fontsize=16, fontweight='bold', y=0.995)
+    
+    # Save figure
+    output_file = output_path / "statistical_validity_summary.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    
+    output_file_pdf = output_path / "statistical_validity_summary.pdf"
+    plt.savefig(output_file_pdf, bbox_inches='tight')
+    
+    print(f"Saved statistical validity plots: {output_file} and {output_file_pdf}")
+    
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+
+
+
+def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors):
+    """Compare paradoxical excitation between PV and SST stimulation"""
+    
+    x_pos = np.arange(len(populations))
+    width = 0.35
+    
+    pv_means = []
+    pv_sems = []
+    sst_means = []
+    sst_sems = []
+    
+    for pop in populations:
+        # PV data
+        pv_trials = pv_results['raw_results']['full_network']
+        pv_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in pv_trials]
+        pv_values = [v for v in pv_values if not np.isnan(v)]
+        pv_means.append(np.mean(pv_values))
+        pv_sems.append(np.std(pv_values) / np.sqrt(len(pv_values)))
+        
+        # SST data
+        sst_trials = sst_results['raw_results']['full_network']
+        sst_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in sst_trials]
+        sst_values = [v for v in sst_values if not np.isnan(v)]
+        sst_means.append(np.mean(sst_values))
+        sst_sems.append(np.std(sst_values) / np.sqrt(len(sst_values)))
+    
+    # Create bars
+    bars1 = ax.bar(x_pos - width/2, pv_means, width, yerr=pv_sems,
+                   label='PV Stimulation', color=colors['pv'], alpha=0.8,
+                   capsize=5, edgecolor='black', linewidth=1.5)
+    bars2 = ax.bar(x_pos + width/2, sst_means, width, yerr=sst_sems,
+                   label='SST Stimulation', color=colors['sst'], alpha=0.8,
+                   capsize=5, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    # Add statistical significance markers
+    for i, pop in enumerate(populations):
+        pv_trials = pv_results['raw_results']['full_network']
+        sst_trials = sst_results['raw_results']['full_network']
+        
+        pv_vals = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in pv_trials]
+        sst_vals = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in sst_trials]
+        
+        pv_vals = [v for v in pv_vals if not np.isnan(v)]
+        sst_vals = [v for v in sst_vals if not np.isnan(v)]
+        
+        if len(pv_vals) > 0 and len(sst_vals) > 0:
+            t_stat, p_value = stats.ttest_ind(pv_vals, sst_vals)
+            
+            y_max = max(pv_means[i] + pv_sems[i], sst_means[i] + sst_sems[i])
+            y_pos = y_max * 1.15
+            
+            if p_value < 0.001:
+                marker = '***'
+            elif p_value < 0.01:
+                marker = '**'
+            elif p_value < 0.05:
+                marker = '*'
+            else:
+                marker = 'ns'
+            
+            # Draw significance bracket
+            x1 = i - width/2
+            x2 = i + width/2
+            ax.plot([x1, x1, x2, x2], [y_pos*0.95, y_pos, y_pos, y_pos*0.95], 
+                   'k-', linewidth=1.5)
+            ax.text(i, y_pos*1.02, marker, ha='center', va='bottom',
+                   fontsize=12, fontweight='bold')
+    
+    ax.set_xlabel('Population', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Paradoxical Excitation Fraction', fontsize=11, fontweight='bold')
+    ax.set_title('Paradoxical Excitation:\nPV vs SST Stimulation', 
+                fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([p.upper() for p in populations], fontsize=11)
+    ax.legend(fontsize=10, frameon=True, fancybox=True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+
+
+def plot_gini_comparison(ax, pv_results, sst_results, populations, colors):
+    """Compare Gini coefficient changes between PV and SST stimulation"""
+    
+    x_pos = np.arange(len(populations))
+    width = 0.35
+    
+    pv_means = []
+    pv_sems = []
+    sst_means = []
+    sst_sems = []
+    
+    for pop in populations:
+        # PV data
+        pv_trials = pv_results['raw_results']['full_network']
+        pv_values = [t.get(f'{pop}_gini_change', np.nan) for t in pv_trials]
+        pv_values = [v for v in pv_values if not np.isnan(v)]
+        pv_means.append(np.mean(pv_values))
+        pv_sems.append(np.std(pv_values) / np.sqrt(len(pv_values)))
+        
+        # SST data
+        sst_trials = sst_results['raw_results']['full_network']
+        sst_values = [t.get(f'{pop}_gini_change', np.nan) for t in sst_trials]
+        sst_values = [v for v in sst_values if not np.isnan(v)]
+        sst_means.append(np.mean(sst_values))
+        sst_sems.append(np.std(sst_values) / np.sqrt(len(sst_values)))
+    
+    # Create bars
+    bars1 = ax.bar(x_pos - width/2, pv_means, width, yerr=pv_sems,
+                   label='PV Stimulation', color=colors['pv'], alpha=0.8,
+                   capsize=5, edgecolor='black', linewidth=1.5)
+    bars2 = ax.bar(x_pos + width/2, sst_means, width, yerr=sst_sems,
+                   label='SST Stimulation', color=colors['sst'], alpha=0.8,
+                   capsize=5, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.3f}', ha='center', 
+                   va='bottom' if height > 0 else 'top', fontsize=9)
+    
+    ax.set_xlabel('Population', fontsize=11, fontweight='bold')
+    ax.set_ylabel(r'$\Delta$ Gini Coefficient', fontsize=11, fontweight='bold')
+    ax.set_title('Firing Rate Inequality:\nPV vs SST Stimulation',
+                fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([p.upper() for p in populations], fontsize=11)
+    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=2)
+    ax.legend(fontsize=10, frameon=True, fancybox=True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+
+
+def plot_effect_size_heatmap(ax, pv_results, sst_results, populations):
+    """Create heatmap of effect sizes (Cohen's d) for primary hypothesis"""
+    
+    # Collect effect sizes
+    effect_matrix = []
+    row_labels = []
+    
+    for target, results in [('PV', pv_results), ('SST', sst_results)]:
+        primary = results['statistical_analysis']['primary_hypothesis']
+        row_effects = []
+        
+        for pop in populations:
+            metric = f'{pop}_paradoxical_fraction'
+            if metric in primary:
+                d = primary[metric].cohens_d
+                row_effects.append(d)
+            else:
+                row_effects.append(0)
+        
+        effect_matrix.append(row_effects)
+        row_labels.append(f'{target} Stim')
+    
+    effect_matrix = np.array(effect_matrix)
+    
+    # Create heatmap
+    im = ax.imshow(effect_matrix, cmap='RdBu_r', aspect='auto', 
+                   vmin=-1.5, vmax=1.5)
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Cohen's d", rotation=270, labelpad=20, fontsize=10)
+    
+    # Set ticks and labels
+    ax.set_xticks(np.arange(len(populations)))
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_xticklabels([p.upper() for p in populations], fontsize=11)
+    ax.set_yticklabels(row_labels, fontsize=11)
+    
+    # Add text annotations
+    for i in range(len(row_labels)):
+        for j in range(len(populations)):
+            text = ax.text(j, i, f'{effect_matrix[i, j]:.2f}',
+                          ha="center", va="center", color="black", fontsize=11,
+                          fontweight='bold')
+    
+    ax.set_title("Effect Sizes (Cohen's d)\nFull Network vs CNQX/APV",
+                fontsize=12, fontweight='bold')
+    ax.set_xlabel('Population', fontsize=11, fontweight='bold')
+    
+    # Add reference lines for effect size interpretation
+    ax.text(1.15, -0.15, 'Small: |d|<0.5\nMedium: 0.5≤|d|<0.8\nLarge: |d|≥0.8',
+           transform=ax.transAxes, fontsize=8, va='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+
+def plot_power_comparison(ax, pv_results, sst_results, populations):
+    """Compare statistical power between PV and SST experiments"""
+    
+    x_pos = np.arange(len(populations))
+    width = 0.35
+    
+    pv_powers = []
+    sst_powers = []
+    
+    for pop in populations:
+        # PV power
+        pv_primary = pv_results['statistical_analysis']['primary_hypothesis']
+        metric = f'{pop}_paradoxical_fraction'
+        if metric in pv_primary:
+            pv_powers.append(pv_primary[metric].statistical_power)
+        else:
+            pv_powers.append(0)
+        
+        # SST power
+        sst_primary = sst_results['statistical_analysis']['primary_hypothesis']
+        if metric in sst_primary:
+            sst_powers.append(sst_primary[metric].statistical_power)
+        else:
+            sst_powers.append(0)
+    
+    # Create bars
+    bars1 = ax.bar(x_pos - width/2, pv_powers, width,
+                   label='PV Stimulation', alpha=0.8,
+                   edgecolor='black', linewidth=1.5)
+    bars2 = ax.bar(x_pos + width/2, sst_powers, width,
+                   label='SST Stimulation', alpha=0.8,
+                   edgecolor='black', linewidth=1.5)
+    
+    # Color bars by power level
+    for bars, powers in [(bars1, pv_powers), (bars2, sst_powers)]:
+        for bar, power in zip(bars, powers):
+            if power >= 0.8:
+                bar.set_facecolor('#2E8B57')  # Green
+            elif power >= 0.6:
+                bar.set_facecolor('#FFA500')  # Orange
+            else:
+                bar.set_facecolor('#DC143C')  # Red
+    
+    # Add value labels
+    for bars, powers in [(bars1, pv_powers), (bars2, sst_powers)]:
+        for bar, power in zip(bars, powers):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{power:.2f}', ha='center', va='bottom', fontsize=9)
+    
+    ax.set_xlabel('Population', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Statistical Power', fontsize=11, fontweight='bold')
+    ax.set_title('Statistical Power Analysis\n(Primary Hypothesis Test)',
+                fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([p.upper() for p in populations], fontsize=11)
+    ax.axhline(y=0.8, color='green', linestyle='--', alpha=0.6, 
+              linewidth=2, label='Adequate (0.8)')
+    ax.axhline(y=0.6, color='orange', linestyle='--', alpha=0.6,
+              linewidth=2, label='Marginal (0.6)')
+    ax.set_ylim([0, 1])
+    ax.legend(fontsize=9, frameon=True, fancybox=True, loc='lower right')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+
+
+def plot_pvalue_comparison(ax, pv_results, sst_results, populations):
+    """Compare p-values between PV and SST experiments"""
+    
+    # Collect p-values
+    pvalue_matrix = []
+    row_labels = []
+    
+    for target, results in [('PV', pv_results), ('SST', sst_results)]:
+        primary = results['statistical_analysis']['primary_hypothesis']
+        row_pvals = []
+        
+        for pop in populations:
+            metric = f'{pop}_paradoxical_fraction'
+            if metric in primary:
+                p = primary[metric].p_value
+                # Convert to -log10 scale for visualization
+                row_pvals.append(-np.log10(p + 1e-10))
+            else:
+                row_pvals.append(0)
+        
+        pvalue_matrix.append(row_pvals)
+        row_labels.append(f'{target} Stim')
+    
+    pvalue_matrix = np.array(pvalue_matrix)
+    
+    # Create heatmap
+    im = ax.imshow(pvalue_matrix, cmap='Reds', aspect='auto', 
+                   vmin=0, vmax=5)
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('-log₁₀(p-value)', rotation=270, labelpad=20, fontsize=10)
+    
+    # Set ticks and labels
+    ax.set_xticks(np.arange(len(populations)))
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_xticklabels([p.upper() for p in populations], fontsize=11)
+    ax.set_yticklabels(row_labels, fontsize=11)
+    
+    # Add text annotations with significance markers
+    for i in range(len(row_labels)):
+        for j in range(len(populations)):
+            # Get actual p-value
+            target = 'PV' if i == 0 else 'SST'
+            results = pv_results if i == 0 else sst_results
+            primary = results['statistical_analysis']['primary_hypothesis']
+            metric = f'{populations[j]}_paradoxical_fraction'
+            
+            if metric in primary:
+                p = primary[metric].p_value
+                
+                if p < 0.001:
+                    marker = '***'
+                elif p < 0.01:
+                    marker = '**'
+                elif p < 0.05:
+                    marker = '*'
+                else:
+                    marker = 'ns'
+                
+                color = 'white' if pvalue_matrix[i, j] > 2 else 'black'
+                ax.text(j, i, f'{pvalue_matrix[i, j]:.1f}\n{marker}',
+                       ha="center", va="center", color=color, fontsize=10,
+                       fontweight='bold')
+    
+    ax.set_title('Statistical Significance\n(Primary Hypothesis Test)',
+                fontsize=12, fontweight='bold')
+    ax.set_xlabel('Population', fontsize=11, fontweight='bold')
+    
+    # Add reference lines
+    ax.axhline(y=-0.5, color='black', linewidth=2)
+    ax.text(1.15, -0.15, 'p<0.001: ***\np<0.01: **\np<0.05: *\np≥0.05: ns',
+           transform=ax.transAxes, fontsize=8, va='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+
+def plot_validation_comparison(ax, pv_results, sst_results):
+    """Compare model predictions to experimental benchmarks"""
+    
+    benchmarks = ExperimentalBenchmarks()
+    
+    # Define metrics and their experimental values
+    metrics_data = [
+        ('GC\n(PV stim)', 
+         'gc_paradoxical_fraction', 
+         benchmarks.pv_paradoxical_gc_fraction,
+         pv_results),
+        ('MC\n(PV stim)', 
+         'mc_paradoxical_fraction',
+         benchmarks.pv_paradoxical_mc_fraction,
+         pv_results),
+        ('GC\n(SST stim)',
+         'gc_paradoxical_fraction',
+         benchmarks.sst_paradoxical_gc_fraction,
+         sst_results),
+        ('MC\n(SST stim)',
+         'mc_paradoxical_fraction',
+         benchmarks.sst_paradoxical_mc_fraction,
+         sst_results),
+    ]
+    
+    x_pos = np.arange(len(metrics_data))
+    width = 0.35
+    
+    model_means = []
+    model_sems = []
+    exp_values = []
+    
+    for label, metric, exp_val, results in metrics_data:
+        trials = results['raw_results']['full_network']
+        values = [t.get(metric, np.nan) for t in trials]
+        values = [v for v in values if not np.isnan(v)]
+        
+        if len(values) > 0:
+            model_means.append(np.mean(values))
+            model_sems.append(np.std(values) / np.sqrt(len(values)))
+        else:
+            model_means.append(0)
+            model_sems.append(0)
+        
+        exp_values.append(exp_val)
+    
+    # Create bars for model
+    bars = ax.bar(x_pos, model_means, width, yerr=model_sems,
+                  label='Model', color='#2E86AB', alpha=0.7,
+                  capsize=5, edgecolor='black', linewidth=1.5)
+    
+    # Add experimental data as scatter
+    ax.scatter(x_pos, exp_values, color='red', s=150,
+              marker='D', label='Experimental', zorder=10,
+              edgecolors='black', linewidth=2)
+    
+    # Add connecting lines showing agreement
+    for i, (m, e) in enumerate(zip(model_means, exp_values)):
+        ax.plot([i, i], [m, e], 'k--', alpha=0.3, linewidth=1)
+    
+    ax.set_xlabel('Condition', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Paradoxical Excitation Fraction', fontsize=11, fontweight='bold')
+    ax.set_title('Model Validation vs\nExperimental Benchmarks',
+                fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([m[0] for m in metrics_data], fontsize=9)
+    ax.legend(fontsize=10, frameon=True, fancybox=True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+    
+    # Calculate and display RMSE
+    rmse = np.sqrt(np.mean([(m - e)**2 for m, e in zip(model_means, exp_values)]))
+    ax.text(0.98, 0.98, f'RMSE: {rmse:.4f}', transform=ax.transAxes,
+           ha='right', va='top', fontsize=9,
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+
+
+def plot_population_distributions(ax, pv_results, sst_results, pop, colors):
+    """Plot detailed distributions for a specific population"""
+    
+    # Get full network data for both conditions
+    pv_full = pv_results['raw_results']['full_network']
+    pv_cnqx = pv_results['raw_results']['cnqx_apv']
+    sst_full = sst_results['raw_results']['full_network']
+    sst_cnqx = sst_results['raw_results']['cnqx_apv']
+    
+    metric = f'{pop}_paradoxical_fraction'
+    
+    # Extract values
+    pv_full_vals = [t.get(metric, np.nan) for t in pv_full]
+    pv_cnqx_vals = [t.get(metric, np.nan) for t in pv_cnqx]
+    sst_full_vals = [t.get(metric, np.nan) for t in sst_full]
+    sst_cnqx_vals = [t.get(metric, np.nan) for t in sst_cnqx]
+    
+    # Remove NaNs
+    pv_full_vals = [v for v in pv_full_vals if not np.isnan(v)]
+    pv_cnqx_vals = [v for v in pv_cnqx_vals if not np.isnan(v)]
+    sst_full_vals = [v for v in sst_full_vals if not np.isnan(v)]
+    sst_cnqx_vals = [v for v in sst_cnqx_vals if not np.isnan(v)]
+    
+    # Create violin plots
+    data = [pv_full_vals, pv_cnqx_vals, sst_full_vals, sst_cnqx_vals]
+    positions = [1, 2, 3.5, 4.5]
+    plot_colors = [colors['pv'], '#CCCCCC', colors['sst'], '#CCCCCC']
+    
+    parts = ax.violinplot(data, positions=positions, showmeans=True,
+                         showextrema=True, widths=0.7)
+    
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(plot_colors[i])
+        pc.set_alpha(0.7)
+        pc.set_edgecolor('black')
+        pc.set_linewidth(1.5)
+    
+    # Add box plots overlay
+    bp = ax.boxplot(data, positions=positions, widths=0.3, showfliers=False,
+                   boxprops=dict(linewidth=1.5, color='black'),
+                   whiskerprops=dict(linewidth=1.5, color='black'),
+                   capprops=dict(linewidth=1.5, color='black'),
+                   medianprops=dict(linewidth=2, color='red'))
+    
+    # Add significance brackets
+    # PV: Full vs CNQX
+    t1, p1 = stats.ttest_ind(pv_full_vals, pv_cnqx_vals)
+    y1 = max(max(pv_full_vals), max(pv_cnqx_vals)) * 1.1
+    ax.plot([1, 1, 2, 2], [y1*0.98, y1, y1, y1*0.98], 'k-', linewidth=1.5)
+    marker1 = '***' if p1 < 0.001 else '**' if p1 < 0.01 else '*' if p1 < 0.05 else 'ns'
+    ax.text(1.5, y1*1.02, marker1, ha='center', va='bottom',
+           fontsize=11, fontweight='bold')
+    
+    # SST: Full vs CNQX
+    t2, p2 = stats.ttest_ind(sst_full_vals, sst_cnqx_vals)
+    y2 = max(max(sst_full_vals), max(sst_cnqx_vals)) * 1.1
+    ax.plot([3.5, 3.5, 4.5, 4.5], [y2*0.98, y2, y2, y2*0.98], 'k-', linewidth=1.5)
+    marker2 = '***' if p2 < 0.001 else '**' if p2 < 0.01 else '*' if p2 < 0.05 else 'ns'
+    ax.text(4, y2*1.02, marker2, ha='center', va='bottom',
+           fontsize=11, fontweight='bold')
+    
+    ax.set_xticks(positions)
+    ax.set_xticklabels(['PV\nFull', 'PV\nCNQX', 'SST\nFull', 'SST\nCNQX'],
+                      fontsize=9)
+    ax.set_ylabel('Paradoxical Excitation\nFraction', fontsize=10, fontweight='bold')
+    ax.set_title(f'{pop.upper()} Response Distributions\n(Multi-trial)',
+                fontsize=11, fontweight='bold')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+
+
+def plot_summary_statistics(ax, pv_results, sst_results):
+    """Display comprehensive summary statistics"""
+    
+    ax.axis('off')
+    
+    pv_primary = pv_results['statistical_analysis']['primary_hypothesis']
+    sst_primary = sst_results['statistical_analysis']['primary_hypothesis']
+    
+    n_trials = len(pv_results['raw_results']['full_network'])
+    
+    summary_text = "Summary Statistics\n"
+    summary_text += "=" * 45 + "\n\n"
+    summary_text += f"Trials per condition: {n_trials}\n"
+    summary_text += f"Total simulations: {n_trials * 6 * 2}\n\n"
+    
+    # PV Summary
+    summary_text += "PV stimulation:\n"
+    summary_text += "-" * 45 + "\n"
+    
+    pv_network = pv_primary.get('network_total_paradoxical')
+    if pv_network:
+        summary_text += f"Network-wide paradoxical excitation:\n"
+        summary_text += f"  Effect size (d): {pv_network.cohens_d:+.3f}\n"
+        summary_text += f"  P-value: {pv_network.p_value:.2e}\n"
+        summary_text += f"  Power: {pv_network.statistical_power:.2f}\n"
+        summary_text += f"  Interpretation: {pv_network.interpretation}\n\n"
+    
+    # SST Summary
+    summary_text += "SST stimulation:\n"
+    summary_text += "-" * 45 + "\n"
+    
+    sst_network = sst_primary.get('network_total_paradoxical')
+    if sst_network:
+        summary_text += f"Network-wide paradoxical excitation:\n"
+        summary_text += f"  Effect size (d): {sst_network.cohens_d:+.3f}\n"
+        summary_text += f"  P-value: {sst_network.p_value:.2e}\n"
+        summary_text += f"  Power: {sst_network.statistical_power:.2f}\n"
+        summary_text += f"  Interpretation: {sst_network.interpretation}\n\n"
+    
+    # Overall Conclusion
+    summary_text += "Overall conclusion:\n"
+    summary_text += "-" * 45 + "\n"
+    
+    pv_strong = (pv_network and pv_network.p_value < 0.001 and 
+                abs(pv_network.cohens_d) > 0.5)
+    sst_strong = (sst_network and sst_network.p_value < 0.001 and 
+                 abs(sst_network.cohens_d) > 0.5)
+    
+    if pv_strong and sst_strong:
+        summary_text += "Strong evidence for disinhibition\n"
+        summary_text += "hypothesis in BOTH PV and SST\n"
+        summary_text += "stimulation conditions.\n\n"
+        summary_text += "Both show:\n"
+        summary_text += "- Highly significant effects\n"
+        summary_text += "- Large effect sizes\n"
+        summary_text += "- Adequate statistical power\n"
+    elif pv_strong or sst_strong:
+        summary_text += "Moderate evidence for\n"
+        summary_text += "disinhibition hypothesis.\n\n"
+        if pv_strong:
+            summary_text += "Strong support for PV,\n"
+            summary_text += "weaker for SST.\n"
+        else:
+            summary_text += "Strong support for SST,\n"
+            summary_text += "weaker for PV.\n"
+    else:
+        summary_text += "Insufficient evidence for\n"
+        summary_text += "strong conclusions about\n"
+        summary_text += "disinhibition hypothesis.\n"
+    
+    ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
+           fontsize=9, verticalalignment='top', fontfamily='monospace',
+           bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+        
 def plot_monte_carlo_results(mc_results: Dict,
                             validation_results: Dict = None,
                             output_dir: str = ".",
@@ -1837,118 +2546,6 @@ def plot_statistical_summary_box(ax, mc_results):
     ax.text(0.05, 0.95, summary_text, transform=ax.transAxes, va='top', ha='left',
            fontsize=10, fontfamily='monospace',
            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-    
-
-def run_statistical_analysis(
-    target_populations: List[str] = ['pv', 'sst'],
-    n_trials: int = 50,
-    light_intensity: float = 1.0,
-    mec_current: float = 100.0,
-    opsin_current: float = 100.0,
-    n_workers: int = 1,
-    optimization_json_file: str = None,
-    output_dir: str = "./statistical_results"):
-    """
-    Run statistical analysis for both PV and SST stimulation
-    
-    Args:
-        target_populations: List of populations to test
-        n_trials: Number of Monte Carlo trials per condition
-        light_intensity: Optogenetic stimulation intensity
-        mec_current: MEC drive current (pA)
-        opsin_current: Direct opsin activation current (pA)
-        optimization_json_file: Path to optimization results (optional)
-        output_dir: Directory for saving results
-    """
-    
-    print("=" * 80)
-    print("Statistical analysis of dg disinhibition hypothesis")
-    print(f"Multi-trial Monte Carlo approach (n={n_trials} trials per condition)")
-    print("=" * 80)
-    
-    # Create output directory
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    
-    all_results = {}
-    
-    for target in target_populations:
-        print(f"\n\nAnalyzing {target.upper()} stimulation...")
-        print("-" * 80)
-        
-        # Initialize tester
-        tester = DisinhibitionHypothesisTester(
-            n_trials=n_trials,
-            optimization_json_file=optimization_json_file
-        )
-        
-        # Run Monte Carlo analysis
-        mc_results = tester.monte_carlo_analysis(
-            target,
-            light_intensity=light_intensity,
-            mec_current=mec_current,
-            opsin_current=opsin_current,
-            n_workers = n_workers,
-            use_multiprocessing = True)
-        
-        # Validate against experimental data
-        validation_results = tester.validate_against_experimental_data(mc_results)
-        
-        # Generate report
-        report = tester.generate_statistical_report(
-            mc_results,
-            validation_results,
-            output_file=str(output_path / f"report_{target}.txt")
-        )
-        
-        print("\n" + report)
-        
-        # Save results
-        tester.save_results(mc_results, validation_results, output_dir=str(output_path))
-        
-        # Create comprehensive plots (existing function)
-        print("\nGenerating statistical analysis plots...")
-        plot_monte_carlo_results(
-            mc_results,
-            validation_results,
-            output_dir=str(output_path),
-            show_plots=False
-        )
-        
-        # Create violin plots showing multi-trial distributions
-        print("Generating multi-trial violin plots...")
-        plot_paradoxical_excitation_violins(
-            mc_results,
-            output_dir=str(output_path),
-            show_plots=False
-        )
-        
-        # Additional detailed violin plot
-        print("Generating detailed violin plots...")
-        create_violin_plots(
-            mc_results,
-            validation_results,
-            output_dir=str(output_path),
-            show_plots=False
-        )
-        
-        all_results[target] = {
-            'mc_results': mc_results,
-            'validation': validation_results,
-            'report': report
-        }
-    
-    print("\n" + "=" * 80)
-    print(f"Analysis complete. Results saved to: {output_path}")
-    print("\nGenerated files:")
-    print("  - monte_carlo_analysis_[target].png (overall analysis)")
-    print("  - paradoxical_excitation_violins_[target].png (multi-trial distributions)")
-    print("  - detailed_violins_[target].png (detailed violin plots)")
-    print("  - report_[target].txt (statistical report)")
-    print("  - mc_results_[target].pkl (raw data)")
-    print("=" * 80)
-    
-    return all_results
 
 
 def create_violin_plots(mc_results: Dict,
@@ -2176,6 +2773,131 @@ def create_violin_plots(mc_results: Dict,
     else:
         plt.close()
 
+    
+
+def run_statistical_analysis(
+    target_populations: List[str] = ['pv', 'sst'],
+    n_trials: int = 50,
+    light_intensity: float = 1.0,
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    n_workers: int = 1,
+    optimization_json_file: str = None,
+    output_dir: str = "./statistical_results"):
+    """
+    Run statistical analysis for both PV and SST stimulation
+    
+    Args:
+        target_populations: List of populations to test
+        n_trials: Number of Monte Carlo trials per condition
+        light_intensity: Optogenetic stimulation intensity
+        mec_current: MEC drive current (pA)
+        opsin_current: Direct opsin activation current (pA)
+        optimization_json_file: Path to optimization results (optional)
+        output_dir: Directory for saving results
+    """
+    
+    print("=" * 80)
+    print("Statistical analysis of DG disinhibition hypothesis")
+    print(f"Multi-trial Monte Carlo approach (n={n_trials} trials per condition)")
+    print("=" * 80)
+    
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    all_results = {}
+    
+    for target in target_populations:
+        print(f"\n\nAnalyzing {target.upper()} stimulation...")
+        print("-" * 80)
+        
+        # Initialize tester
+        tester = DisinhibitionHypothesisTester(
+            n_trials=n_trials,
+            optimization_json_file=optimization_json_file
+        )
+        
+        # Run Monte Carlo analysis
+        mc_results = tester.monte_carlo_analysis(
+            target,
+            light_intensity=light_intensity,
+            mec_current=mec_current,
+            opsin_current=opsin_current,
+            n_workers = n_workers,
+            use_multiprocessing = True)
+        
+        # Validate against experimental data
+        validation_results = tester.validate_against_experimental_data(mc_results)
+        
+        # Generate report
+        report = tester.generate_statistical_report(
+            mc_results,
+            validation_results,
+            output_file=str(output_path / f"report_{target}.txt")
+        )
+        
+        print("\n" + report)
+        
+        # Save results
+        tester.save_results(mc_results, validation_results, output_dir=str(output_path))
+        
+        # Create plots
+        print("\nGenerating statistical analysis plots...")
+
+        
+        plot_monte_carlo_results(
+            mc_results,
+            validation_results,
+            output_dir=str(output_path),
+            show_plots=False
+        )
+        
+        # Create violin plots showing multi-trial distributions
+        print("Generating multi-trial violin plots...")
+        plot_paradoxical_excitation_violins(
+            mc_results,
+            output_dir=str(output_path),
+            show_plots=False
+        )
+        
+        # Additional detailed violin plot
+        print("Generating detailed violin plots...")
+        create_violin_plots(
+            mc_results,
+            validation_results,
+            output_dir=str(output_path),
+            show_plots=False
+        )
+        
+        all_results[target] = {
+            'mc_results': mc_results,
+            'validation': validation_results,
+            'report': report
+        }
+
+
+    if 'pv' in all_results and 'sst' in all_results:
+        print("\nGenerating overall statistical validity summary plot...")
+        plot_statistical_validity_summary(
+            all_results['pv']['mc_results'],
+            all_results['sst']['mc_results'],
+            output_dir=output_dir,
+            show_plots=False
+        )
+        
+    print("\n" + "=" * 80)
+    print(f"Analysis complete. Results saved to: {output_path}")
+    print("\nGenerated files:")
+    print("  - monte_carlo_analysis_[target].png (overall analysis)")
+    print("  - paradoxical_excitation_violins_[target].png (multi-trial distributions)")
+    print("  - detailed_violins_[target].png (detailed violin plots)")
+    print("  - report_[target].txt (statistical report)")
+    print("  - mc_results_[target].pkl (raw data)")
+    print("=" * 80)
+    
+    return all_results
+
 
 if __name__ == "__main__":
     # Example usage
@@ -2191,11 +2913,11 @@ if __name__ == "__main__":
     # Run analysis
     results = run_statistical_analysis(
         target_populations=['sst', 'pv'],
-        n_trials=150,
+        n_trials=2,
         light_intensity=1.0,
         mec_current=40.0,
         opsin_current=200.0,
-        n_workers = 80,
+        n_workers = 2,
         optimization_json_file=optimization_file,
         output_dir="./statistical_results"
     )
