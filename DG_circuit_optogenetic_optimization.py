@@ -42,10 +42,6 @@ class OptogeneticTargets:
         }
     })
     
-    # Minimum firing rate change to count as "activated"
-    # (as fraction of baseline standard deviation)
-    activation_threshold: float = 2.0
-    
     # Target for increased inequality (Gini coefficient change)
     target_gini_increase: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
         'pv': {
@@ -124,12 +120,12 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
     warmup = 150.
     
     exp_result = experiment.simulate_stimulation(target_pop,
-                                                   light_intensity,
-                                                   duration = duration,
-                                                   stim_start = stim_start,
-                                                   mec_current = mec_current,
-                                                   opsin_current = opsin_current,
-                                                   plot_activity = False)
+                                                 light_intensity,
+                                                 duration = duration,
+                                                 stim_start = stim_start,
+                                                 mec_current = mec_current,
+                                                 opsin_current = opsin_current,
+                                                 plot_activity = False)
 
     time = exp_result['time']
     activity = exp_result['activity_trace']
@@ -150,9 +146,17 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
             # Changes
             rate_changes = stim_rates - baseline_rates
             baseline_std = torch.std(baseline_rates)
-            
+
             # Fraction activated
             activated_fraction = torch.mean((rate_changes > baseline_std).float()).item()
+
+            baseline_mean = torch.mean(baseline_rates).item()
+            stim_mean = torch.mean(stim_rates).item()
+            stim_std = torch.std(stim_rates).item()
+            
+            #print(f"{pop} baseline_mean: {baseline_mean} baseline_std: {baseline_std}")
+            #print(f"{pop} stim_mean: {stim_mean} stim_std: {stim_std}")
+            #print(f"{pop} mean_change: {torch.mean(rate_changes).item()} activated_fraction: {activated_fraction}")
             
             # Gini coefficients
             baseline_gini = calculate_gini_coefficient(baseline_rates.numpy())
@@ -219,7 +223,7 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
 
 
 def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_data,
-                                          targets: CombinedOptimizationTargets, config):
+                                 targets: CombinedOptimizationTargets, config):
     """
     Objective worker function including optogenetic objectives
     """
@@ -800,8 +804,7 @@ def save_optimization_results_to_json(results: Dict,
         'optogenetic_targets': {
             'target_rate_increases': targets.optogenetic_targets.target_rate_increases,
             'target_gini_increases': targets.optogenetic_targets.target_gini_increase,
-            'stimulation_intensity': targets.optogenetic_targets.stimulation_intensity,
-            'activation_threshold': targets.optogenetic_targets.activation_threshold,
+            'stimulation_intensity': targets.optogenetic_targets.stimulation_intensity
         },
         
         'optimized_parameters': {
@@ -1040,5 +1043,5 @@ if __name__ == "__main__":
         results['targets'],
         circuit_factory_data,
         'DG_optogenetic_optimization_results.json',
-        mec_drive_levels=[80.0, 150.0, 200.0]
+        mec_drive_levels=[40.0, 80.0, 150.0, 200.0]
     )
