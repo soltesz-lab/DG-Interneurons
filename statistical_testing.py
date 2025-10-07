@@ -252,7 +252,7 @@ class DisinhibitionHypothesisTester:
             # Force CPU usage for multiprocessing (GPU doesn't work well with fork)
             import torch
             torch.set_num_threads(1)  # Prevent nested parallelism
-            
+
             trial_result = self.run_single_trial(
                 target_population,
                 light_intensity,
@@ -403,26 +403,78 @@ class DisinhibitionHypothesisTester:
         
         # Define experimental conditions
         conditions = {
+            
+            # Control condition
             'full_network': {
                 'inhibition_scale': 1.0,
-                'description': 'Full network (control)'
+                'excitation_scale': 1.0,
+            'description': 'Full network (control)'
             },
-            'reduced_inhibition_50': {
-                'inhibition_scale': 0.5,
-                'description': '50% reduced inhibition'
+            
+            # TEST 1: Block excitation TO interneurons only
+            'block_exc_to_interneurons': {
+                'connection_modulation': {
+                    # Minimal excitatory inputs to PV
+                    'mec_pv': 0.01,
+                    'gc_pv': 0.01,
+                    'mc_pv': 0.01,
+                    
+                    # Minimal excitatory inputs to SST
+                    'gc_sst': 0.01,
+                    'mc_sst': 0.01,
+                    # Keep excitation to principal cells intact
+                },
+                'description': 'Block excitation to interneurons only (clean disinhibition test)'
             },
-            'reduced_inhibition_10': {
-                'inhibition_scale': 0.1,
-                'description': '90% reduced inhibition'
+            
+            # TEST 2: Block interneuron -> interneuron connections
+            # Tests whether disinhibition requires interneuron interactions
+            'block_int_to_int': {
+                'connection_modulation': {
+                    'pv_sst': 0.01,
+                    'pv_pv': 0.01,
+                    'sst_pv': 0.01,
+                    'sst_sst': 0.01,
+                },
+                'description': 'Block interneuron-interneuron connections'
             },
-            'cnqx_apv': {
+            
+            # TEST 3: Block MC -> interneuron specifically
+            # MCs provide strong excitation to interneurons
+            'block_mc_to_interneurons': {
+                'connection_modulation': {
+                    'mc_pv': 0.01,
+                    'mc_sst': 0.01,
+                    # Keep other connections intact
+                },
+                'description': 'Block MC excitation to interneurons'
+            },
+            
+            # TEST 4: Original broad CNQX/APV (for comparison)
+            'cnqx_apv_broad': {
                 'excitation_scale': 0.1,
-                'description': 'CNQX/APV (90% blocked glutamate)'
+                'description': 'Broad glutamate blockade'
             },
+            
+            # TEST 5: Block principal -> principal excitation only
+            # Tests whether recurrent excitation is necessary
+            'block_principal_recurrent': {
+                'connection_modulation': {
+                    'gc_mc': 0.01,
+                    'mc_gc': 0.01,
+                    'mc_mc': 0.01,
+                    # Keep excitation to/from interneurons intact
+                },
+                'description': 'Block recurrent excitation among principal cells'
+            },
+            
+            # TEST 6: Gabazine (PV-specific GABA blockade)
             'gabazine': {
                 'pv_inhibition_scale': 0.1,
                 'description': 'Gabazine (90% blocked GABA-A/PV)'
             },
+            
+            # TEST 7: No optogenetic stimulation (negative control)
             'no_stimulation': {
                 'no_stimulation': True,
                 'description': 'No optogenetic stimulation'
@@ -529,34 +581,35 @@ class DisinhibitionHypothesisTester:
             ])
         metrics_to_analyze.append('network_total_paradoxical')
         
-        # Primary comparison: full network vs CNQX/APV (tests disinhibition hypothesis)
-        print("  Primary hypothesis test: Full network vs CNQX/APV...")
-        analysis['primary_hypothesis'] = {}
+        # Primary comparison: full network vs blocking exc. input to inh. INs (tests disinhibition hypothesis)
+        print("  Primary hypothesis test: Full network vs Block Exc->Int...")
+        analysis['primary_disinhibition_test'] = {}
         
         for metric in metrics_to_analyze:
             full_values = [trial.get(metric, np.nan) for trial in results['full_network']]
-            cnqx_values = [trial.get(metric, np.nan) for trial in results['cnqx_apv']]
+            blocked_values = [trial.get(metric, np.nan) for trial in results['block_exc_to_interneurons']]
             
             # Remove NaN values
             full_values = [v for v in full_values if not np.isnan(v)]
-            cnqx_values = [v for v in cnqx_values if not np.isnan(v)]
+            blocked_values = [v for v in blocked_values if not np.isnan(v)]
             
-            if len(full_values) > 0 and len(cnqx_values) > 0:
+            if len(full_values) > 0 and len(blocked_values) > 0:
                 stat_result = self._statistical_comparison(
-                    full_values, cnqx_values, metric
+                    full_values, blocked_values, metric
                 )
-                analysis['primary_hypothesis'][metric] = stat_result
+                analysis['primary_disinhibition_test'][metric] = stat_result
         
         # Secondary comparisons
-        secondary_comparisons = [
-            ('full_network', 'reduced_inhibition_50', 'Disinhibition mechanism'),
-            ('full_network', 'reduced_inhibition_10', 'Strong disinhibition'),
-            ('full_network', 'gabazine', 'PV-specific blockade'),
+        secondary_tests = [
+            ('full_network', 'block_int_to_int', 'Interneuron interaction test'),
+            ('full_network', 'block_mc_to_interneurons', 'MC pathway test'),
+            ('full_network', 'block_principal_recurrent', 'Recurrent excitation test'),
+            ('full_network', 'cnqx_apv_broad', 'Broad blockade (original)'),
             ('full_network', 'no_stimulation', 'Optogenetic control')
         ]
         
         print("  Secondary hypothesis tests...")
-        for condition1, condition2, desc in secondary_comparisons:
+        for condition1, condition2, desc in secondary_tests:
             comparison_key = f'{condition1}_vs_{condition2}'
             analysis[comparison_key] = {'description': desc, 'results': {}}
             
@@ -762,7 +815,7 @@ class DisinhibitionHypothesisTester:
         report.append("-" * 80)
         report.append("\nComparison: Full network vs CNQX/APV (glutamate blockade)")
         
-        primary = analysis['primary_hypothesis']
+        primary = analysis['primary_disinhibition_test']
         for metric, result in primary.items():
             report.append(f"\n{metric}:")
             report.append(f"  Full network:    {result.mean_treatment:.4f} +/- {result.std_treatment:.4f}")
@@ -1048,7 +1101,514 @@ def plot_statistical_validity_summary(pv_results: Dict,
         plt.close()
 
 
+def plot_disinhibition_test_results(mc_results: Dict,
+                                    output_dir: str = ".",
+                                    show_plots: bool = True):
+    """
+    Visualize mechanistic dissection of disinhibition hypothesis
+    
+    Shows effects of targeted ablations to identify key pathways
+    
+    Args:
+        mc_results: Results from monte_carlo_analysis_improved()
+        output_dir: Directory to save plots
+        show_plots: Whether to display plots
+    """
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    plt.style.use('seaborn-v0_8-paper')
+    
+    fig = plt.figure(figsize=(16, 12))
+    target_pop = mc_results['target_population']
+    
+    # Define condition order and colors
+    condition_order = [
+        'full_network',
+        'block_exc_to_interneurons',
+        'block_int_to_int',
+        'block_mc_to_interneurons',
+        'block_principal_recurrent',
+        'cnqx_apv_broad',
+        'no_stimulation'
+    ]
+    
+    condition_colors = {
+        'full_network': '#2E86AB',
+        'block_exc_to_interneurons': '#DC143C',  # Red - key test
+        'block_int_to_int': '#FF8C00',
+        'block_mc_to_interneurons': '#9370DB',
+        'block_principal_recurrent': '#20B2AA',
+        'cnqx_apv_broad': '#808080',
+        'gabazine': '#6A994E',
+        'no_stimulation': '#D3D3D3'
+    }
+    
+    condition_labels = {
+        'full_network': 'Full\nNetwork',
+        'block_exc_to_interneurons': 'Block\nExc->Int',
+        'block_int_to_int': 'Block\nInt→Int',
+        'block_mc_to_interneurons': 'Block\nMC->Int',
+        'block_principal_recurrent': 'Block\nRecurrent',
+        'cnqx_apv_broad': 'CNQX/APV\nBroad',
+        'no_stimulation': 'No\nStim'
+    }
+    
+    # ============================================================================
+    # Panel A: Network-wide paradoxical excitation across conditions
+    # ============================================================================
+    ax1 = plt.subplot(3, 3, 1)
+    plot_condition_comparison(ax1, mc_results, condition_order, condition_colors, 
+                              condition_labels, 'network_total_paradoxical',
+                              'Network-Wide Paradoxical Excitation')
+    ax1.text(-0.15, 1.05, 'A', transform=ax1.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # Panel B: GC paradoxical fraction
+    # ============================================================================
+    ax2 = plt.subplot(3, 3, 2)
+    plot_condition_comparison(ax2, mc_results, condition_order, condition_colors,
+                              condition_labels, 'gc_paradoxical_fraction',
+                              'GC Paradoxical Excitation')
+    ax2.text(-0.15, 1.05, 'B', transform=ax2.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # Panel C: MC paradoxical fraction
+    # ============================================================================
+    ax3 = plt.subplot(3, 3, 3)
+    plot_condition_comparison(ax3, mc_results, condition_order, condition_colors,
+                              condition_labels, 'mc_paradoxical_fraction',
+                              'MC Paradoxical Excitation')
+    ax3.text(-0.15, 1.05, 'C', transform=ax3.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # Panel D: Reduction from baseline (effect sizes)
+    # ============================================================================
+    ax4 = plt.subplot(3, 3, 4)
+    plot_reduction_from_baseline(ax4, mc_results, condition_order, condition_colors,
+                                 condition_labels)
+    ax4.text(-0.15, 1.05, 'D', transform=ax4.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # Panel E: Statistical significance heatmap
+    # ============================================================================
+    ax5 = plt.subplot(3, 3, 5)
+    plot_significance_heatmap(ax5, mc_results, condition_order, condition_labels)
+    ax5.text(-0.15, 1.05, 'E', transform=ax5.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    
+    # ============================================================================
+    # Panel F: Gini coefficient changes
+    # ============================================================================
+    ax6 = plt.subplot(3, 3, 6)
+    plot_condition_comparison(ax6, mc_results, condition_order, condition_colors,
+                              condition_labels, 'gc_gini_change',
+                              'GC Inequality Change')
+    ax6.text(-0.15, 1.05, 'F', transform=ax6.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # Panel G: Pathway diagram
+    # ============================================================================
+    ax7 = plt.subplot(3, 3, 7)
+    plot_pathway_diagram(ax7, target_pop)
+    ax7.text(-0.15, 1.05, 'G', transform=ax7.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    # ============================================================================
+    # Panel I: Conclusion summary
+    # ============================================================================
+    ax9 = plt.subplot(3, 3, 9)
+    plot_conclusion_summary(ax9, mc_results)
+    ax9.text(-0.15, 1.05, 'I', transform=ax9.transAxes,
+            fontsize=20, fontweight='bold', va='top')
+    
+    plt.suptitle(f'Disinhibition Test: {target_pop.upper()} Stimulation\n' +
+                'Targeted Ablations to Test Disinhibition Hypothesis',
+                fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.985])
+    
+    # Save figure
+    output_file = output_path / f"disinhibition_test_{target_pop}.png"
+    plt.savefig(output_file, dpi=600, bbox_inches='tight')
+    
+    output_file_pdf = output_path / f"disinhibition_test_{target_pop}.pdf"
+    plt.savefig(output_file_pdf, bbox_inches='tight')
+    
+    print(f"Saved disinhibition test plots: {output_file}")
+    
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
 
+
+
+
+def plot_condition_comparison(ax, mc_results, condition_order, condition_colors,
+                              condition_labels, metric, title):
+    """Plot comparison across all conditions for a specific metric"""
+    
+    results = mc_results['raw_results']
+    
+    means = []
+    sems = []
+    colors = []
+    labels = []
+    valid_conditions = []  # Track which conditions have valid data
+    
+    for condition in condition_order:
+        if condition not in results:
+            continue
+            
+        trials = results[condition]
+        values = [t.get(metric, np.nan) for t in trials]
+        values = [v for v in values if not np.isnan(v)]
+        
+        if len(values) > 0:
+            means.append(np.mean(values))
+            sems.append(np.std(values) / np.sqrt(len(values)))
+            colors.append(condition_colors[condition])
+            labels.append(condition_labels[condition])
+            valid_conditions.append(condition)  # ✓ Store valid condition name
+    
+    x_pos = np.arange(len(labels))
+    bars = ax.bar(x_pos, means, yerr=sems, color=colors, alpha=0.8,
+                  capsize=4, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels
+    for bar, mean in zip(bars, means):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+               f'{mean:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # Add significance markers vs full network
+    # Get full_network data once
+    if 'full_network' in results:
+        full_values = [t.get(metric, np.nan) for t in results['full_network']]
+        full_values = [v for v in full_values if not np.isnan(v)]
+    else:
+        full_values = []
+    
+    # iterate through valid_conditions with matching indices
+    for i, condition in enumerate(valid_conditions):
+        if condition == 'full_network':
+            continue
+            
+        cond_values = [t.get(metric, np.nan) for t in results[condition]]
+        cond_values = [v for v in cond_values if not np.isnan(v)]
+        
+        if len(full_values) > 0 and len(cond_values) > 0:
+            t_stat, p_value = stats.ttest_ind(full_values, cond_values)
+            
+            if p_value < 0.001:
+                marker = '***'
+            elif p_value < 0.01:
+                marker = '**'
+            elif p_value < 0.05:
+                marker = '*'
+            else:
+                marker = ''
+            
+            if marker:
+                ax.text(i, means[i] + sems[i] * 1.2, marker,
+                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=10)
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+    
+
+def plot_reduction_from_baseline(ax, mc_results, condition_order, condition_colors,
+                                 condition_labels):
+    """Plot reduction in paradoxical excitation relative to full network"""
+    
+    results = mc_results['raw_results']
+    
+    # Get full network baseline
+    if 'full_network' not in results:
+        ax.text(0.5, 0.5, 'No full_network data available', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Effect Size: Reduction in Paradoxical Excitation',
+                    fontsize=11, fontweight='bold')
+        return
+    
+    full_trials = results['full_network']
+    full_values = [t.get('network_total_paradoxical', np.nan) for t in full_trials]
+    full_values = [v for v in full_values if not np.isnan(v)]
+    
+    if len(full_values) == 0:
+        ax.text(0.5, 0.5, 'No valid full_network data', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Effect Size: Reduction in Paradoxical Excitation',
+                    fontsize=11, fontweight='bold')
+        return
+    
+    full_mean = np.mean(full_values)
+    
+    reductions = []
+    reduction_sems = []
+    colors = []
+    labels = []
+    valid_conditions = []  # Track which conditions have valid data
+    
+    for condition in condition_order:
+        if condition == 'full_network' or condition not in results:
+            continue
+            
+        trials = results[condition]
+        values = [t.get('network_total_paradoxical', np.nan) for t in trials]
+        values = [v for v in values if not np.isnan(v)]
+        
+        if len(values) > 0:
+            cond_mean = np.mean(values)
+            reduction = (full_mean - cond_mean) / full_mean * 100  # Percent reduction
+            
+            # Bootstrap SEM for reduction
+            bootstrap_reductions = []
+            for _ in range(1000):
+                boot_full = np.random.choice(full_values, len(full_values), replace=True)
+                boot_cond = np.random.choice(values, len(values), replace=True)
+                boot_reduction = (np.mean(boot_full) - np.mean(boot_cond)) / np.mean(boot_full) * 100
+                bootstrap_reductions.append(boot_reduction)
+            
+            reductions.append(reduction)
+            reduction_sems.append(np.std(bootstrap_reductions))
+            colors.append(condition_colors[condition])
+            labels.append(condition_labels[condition])
+            valid_conditions.append(condition)
+    
+    if len(reductions) == 0:
+        ax.text(0.5, 0.5, 'No valid comparison data', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Effect Size: Reduction in Paradoxical Excitation',
+                    fontsize=11, fontweight='bold')
+        return
+    
+    x_pos = np.arange(len(labels))
+    bars = ax.bar(x_pos, reductions, yerr=reduction_sems, color=colors, alpha=0.8,
+                  capsize=4, edgecolor='black', linewidth=1.5)
+    
+    # Add value labels
+    for bar, reduction in zip(bars, reductions):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+               f'{reduction:.0f}%', ha='center', va='bottom', fontsize=8)
+    
+    # Highlight the key test (block_exc_to_interneurons)
+    if 'block_exc_to_interneurons' in valid_conditions:
+        idx = valid_conditions.index('block_exc_to_interneurons')
+        bars[idx].set_linewidth(3)
+        bars[idx].set_edgecolor('red')
+    
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel('% Reduction from\nFull Network', fontsize=10, fontweight='bold')
+    ax.set_title('Effect Size: Reduction in Paradoxical Excitation',
+                fontsize=11, fontweight='bold')
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=2)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+
+    
+def plot_significance_heatmap(ax, mc_results, condition_order, condition_labels):
+    """Create heatmap of p-values for all condition comparisons"""
+    
+    results = mc_results['raw_results']
+    metrics = ['gc_paradoxical_fraction', 'mc_paradoxical_fraction', 
+               'network_total_paradoxical']
+    
+    # Build matrix
+    conditions = [c for c in condition_order if c in results and c != 'full_network']
+    pvalue_matrix = []
+    
+    for metric in metrics:
+        row = []
+        full_values = [t.get(metric, np.nan) for t in results['full_network']]
+        full_values = [v for v in full_values if not np.isnan(v)]
+        
+        for condition in conditions:
+            cond_values = [t.get(metric, np.nan) for t in results[condition]]
+            cond_values = [v for v in cond_values if not np.isnan(v)]
+            
+            if len(full_values) > 0 and len(cond_values) > 0:
+                t_stat, p_value = stats.ttest_ind(full_values, cond_values)
+                row.append(-np.log10(p_value + 1e-10))
+            else:
+                row.append(0)
+        
+        pvalue_matrix.append(row)
+    
+    pvalue_matrix = np.array(pvalue_matrix)
+    
+    # Create heatmap
+    im = ax.imshow(pvalue_matrix, cmap='Reds', aspect='auto', vmin=0, vmax=5)
+    
+    # Colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('-log₁₀(p-value)', rotation=270, labelpad=15, fontsize=9)
+    
+    # Labels
+    ax.set_xticks(np.arange(len(conditions)))
+    ax.set_yticks(np.arange(len(metrics)))
+    ax.set_xticklabels([condition_labels[c] for c in conditions], 
+                       rotation=45, ha='right', fontsize=8)
+    ax.set_yticklabels([m.replace('_', ' ').title() for m in metrics], fontsize=8)
+    
+    # Annotations
+    for i in range(len(metrics)):
+        for j in range(len(conditions)):
+            text = ax.text(j, i, f'{pvalue_matrix[i, j]:.1f}',
+                          ha="center", va="center", 
+                          color="white" if pvalue_matrix[i, j] > 2.5 else "black",
+                          fontsize=9)
+    
+    ax.set_title('Statistical Significance vs Full Network\n(-log₁₀ p-value)',
+                     fontsize=11, fontweight='bold')
+
+
+def plot_pathway_diagram(ax, target_pop):
+    """Draw simplified pathway diagram showing tested connections"""
+    
+    ax.axis('off')
+    ax.set_xlim([0, 10])
+    ax.set_ylim([0, 10])
+    
+    # Draw nodes
+    nodes = {
+        'MEC': (2, 8),
+        'GC': (2, 5),
+        'MC': (5, 5),
+        'PV': (8, 7),
+        'SST': (8, 3)
+    }
+    
+    for name, (x, y) in nodes.items():
+        if name == target_pop.upper():
+            color = 'red'
+            size = 1500
+        elif name in ['PV', 'SST']:
+            color = 'orange'
+            size = 1000
+        else:
+            color = 'lightblue'
+            size = 1000
+        
+        ax.scatter(x, y, s=size, c=color, alpha=0.7, edgecolors='black', linewidth=2)
+        ax.text(x, y, name, ha='center', va='center', fontsize=11, fontweight='bold')
+    
+    # Draw connections tested
+    arrows = [
+        ('MEC', 'PV', 'green', 'solid', 2),
+        ('GC', 'PV', 'green', 'solid', 2),
+        ('MC', 'PV', 'green', 'solid', 2),
+        ('GC', 'SST', 'green', 'dashed', 1),
+        ('MC', 'SST', 'green', 'solid', 2),
+        ('PV', 'SST', 'red', 'solid', 2),
+        ('SST', 'PV', 'red', 'dashed', 1),
+    ]
+    
+    for src, tgt, color, style, width in arrows:
+        x1, y1 = nodes[src]
+        x2, y2 = nodes[tgt]
+        
+        dx = x2 - x1
+        dy = y2 - y1
+        length = np.sqrt(dx**2 + dy**2)
+        
+        # Shorten to avoid overlap with nodes
+        x1 += dx / length * 0.5
+        y1 += dy / length * 0.5
+        x2 -= dx / length * 0.5
+        y2 -= dy / length * 0.5
+        
+        ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                   arrowprops=dict(arrowstyle='->', lw=width, color=color, 
+                                 linestyle=style, alpha=0.6))
+    
+    ax.set_title('Circuit Connectivity\n(Green=Exc, Red=Inh)', 
+                fontsize=11, fontweight='bold')
+    
+    # Legend
+    ax.text(0.5, 0.5, 'Solid = strong\nDashed = weak',
+           fontsize=8, bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    
+def plot_conclusion_summary(ax, mc_results):
+    """Display overall disinhibition conclusion"""
+    
+    ax.axis('off')
+    
+    # Analyze key comparisons
+    results = mc_results['raw_results']
+    
+    # Full network value
+    full_trials = results['full_network']
+    full_vals = [t.get('network_total_paradoxical', np.nan) for t in full_trials]
+    full_vals = [v for v in full_vals if not np.isnan(v)]
+    full_mean = np.mean(full_vals)
+    
+    # Key test: block_exc_to_interneurons
+    if 'block_exc_to_interneurons' in results:
+        block_trials = results['block_exc_to_interneurons']
+        block_vals = [t.get('network_total_paradoxical', np.nan) for t in block_trials]
+        block_vals = [v for v in block_vals if not np.isnan(v)]
+        block_mean = np.mean(block_vals)
+        
+        reduction = (full_mean - block_mean) / full_mean
+        t_stat, p_value = stats.ttest_ind(full_vals, block_vals)
+        
+        summary_text = "Primary test:\n"
+        summary_text += "Block Exc -> Interneurons\n\n"
+        summary_text += f"Reduction: {reduction:.1%}\n"
+        summary_text += f"P-value: {p_value:.2e}\n\n"
+        
+        if p_value < 0.001 and reduction > 0.5:
+            summary_text += "Strong support for\n"
+            summary_text += "disinhibition hypothesis.\n\n"
+            summary_text += "Paradoxical excitation\n"
+            summary_text += "Requires excitation of\n"
+            summary_text += "the inhibitory network.\n"
+        elif p_value < 0.05 and reduction > 0.3:
+            summary_text += "Moderate support for\n"
+            summary_text += "disinhibition hypothesis.\n"
+        else:
+            summary_text += "Weak/no support for\n"
+            summary_text += "simple disinhibition.\n"
+    
+    # Compare to broad blockade
+    if 'cnqx_apv_broad' in results:
+        broad_trials = results['cnqx_apv_broad']
+        broad_vals = [t.get('network_total_paradoxical', np.nan) for t in broad_trials]
+        broad_vals = [v for v in broad_vals if not np.isnan(v)]
+        broad_mean = np.mean(broad_vals)
+        
+        broad_reduction = (full_mean - broad_mean) / full_mean
+        
+        summary_text += f"\nBroad CNQX/APV:\n"
+        summary_text += f"Reduction: {broad_reduction:.1%}\n"
+        summary_text += "(Confounded by direct\n"
+        summary_text += "suppression of principal\n"
+        summary_text += "cell excitation)\n"
+    
+    ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
+           fontsize=9, verticalalignment='top', fontfamily='monospace',
+           bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+    
 def plot_paradoxical_comparison(ax, pv_results, sst_results, populations, colors):
     """Validate paradoxical excitation: fraction of excited cells"""
     
@@ -1327,7 +1887,7 @@ def plot_effect_size_heatmap(ax, pv_results, sst_results, populations):
     row_labels = []
     
     for target, results in [('PV', pv_results), ('SST', sst_results)]:
-        primary = results['statistical_analysis']['primary_hypothesis']
+        primary = results['statistical_analysis']['primary_disinhibition_test']
         row_effects = []
         
         for pop in populations:
@@ -1364,7 +1924,7 @@ def plot_effect_size_heatmap(ax, pv_results, sst_results, populations):
                           ha="center", va="center", color="black", fontsize=11,
                           fontweight='bold')
     
-    ax.set_title("Effect Sizes (Cohen's d)\nFull Network vs CNQX/APV",
+    ax.set_title("Effect Sizes (Cohen's d)\nFull Network vs Disinhibition",
                 fontsize=12, fontweight='bold')
     ax.set_xlabel('Population', fontsize=11, fontweight='bold')
     
@@ -1385,7 +1945,7 @@ def plot_power_comparison(ax, pv_results, sst_results, populations):
     
     for pop in populations:
         # PV power
-        pv_primary = pv_results['statistical_analysis']['primary_hypothesis']
+        pv_primary = pv_results['statistical_analysis']['primary_disinhibition_test']
         metric = f'{pop}_paradoxical_fraction'
         if metric in pv_primary:
             pv_powers.append(pv_primary[metric].statistical_power)
@@ -1393,7 +1953,7 @@ def plot_power_comparison(ax, pv_results, sst_results, populations):
             pv_powers.append(0)
         
         # SST power
-        sst_primary = sst_results['statistical_analysis']['primary_hypothesis']
+        sst_primary = sst_results['statistical_analysis']['primary_disinhibition_test']
         if metric in sst_primary:
             sst_powers.append(sst_primary[metric].statistical_power)
         else:
@@ -1450,7 +2010,7 @@ def plot_pvalue_comparison(ax, pv_results, sst_results, populations):
     row_labels = []
     
     for target, results in [('PV', pv_results), ('SST', sst_results)]:
-        primary = results['statistical_analysis']['primary_hypothesis']
+        primary = results['statistical_analysis']['primary_disinhibition_test']
         row_pvals = []
         
         for pop in populations:
@@ -1487,7 +2047,7 @@ def plot_pvalue_comparison(ax, pv_results, sst_results, populations):
             # Get actual p-value
             target = 'PV' if i == 0 else 'SST'
             results = pv_results if i == 0 else sst_results
-            primary = results['statistical_analysis']['primary_hypothesis']
+            primary = results['statistical_analysis']['primary_disinhibition_test']
             metric = f'{populations[j]}_paradoxical_fraction'
             
             if metric in primary:
@@ -1602,9 +2162,9 @@ def plot_population_distributions(ax, pv_results, sst_results, pop, colors):
     
     # Get full network data for both conditions
     pv_full = pv_results['raw_results']['full_network']
-    pv_cnqx = pv_results['raw_results']['cnqx_apv']
+    pv_cnqx = pv_results['raw_results']['cnqx_apv_broad']
     sst_full = sst_results['raw_results']['full_network']
-    sst_cnqx = sst_results['raw_results']['cnqx_apv']
+    sst_cnqx = sst_results['raw_results']['cnqx_apv_broad']
     
     metric = f'{pop}_paradoxical_fraction'
     
@@ -1675,8 +2235,8 @@ def plot_summary_statistics(ax, pv_results, sst_results):
     
     ax.axis('off')
     
-    pv_primary = pv_results['statistical_analysis']['primary_hypothesis']
-    sst_primary = sst_results['statistical_analysis']['primary_hypothesis']
+    pv_primary = pv_results['statistical_analysis']['primary_disinhibition_test']
+    sst_primary = sst_results['statistical_analysis']['primary_disinhibition_test']
     
     n_trials = len(pv_results['raw_results']['full_network'])
     
@@ -1773,11 +2333,13 @@ def plot_monte_carlo_results(mc_results: Dict,
     # Define colors for conditions
     condition_colors = {
         'full_network': '#2E86AB',
-        'reduced_inhibition_50': '#A23B72',
-        'reduced_inhibition_10': '#F18F01',
-        'cnqx_apv': '#C73E1D',
+        'block_exc_to_interneurons': '#DC143C',  # Red - key test
+        'block_int_to_int': '#FF8C00',
+        'block_mc_to_interneurons': '#9370DB',
+        'block_principal_recurrent': '#20B2AA',
+        'cnqx_apv_broad': '#808080',
         'gabazine': '#6A994E',
-        'no_stimulation': '#999999'
+        'no_stimulation': '#D3D3D3'
     }
     
     populations = [p for p in ['gc', 'mc', 'pv', 'sst'] if p != target_pop]
@@ -1796,7 +2358,7 @@ def plot_monte_carlo_results(mc_results: Dict,
     
     # Panel 4: Effect sizes (primary hypothesis)
     ax4 = plt.subplot(3, 4, 4)
-    plot_effect_sizes(ax4, analysis['primary_hypothesis'], populations)
+    plot_effect_sizes(ax4, analysis['primary_disinhibition_test'], populations)
     
     # Panel 5-7: Distribution comparisons for each population
     for idx, pop in enumerate(populations):
@@ -1813,7 +2375,7 @@ def plot_monte_carlo_results(mc_results: Dict,
     
     # Panel 10: Power analysis
     ax10 = plt.subplot(3, 4, 10)
-    plot_power_analysis(ax10, analysis['primary_hypothesis'], populations)
+    plot_power_analysis(ax10, analysis['primary_disinhibition_test'], populations)
     
     # Panel 11: Model validation (if available)
     if validation_results:
@@ -1843,14 +2405,33 @@ def plot_paradoxical_fractions(ax, raw_results, populations, condition_colors, t
     """Plot paradoxical excitation fractions"""
     
     conditions = list(raw_results.keys())
+    
+    # Check if we have any data
+    has_data = False
+    for condition in conditions:
+        if condition in raw_results and len(raw_results[condition]) > 0:
+            has_data = True
+            break
+    
+    if not has_data:
+        ax.text(0.5, 0.5, 'No data available', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Paradoxical Excitation Fractions', fontsize=11, fontweight='bold')
+        return
+    
     x_pos = np.arange(len(conditions))
-    width = 0.8 / len(populations)
+    width = 0.8 / len(populations) if len(populations) > 0 else 0.8
     
     for i, pop in enumerate(populations):
         means = []
         sems = []
         
         for condition in conditions:
+            if condition not in raw_results:
+                means.append(0)
+                sems.append(0)
+                continue
+                
             trials = raw_results[condition]
             values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in trials]
             values = [v for v in values if not np.isnan(v)]
@@ -1862,17 +2443,23 @@ def plot_paradoxical_fractions(ax, raw_results, populations, condition_colors, t
                 means.append(0)
                 sems.append(0)
         
-        ax.bar(x_pos + i * width, means, width, yerr=sems,
-              label=pop.upper(), alpha=0.7, capsize=3)
+        # Plot bars for this population
+        bar_positions = [x + i * width for x in x_pos]
+        ax.bar(bar_positions, means, width, yerr=sems,
+              label=pop.upper(), alpha=0.7, capsize=3,
+              edgecolor='black', linewidth=1)
     
-    ax.set_xlabel('Condition')
-    ax.set_ylabel('Paradoxical Fraction')
-    ax.set_title('Paradoxical Excitation Fractions')
+    ax.set_xlabel('Condition', fontsize=10, fontweight='bold')
+    ax.set_ylabel('Paradoxical Fraction', fontsize=10, fontweight='bold')
+    ax.set_title('Paradoxical Excitation Fractions', fontsize=11, fontweight='bold')
     ax.set_xticks(x_pos + width * (len(populations) - 1) / 2)
     ax.set_xticklabels(conditions, rotation=45, ha='right', fontsize=8)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
+    ax.legend(fontsize=8, loc='best', frameon=True, fancybox=True)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.set_ylim(bottom=0)        
 
 def plot_mean_rate_changes(ax, raw_results, populations, condition_colors, target_pop):
     """Plot mean firing rate changes"""
@@ -1978,7 +2565,7 @@ def plot_effect_sizes(ax, primary_hypothesis, populations):
     
     ax.set_xlabel('Population')
     ax.set_ylabel("Cohen's d")
-    ax.set_title('Effect Sizes (Full vs CNQX/APV)')
+    ax.set_title('Effect Sizes (Full vs Disinhibition)')
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels)
     ax.axhline(y=0, color='black', linestyle='-', alpha=0.5)
@@ -1992,19 +2579,19 @@ def plot_effect_sizes(ax, primary_hypothesis, populations):
 def plot_distribution_comparison(ax, raw_results, pop, condition_colors):
     """Plot distribution comparison for a specific population"""
     
-    # Compare full network vs CNQX/APV
+    # Compare full network vs disinhibition
     full_trials = raw_results['full_network']
-    cnqx_trials = raw_results['cnqx_apv']
+    disinhibition_trials = raw_results['block_exc_to_interneurons']
     
     full_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in full_trials]
-    cnqx_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in cnqx_trials]
+    disinhibition_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in disinhibition_trials]
     
     full_values = [v for v in full_values if not np.isnan(v)]
-    cnqx_values = [v for v in cnqx_values if not np.isnan(v)]
+    disinhibition_values = [v for v in disinhibition_values if not np.isnan(v)]
     
-    if len(full_values) > 0 and len(cnqx_values) > 0:
+    if len(full_values) > 0 and len(disinhibition_values) > 0:
         # Violin plots
-        parts = ax.violinplot([full_values, cnqx_values], positions=[1, 2],
+        parts = ax.violinplot([full_values, disinhibition_values], positions=[1, 2],
                              showmeans=True, showextrema=True)
         
         for i, pc in enumerate(parts['bodies']):
@@ -2012,7 +2599,7 @@ def plot_distribution_comparison(ax, raw_results, pop, condition_colors):
             pc.set_alpha(0.7)
         
         ax.set_xticks([1, 2])
-        ax.set_xticklabels(['Full\nNetwork', 'CNQX/\nAPV'], fontsize=8)
+        ax.set_xticklabels(['Full\nNetwork', 'DISINHIBITION/\nAPV'], fontsize=8)
         ax.set_ylabel('Paradoxical Fraction')
         ax.set_title(f'{pop.upper()} Distribution')
         ax.grid(True, alpha=0.3)
@@ -2025,6 +2612,7 @@ def plot_network_paradoxical(ax, raw_results, condition_colors):
     means = []
     sems = []
     colors = []
+    valid_conditions = []  # Track conditions with valid data
     
     for condition in conditions:
         trials = raw_results[condition]
@@ -2035,32 +2623,80 @@ def plot_network_paradoxical(ax, raw_results, condition_colors):
             means.append(np.mean(values))
             sems.append(np.std(values) / np.sqrt(len(values)))
             colors.append(condition_colors.get(condition, '#999999'))
-        else:
-            means.append(0)
-            sems.append(0)
-            colors.append('#999999')
+            valid_conditions.append(condition)
     
-    x_pos = np.arange(len(conditions))
-    bars = ax.bar(x_pos, means, yerr=sems, color=colors, alpha=0.7, capsize=5)
+    if len(means) == 0:
+        ax.text(0.5, 0.5, 'No valid data', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Network-Wide Paradoxical Excitation', fontsize=11, fontweight='bold')
+        return
     
-    ax.set_xlabel('Condition')
-    ax.set_ylabel('Total Paradoxical Fraction')
-    ax.set_title('Network-Wide Paradoxical Excitation')
+    x_pos = np.arange(len(valid_conditions))
+    bars = ax.bar(x_pos, means, yerr=sems, color=colors, alpha=0.7, capsize=5,
+                  edgecolor='black', linewidth=1.5)
+    
+    # Add value labels on bars
+    for bar, mean in zip(bars, means):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+               f'{mean:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    ax.set_xlabel('Condition', fontsize=10, fontweight='bold')
+    ax.set_ylabel('Total Paradoxical Fraction', fontsize=10, fontweight='bold')
+    ax.set_title('Network-Wide Paradoxical Excitation', fontsize=11, fontweight='bold')
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(conditions, rotation=45, ha='right', fontsize=8)
-    ax.grid(True, alpha=0.3)
+    ax.set_xticklabels(valid_conditions, rotation=45, ha='right', fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.set_axisbelow(True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     
-    # Add significance stars
-    full_mean = means[0]  # Assuming full_network is first
-    for i, (mean, sem) in enumerate(zip(means, sems)):
-        if i > 0 and abs(mean - full_mean) > 2 * (sem + sems[0]):
-            ax.text(i, mean + sem, '***', ha='center', va='bottom', fontsize=12)
+    # Add significance stars comparing to full_network
+    if 'full_network' in valid_conditions:
+        full_idx = valid_conditions.index('full_network')
+        full_mean = means[full_idx]
+        full_sem = sems[full_idx]
+        
+        # Get full_network values for statistical test
+        full_values = [t.get('network_total_paradoxical', np.nan) 
+                      for t in raw_results['full_network']]
+        full_values = [v for v in full_values if not np.isnan(v)]
+        
+        for i, condition in enumerate(valid_conditions):
+            if condition == 'full_network':
+                continue
+            
+            # Get condition values for statistical test
+            cond_values = [t.get('network_total_paradoxical', np.nan) 
+                          for t in raw_results[condition]]
+            cond_values = [v for v in cond_values if not np.isnan(v)]
+            
+            if len(cond_values) > 0:
+                # Perform t-test
+                from scipy import stats
+                t_stat, p_value = stats.ttest_ind(full_values, cond_values)
+                
+                # Add significance marker
+                if p_value < 0.001:
+                    marker = '***'
+                elif p_value < 0.01:
+                    marker = '**'
+                elif p_value < 0.05:
+                    marker = '*'
+                else:
+                    marker = ''
+                
+                if marker:
+                    y_pos = means[i] + sems[i] * 1.2
+                    ax.text(i, y_pos, marker, ha='center', va='bottom', 
+                           fontsize=12, fontweight='bold')
 
+                    
 
 def plot_pvalue_heatmap(ax, analysis):
     """Plot p-value heatmap for all comparisons"""
     
-    primary = analysis['primary_hypothesis']
+    primary = analysis['primary_disinhibition_test']
     
     metrics = list(primary.keys())
     p_values = [-np.log10(primary[m].p_value + 1e-10) for m in metrics]
@@ -2073,7 +2709,7 @@ def plot_pvalue_heatmap(ax, analysis):
     ax.set_yticks(np.arange(len(metrics)))
     ax.set_yticklabels([m.replace('_', ' ') for m in metrics], fontsize=8)
     ax.set_xticks([0])
-    ax.set_xticklabels(['Full vs\nCNQX/APV'], fontsize=8)
+    ax.set_xticklabels(['Full vs\nDisinhibition'], fontsize=8)
     ax.set_title('-log10(p-value)')
     
     # Add colorbar
@@ -2163,7 +2799,7 @@ def plot_summary_table(ax, analysis, validation_results):
     ax.axis('off')
     
     # Create summary text
-    primary = analysis['primary_hypothesis']
+    primary = analysis['primary_disinhibition_test']
     network_result = primary.get('network_total_paradoxical')
     
     if network_result:
@@ -2224,11 +2860,13 @@ def plot_paradoxical_excitation_violins(mc_results: Dict,
     
     condition_colors = {
         'full_network': '#2E86AB',
-        'reduced_inhibition_50': '#A23B72',
-        'reduced_inhibition_10': '#F18F01',
-        'cnqx_apv': '#C73E1D',
+        'block_exc_to_interneurons': '#DC143C',  # Red - key test
+        'block_int_to_int': '#FF8C00',
+        'block_mc_to_interneurons': '#9370DB',
+        'block_principal_recurrent': '#20B2AA',
+        'cnqx_apv_broad': '#808080',
         'gabazine': '#6A994E',
-        'no_stimulation': '#999999'
+        'no_stimulation': '#D3D3D3'
     }
     
     populations = [p for p in ['gc', 'mc', 'pv', 'sst'] if p != target_pop]
@@ -2245,7 +2883,7 @@ def plot_paradoxical_excitation_violins(mc_results: Dict,
     ax1 = plt.subplot(3, 3, 1)
     plot_violin_paradoxical_by_condition(ax1, raw_results, populations, condition_colors, target_pop)
     
-    # Panel 2: Paradoxical excitation - comparison of full network vs CNQX/APV
+    # Panel 2: Paradoxical excitation - comparison of full network vs disinhibition
     ax2 = plt.subplot(3, 3, 2)
     plot_violin_primary_comparison(ax2, raw_results, populations, colors, target_pop)
     
@@ -2288,8 +2926,9 @@ def plot_paradoxical_excitation_violins(mc_results: Dict,
 def plot_violin_paradoxical_by_condition(ax, raw_results, populations, condition_colors, target_pop):
     """Violin plots of paradoxical excitation fractions across all conditions"""
     
-    conditions = ['full_network', 'reduced_inhibition_50', 'reduced_inhibition_10', 
-                 'cnqx_apv', 'gabazine', 'no_stimulation']
+    conditions = ['full_network', 'block_exc_to_interneurons', 'block_int_to_int',
+                  'block_mc_to_interneurons', 'block_principal_recurrent',
+                  'cnqx_apv_broad', 'gabazine', 'no_stimulation']
     
     # Collect data for the most responsive population
     pop = populations[0]  # Use first non-target population
@@ -2309,9 +2948,8 @@ def plot_violin_paradoxical_by_condition(ax, raw_results, populations, condition
                 # Short labels for readability
                 label_map = {
                     'full_network': 'Full',
-                    'reduced_inhibition_50': 'Inh-50%',
-                    'reduced_inhibition_10': 'Inh-10%',
-                    'cnqx_apv': 'CNQX/APV',
+                    'disinhibition_test': 'Disinh. test',
+                    'cnqx_apv_broad': 'CNQX/APV',
                     'gabazine': 'Gabazine',
                     'no_stimulation': 'No Stim'
                 }
@@ -2351,11 +2989,27 @@ def plot_violin_paradoxical_by_condition(ax, raw_results, populations, condition
 
 
 def plot_violin_primary_comparison(ax, raw_results, populations, colors, target_pop):
-    """Violin plots comparing full network vs CNQX/APV for all populations"""
+    """Violin plots comparing full network vs disinhibition test for all populations"""
     
     violin_data = []
     labels = []
     plot_colors = []
+    positions = []
+    
+    # Check if required conditions exist
+    if 'full_network' not in raw_results:
+        ax.text(0.5, 0.5, 'No full_network data available', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Primary Hypothesis Test:\nFull Network vs Blocked Exc->Int', 
+                    fontsize=11, fontweight='bold')
+        return
+    
+    if 'block_exc_to_interneurons' not in raw_results:
+        ax.text(0.5, 0.5, 'No block_exc_to_interneurons data available', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Primary Hypothesis Test:\nFull Network vs Blocked Exc->Int', 
+                    fontsize=11, fontweight='bold')
+        return
     
     for pop in populations:
         # Full network data
@@ -2363,68 +3017,100 @@ def plot_violin_primary_comparison(ax, raw_results, populations, colors, target_
         full_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in full_trials]
         full_values = [v for v in full_values if not np.isnan(v)]
         
-        # CNQX/APV data
-        cnqx_trials = raw_results['cnqx_apv']
-        cnqx_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in cnqx_trials]
-        cnqx_values = [v for v in cnqx_values if not np.isnan(v)]
+        # Disinhibition test data
+        disinhibition_trials = raw_results['block_exc_to_interneurons']
+        disinhibition_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) 
+                               for t in disinhibition_trials]
+        disinhibition_values = [v for v in disinhibition_values if not np.isnan(v)]
         
-        if len(full_values) > 0 and len(cnqx_values) > 0:
-            violin_data.extend([full_values, cnqx_values])
-            labels.extend([f'{pop.upper()}\nFull', f'{pop.upper()}\nCNQX'])
+        if len(full_values) > 0 and len(disinhibition_values) > 0:
+            violin_data.extend([full_values, disinhibition_values])
+            labels.extend([f'{pop.upper()}\nFull', f'{pop.upper()}\nBlocked\nExc->Int'])
             plot_colors.extend([colors[pop], '#CCCCCC'])
     
-    if violin_data:
-        positions = []
-        current_pos = 0
-        for i in range(len(violin_data)):
-            if i % 2 == 0:
-                positions.append(current_pos)
-            else:
-                positions.append(current_pos + 0.5)
-                current_pos += 1.5
-        
-        parts = ax.violinplot(violin_data, positions=positions,
-                             showmeans=True, showextrema=True, widths=0.4)
-        
-        for i, pc in enumerate(parts['bodies']):
-            pc.set_facecolor(plot_colors[i])
-            pc.set_alpha(0.7)
-            pc.set_edgecolor('black')
-            pc.set_linewidth(1.5)
-        
-        # Add significance markers
-        for i in range(0, len(violin_data), 2):
-            full_data = violin_data[i]
-            cnqx_data = violin_data[i+1]
-            
-            # Simple t-test for significance
-            from scipy import stats
-            t_stat, p_value = stats.ttest_ind(full_data, cnqx_data)
-            
-            # Add significance stars
-            y_max = max(max(full_data), max(cnqx_data))
-            x_pos = (positions[i] + positions[i+1]) / 2
-            
-            if p_value < 0.001:
-                marker = '***'
-            elif p_value < 0.01:
-                marker = '**'
-            elif p_value < 0.05:
-                marker = '*'
-            else:
-                marker = 'ns'
-            
-            ax.text(x_pos, y_max * 1.1, marker, ha='center', va='bottom',
-                   fontsize=12, fontweight='bold')
+    # ✓ Check if we have any valid data
+    if not violin_data or len(violin_data) == 0:
+        ax.text(0.5, 0.5, 'No valid data for comparison', 
+                transform=ax.transAxes, ha='center', va='center')
+        ax.set_title('Primary Hypothesis Test:\nFull Network vs Blocked Exc->Int', 
+                    fontsize=11, fontweight='bold')
+        return
     
+    current_pos = 0
+    for i in range(len(violin_data)):
+        if i % 2 == 0:
+            positions.append(current_pos)
+        else:
+            positions.append(current_pos + 0.5)
+            current_pos += 1.5
+    
+    # Create violin plots
+    parts = ax.violinplot(violin_data, positions=positions,
+                         showmeans=True, showextrema=True, widths=0.4)
+    
+    # Color the violins
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(plot_colors[i])
+        pc.set_alpha(0.7)
+        pc.set_edgecolor('black')
+        pc.set_linewidth(1.5)
+    
+    # Customize mean markers
+    for partname in ['cmeans', 'cmaxes', 'cmins', 'cbars']:
+        if partname in parts:
+            parts[partname].set_edgecolor('black')
+            parts[partname].set_linewidth(2)
+    
+    # Add significance markers
+    for i in range(0, len(violin_data), 2):
+        if i + 1 >= len(violin_data):  # ✓ Safety check
+            break
+            
+        full_data = violin_data[i]
+        blocked_data = violin_data[i+1]
+        
+        if len(full_data) == 0 or len(blocked_data) == 0:  # ✓ Safety check
+            continue
+        
+        # Statistical test
+        from scipy import stats
+        t_stat, p_value = stats.ttest_ind(full_data, blocked_data)
+        
+        # Determine significance marker
+        if p_value < 0.001:
+            marker = '***'
+        elif p_value < 0.01:
+            marker = '**'
+        elif p_value < 0.05:
+            marker = '*'
+        else:
+            marker = 'ns'
+        
+        # Add significance bracket and marker
+        y_max = max(max(full_data), max(blocked_data))
+        x_pos = (positions[i] + positions[i+1]) / 2
+        y_bracket = y_max * 1.1
+        
+        # Draw bracket
+        ax.plot([positions[i], positions[i], positions[i+1], positions[i+1]], 
+               [y_bracket*0.98, y_bracket, y_bracket, y_bracket*0.98], 
+               'k-', linewidth=1.5)
+        
+        # Add marker text
+        ax.text(x_pos, y_bracket * 1.02, marker, ha='center', va='bottom',
+               fontsize=12, fontweight='bold')
+    
+    # Set x-axis properties
     ax.set_xticks(positions)
     ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
-    ax.set_ylabel('Paradoxical Excitation\nFraction', fontsize=10)
-    ax.set_title('Primary Hypothesis Test:\nFull Network vs CNQX/APV', 
+    ax.set_ylabel('Paradoxical Excitation\nFraction', fontsize=10, fontweight='bold')
+    ax.set_title('Primary Hypothesis Test:\nFull Network vs Blocked Exc->Int', 
                 fontsize=11, fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
     ax.set_axisbelow(True)
-
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.set_ylim(bottom=0)    
 
 def plot_violin_rate_modulation(ax, raw_results, populations, colors, target_pop):
     """Violin plots of firing rate modulation ratios"""
@@ -2480,8 +3166,10 @@ def plot_violin_rate_modulation(ax, raw_results, populations, colors, target_pop
 def plot_violin_single_population(ax, raw_results, pop, condition_colors, target_pop):
     """Detailed violin plot for a single population across all conditions"""
     
-    conditions = ['full_network', 'reduced_inhibition_50', 'reduced_inhibition_10',
-                 'cnqx_apv', 'gabazine', 'no_stimulation']
+    conditions = ['full_network', 'block_exc_to_interneurons', 'block_int_to_int',
+                  'block_mc_to_interneurons', 'block_principal_recurrent',
+                  'cnqx_apv_broad', 'gabazine', 'no_stimulation']
+
     
     violin_data = []
     labels = []
@@ -2497,9 +3185,9 @@ def plot_violin_single_population(ax, raw_results, pop, condition_colors, target
                 violin_data.append(values)
                 label_map = {
                     'full_network': 'Full',
-                    'reduced_inhibition_50': 'Inh-50',
-                    'reduced_inhibition_10': 'Inh-10',
-                    'cnqx_apv': 'CNQX',
+                    'block_exc_to_interneurons': 'Block Exc Int',
+                    'block_int_to_int': 'Block Int-Int',
+                    'cnqx_apv_broad': 'CNQX',
                     'gabazine': 'Gaba',
                     'no_stimulation': 'None'
                 }
@@ -2533,8 +3221,10 @@ def plot_violin_single_population(ax, raw_results, pop, condition_colors, target
 def plot_violin_network_wide(ax, raw_results, condition_colors):
     """Violin plot of network-wide paradoxical excitation"""
     
-    conditions = ['full_network', 'reduced_inhibition_50', 'reduced_inhibition_10',
-                 'cnqx_apv', 'gabazine', 'no_stimulation']
+    conditions = ['full_network', 'block_exc_to_interneurons', 'block_int_to_int',
+                  'block_mc_to_interneurons', 'block_principal_recurrent',
+                  'cnqx_apv_broad', 'gabazine', 'no_stimulation']
+
     
     violin_data = []
     labels = []
@@ -2550,9 +3240,9 @@ def plot_violin_network_wide(ax, raw_results, condition_colors):
                 violin_data.append(values)
                 label_map = {
                     'full_network': 'Full\nNetwork',
-                    'reduced_inhibition_50': 'Reduced\nInh-50%',
-                    'reduced_inhibition_10': 'Reduced\nInh-10%',
-                    'cnqx_apv': 'CNQX/\nAPV',
+                    'block_exc_to_interneurons': 'Block\nExc-IN',
+                    'block_int_to_int': 'Block\nIN-IN',
+                    'cnqx_apv_broad': 'CNQX/\nAPV',
                     'gabazine': 'Gabazine',
                     'no_stimulation': 'No\nStim'
                 }
@@ -2637,7 +3327,7 @@ def plot_statistical_summary_box(ax, mc_results):
     ax.axis('off')
     
     analysis = mc_results['statistical_analysis']
-    primary = analysis['primary_hypothesis']
+    primary = analysis['primary_disinhibition_test']
     target_pop = mc_results['target_population']
     n_trials = len(mc_results['raw_results']['full_network'])
     
@@ -2711,23 +3401,23 @@ def create_violin_plots(mc_results: Dict,
     
     populations = [p for p in ['gc', 'mc', 'pv', 'sst'] if p != target_pop]
     
-    # Panel A: Primary comparison (Full vs CNQX/APV) - 2x2 grid
+    # Panel A: Primary comparison (Full vs disinhibition) - 2x2 grid
     for idx, pop in enumerate(populations):
         ax = plt.subplot(3, 2, idx + 1)
         
         # Get data
         full_trials = raw_results['full_network']
-        cnqx_trials = raw_results['cnqx_apv']
+        disinhibition_trials = raw_results['block_exc_to_interneurons']
         
         full_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in full_trials]
-        cnqx_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in cnqx_trials]
+        disinhibition_values = [t.get(f'{pop}_paradoxical_fraction', np.nan) for t in disinhibition_trials]
         
         full_values = [v for v in full_values if not np.isnan(v)]
-        cnqx_values = [v for v in cnqx_values if not np.isnan(v)]
+        disinhibition_values = [v for v in disinhibition_values if not np.isnan(v)]
         
-        if len(full_values) > 0 and len(cnqx_values) > 0:
+        if len(full_values) > 0 and len(disinhibition_values) > 0:
             # Create violin plot
-            parts = ax.violinplot([full_values, cnqx_values], positions=[0, 1],
+            parts = ax.violinplot([full_values, disinhibition_values], positions=[0, 1],
                                  showmeans=False, showextrema=False, widths=0.7)
             
             # Color violins
@@ -2739,7 +3429,7 @@ def create_violin_plots(mc_results: Dict,
                 pc.set_linewidth(1.5)
             
             # Add boxplot overlay for quartiles
-            bp = ax.boxplot([full_values, cnqx_values], positions=[0, 1],
+            bp = ax.boxplot([full_values, disinhibition_values], positions=[0, 1],
                           widths=0.3, showfliers=False,
                           boxprops=dict(linewidth=1.5, color='black'),
                           whiskerprops=dict(linewidth=1.5, color='black'),
@@ -2747,17 +3437,17 @@ def create_violin_plots(mc_results: Dict,
                           medianprops=dict(linewidth=2, color='red'))
             
             # Add individual data points with jitter
-            for i, values in enumerate([full_values, cnqx_values]):
+            for i, values in enumerate([full_values, disinhibition_values]):
                 y = values
                 x = np.random.normal(i, 0.04, size=len(y))
                 ax.scatter(x, y, alpha=0.4, s=15, color='black', zorder=10)
             
             # Statistical test
             from scipy import stats
-            t_stat, p_value = stats.ttest_ind(full_values, cnqx_values)
+            t_stat, p_value = stats.ttest_ind(full_values, disinhibition_values)
             
             # Add significance marker
-            y_max = max(max(full_values), max(cnqx_values))
+            y_max = max(max(full_values), max(disinhibition_values))
             if p_value < 0.001:
                 marker = '***'
             elif p_value < 0.01:
@@ -2775,8 +3465,8 @@ def create_violin_plots(mc_results: Dict,
                    fontsize=11, fontweight='bold')
             
             # Effect size
-            cohens_d = (np.mean(full_values) - np.mean(cnqx_values)) / \
-                      np.sqrt((np.var(full_values) + np.var(cnqx_values)) / 2)
+            cohens_d = (np.mean(full_values) - np.mean(disinhibition_values)) / \
+                      np.sqrt((np.var(full_values) + np.var(disinhibition_values)) / 2)
             
             # Add text with statistics
             stats_text = f"d={cohens_d:.2f}"
@@ -2785,7 +3475,7 @@ def create_violin_plots(mc_results: Dict,
                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         ax.set_xticks([0, 1])
-        ax.set_xticklabels(['Full\nNetwork', 'CNQX/\nAPV'], fontsize=9)
+        ax.set_xticklabels(['Full\nNetwork', 'DISINHIBITION/\nAPV'], fontsize=9)
         ax.set_ylabel('Paradoxical\nExcitation Fraction', fontsize=9)
         ax.set_title(f'{pop.upper()}', fontsize=11, fontweight='bold', pad=10)
         ax.spines['top'].set_visible(False)
@@ -2797,8 +3487,8 @@ def create_violin_plots(mc_results: Dict,
     # Panel E: Network-wide effect
     ax5 = plt.subplot(3, 2, 5)
     
-    conditions = ['full_network', 'cnqx_apv', 'gabazine', 'no_stimulation']
-    condition_labels = ['Full\nNetwork', 'CNQX/\nAPV', 'Gabazine', 'No\nStim']
+    conditions = ['full_network', 'block_exc_to_interneurons', 'gabazine', 'no_stimulation']
+    condition_labels = ['Full\nNetwork', 'Disinhibition', 'Gabazine', 'No\nStim']
     condition_colors_list = ['#2E86AB', '#C73E1D', '#6A994E', '#999999']
     
     violin_data = []
@@ -2843,7 +3533,7 @@ def create_violin_plots(mc_results: Dict,
     ax6.axis('off')
     
     # Create summary table
-    primary = analysis['primary_hypothesis']
+    primary = analysis['primary_disinhibition_test']
     network_result = primary.get('network_total_paradoxical')
     
     summary_text = f"Statistical Summary\n"
@@ -2971,10 +3661,15 @@ def run_statistical_analysis(
         # Create plots
         print("\nGenerating statistical analysis plots...")
 
-        
         plot_monte_carlo_results(
             mc_results,
             validation_results,
+            output_dir=str(output_path),
+            show_plots=False
+        )
+        
+        plot_disinhibition_test_results(
+            mc_results,
             output_dir=str(output_path),
             show_plots=False
         )
