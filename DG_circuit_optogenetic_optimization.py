@@ -57,8 +57,6 @@ class OptogeneticTargets:
     # Light intensity for stimulation
     stimulation_intensity: float = 1.0
     
-    # Weight for optogenetic objectives in total loss
-    opto_loss_weight: float = 0.5
 
 @dataclass
 class CombinedOptimizationTargets(OptimizationTargets):
@@ -68,8 +66,8 @@ class CombinedOptimizationTargets(OptimizationTargets):
     optogenetic_targets: OptogeneticTargets = field(default_factory=OptogeneticTargets)
     
     # Overall weight distribution
-    baseline_weight: float = 0.5
-    optogenetic_weight: float = 0.5
+    baseline_weight: float = 1.0
+    optogenetic_weight: float = 1.0
 
 
 def calculate_gini_coefficient(values: np.ndarray) -> float:
@@ -196,15 +194,19 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
         for affected_pop, target_fraction in opto_targets.target_rate_increases[target_pop].items():
             if affected_pop in opto_results and affected_pop != target_pop:
                 actual_fraction = opto_results[affected_pop]['activated_fraction']
+
+                print(f"Target {target_pop}: {affected_pop} target_fraction: {target_fraction} actual_fraction: {actual_fraction}")
                 
                 # Squared error
                 error = (actual_fraction - target_fraction) ** 2
 
-                if (target_fraction) > 0 and (np.isclose(actual_fraction, 0.0, 1e-2, 1e-2)):
+                if (np.abs(target_fraction) > 0) and (np.isclose(np.abs(actual_fraction), 0.0, 1e-2, 1e-2)):
                     rate_increase_loss += 1e2
                 else:
                     rate_increase_loss += error
         
+
+        print(f"Target {target_pop}: rate increase loss is {rate_increase_loss}")
         loss_components['rate_increase'] = rate_increase_loss
         total_loss += rate_increase_loss
     
@@ -345,10 +347,6 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
             
             opto_loss += pop_opto_loss
         
-        
-        # Average optogenetic loss across both stimulation types
-        opto_loss /= 2.0
-        
         # === COMBINED LOSS ===
         total_loss = (targets.baseline_weight * baseline_loss + 
                      targets.optogenetic_weight * opto_loss)
@@ -428,8 +426,8 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
         sparsity_targets=base_targets.sparsity_targets,
         rate_ordering_constraints=base_targets.rate_ordering_constraints,
         optogenetic_targets=opto_targets,
-        baseline_weight=0.5,
-        optogenetic_weight=0.5
+        baseline_weight=1.0,
+        optogenetic_weight=4.0
     )
     
     # Circuit factory data
@@ -525,10 +523,10 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
         n_dimensions = len(connection_names)
         max_iterations = optimization_config.max_iterations
         
-        # PSO parameters
-        w = 0.7
-        c1 = 1.5
-        c2 = 1.5
+        # Adaptive inertia weight parameters for PSO
+        w_max = 0.9  # Initial inertia (high exploration)
+        w_min = 0.2  # Final inertia (high exploitation)
+        w = w_max # Initial inertia
         
         # Initialize
         lower_bounds = np.array([b[0] for b in bounds])
@@ -545,9 +543,16 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
         history = {'loss': [], 'parameters': []}
         
         ctx = mp.get_context('spawn')
+
+        # Track improvement
+        previous_global_best = float('inf')
+        no_improvement_count = 0
+        improvement_threshold = 0.1
         
         for iteration in range(max_iterations):
             print(f"PSO Iteration {iteration+1}/{max_iterations}")
+
+            c1, c2 = np.random.uniform(low=1.5, high=2.5, size=1), np.random.uniform(low=1.5, high=2.5, size=1)
             
             # Prepare evaluation arguments
             eval_args = [
@@ -582,6 +587,30 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
                 
                 history['loss'].append(score)
                 history['parameters'].append(connection_modulation)
+
+            # Adapt w based on improvement
+            improvement = previous_global_best - global_best_score
+        
+            if improvement > improvement_threshold:
+                # Good progress: increase exploration slightly
+                w = min(w + 0.05, w_max)
+                no_improvement_count = 0
+                print(f"  Improvement detected, increasing w to {w:.3f}")
+            else:
+                # Stagnation: decrease w to increase exploitation
+                w = max(w - 0.2 * w, w_min)
+                no_improvement_count += 1
+                print(f"  No improvement, decreasing w to {w:.3f}")
+                
+            previous_global_best = global_best_score
+
+            # Reset if stuck too long
+            if no_improvement_count > 3:
+                if w == w_max:
+                    w_max += 0.05
+                w = w_max  # Reset to exploration mode
+                print(f"  Stagnation detected, resetting w to {w_max}")
+                no_improvement_count = 0
             
             # Update velocities and positions
             for i in range(n_particles):
@@ -935,8 +964,8 @@ def print_results_summary(output_data: Dict):
     # Weights
     weights = output_data['optimization_weights']
     print(f"\nObjective Weights:")
-    print(f"  Baseline: {weights['baseline_weight']:.1%}")
-    print(f"  Optogenetic: {weights['optogenetic_weight']:.1%}")
+    print(f"  Baseline: {weights['baseline_weight']:.1f}")
+    print(f"  Optogenetic: {weights['optogenetic_weight']:.1f}")
     
     # Performance summary
     if 'performance_summary' in output_data:
@@ -1001,7 +1030,7 @@ if __name__ == "__main__":
     
     # Create configuration
     config = create_default_global_opt_config()
-    config.max_iterations = 30
+    config.max_iterations = 6
     
     from DG_circuit_dendritic_somatic_transfer import (
         CircuitParams, PerConnectionSynapticParams, OpsinParams
