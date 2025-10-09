@@ -260,9 +260,9 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
 
 
 
-def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_data,
-                                 targets: CombinedOptimizationTargets, config,
-                                 verbose: bool = False):
+def evaluate_candidate_worker(param_array, connection_names, circuit_factory_data,
+                              targets: CombinedOptimizationTargets, config,
+                              verbose: bool = False):
     """
     Objective worker function with detailed diagnostics
     
@@ -430,7 +430,6 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
         # === OPTOGENETIC OBJECTIVES ===
         opto_loss = 0.0
         opto_targets = targets.optogenetic_targets
-        opto_breakdown = {}
         
         if verbose:
             print(f"\n{'='*80}")
@@ -450,23 +449,23 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
                 if verbose and config.n_trials > 1:
                     print(f"\n  Trial {trial + 1}/{config.n_trials}:")
 
-                    opto_results = simulate_optogenetic_stimulation(
-                        circuit_factory_data,
-                        connection_modulation,
-                        target_pop,
-                        opto_targets.stimulation_intensity,
-                        mec_current=config.mec_drive_levels[0]  # Use first MEC drive level
-                    )
+                opto_results = simulate_optogenetic_stimulation(
+                    circuit_factory_data,
+                    connection_modulation,
+                    target_pop,
+                    opto_targets.stimulation_intensity,
+                    mec_current=config.mec_drive_levels[0]  # Use first MEC drive level
+                )
 
-                    # Evaluate optogenetic objectives for this trial
-                    pop_opto_loss, loss_components = evaluate_optogenetic_objectives(
-                        opto_results,
-                        target_pop,
-                        opto_targets,
-                        verbose=verbose
-                    )
+                # Evaluate optogenetic objectives for this trial
+                trial_opto_loss, loss_components = evaluate_optogenetic_objectives(
+                    opto_results,
+                    target_pop,
+                    opto_targets,
+                    verbose=verbose
+                )
 
-                    target_pop_opto_loss += trial_opto_loss
+                target_pop_opto_loss += trial_opto_loss
 
                 
             # Average over trials
@@ -510,8 +509,7 @@ def evaluate_particle_worker(args):
     position, connection_names, circuit_factory_data, targets, config = args
     
     try:
-        # Use the extended DE worker function
-        loss = evaluate_de_candidate_worker(
+        loss = evaluate_candidate_worker(
             position, connection_names, circuit_factory_data, targets, config
         )
         
@@ -538,7 +536,7 @@ def print_new_best_diagnostics(position, loss, connection_names,
     print(f"Loss: {loss:.6f}\n")
     
     # Evaluate with verbose output
-    recomputed_loss = evaluate_de_candidate_worker(
+    recomputed_loss = evaluate_candidate_worker(
         position, 
         connection_names, 
         circuit_factory_data, 
@@ -678,7 +676,6 @@ def run_global_optimization(optimization_config,
     from DG_circuit_dendritic_somatic_transfer import (
         CircuitParams, PerConnectionSynapticParams, OpsinParams
     )
-    from DG_circuit_optimization import GlobalCircuitOptimizer
     from scipy.optimize import differential_evolution
     import multiprocessing as mp
     
@@ -711,7 +708,7 @@ def run_global_optimization(optimization_config,
         rate_ordering_constraints=base_targets.rate_ordering_constraints,
         optogenetic_targets=opto_targets,
         baseline_weight=1.0,
-        optogenetic_weight=4.0
+        optogenetic_weight=1.0
     )
     
     # Circuit factory data
@@ -750,7 +747,7 @@ def run_global_optimization(optimization_config,
     if method == 'differential_evolution':
         # Use Differential Evolution
         objective = partial(
-            evaluate_de_candidate_worker,
+            evaluate_candidate_worker,
             connection_names=connection_names,
             circuit_factory_data=circuit_factory_data,
             targets=targets,
@@ -762,7 +759,7 @@ def run_global_optimization(optimization_config,
         history = {'loss': [], 'parameters': []}
         
         def callback(xk, convergence):
-            loss = evaluate_de_candidate_worker(
+            loss = evaluate_candidate_worker(
                 xk, connection_names, circuit_factory_data, targets, optimization_config
             )
             connection_modulation = dict(zip(connection_names, xk))
@@ -806,7 +803,7 @@ def run_global_optimization(optimization_config,
     
     elif method == 'particle_swarm':
         # Use Particle Swarm Optimization
-        n_particles = 120
+        n_particles = 142
         n_dimensions = len(connection_names)
         max_iterations = optimization_config.max_iterations
         
@@ -878,7 +875,9 @@ def run_global_optimization(optimization_config,
                             position, score, connection_names,
                             circuit_factory_data, targets, optimization_config
                         )
-                
+
+                    n_new_bests[0] += 1
+                    
                 history['loss'].append(score)
                 history['parameters'].append(connection_modulation)
 
@@ -1331,7 +1330,7 @@ if __name__ == "__main__":
     
     # Create configuration
     config = create_default_global_opt_config()
-    config.max_iterations = 6
+    config.max_iterations = 9
     
     from DG_circuit_dendritic_somatic_transfer import (
         CircuitParams, PerConnectionSynapticParams, OpsinParams
@@ -1357,7 +1356,7 @@ if __name__ == "__main__":
     # Run optimization
     results = run_global_optimization(
         config,
-        n_workers=120,
+        n_workers=142,
         n_threads_per_worker=1,
         method='particle_swarm'
     )
