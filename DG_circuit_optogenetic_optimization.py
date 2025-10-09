@@ -440,31 +440,43 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
         # Run optogenetic stimulation for PV and SST
         for target_pop in ['pv', 'sst']:
             if verbose:
-                print(f"\n--- {target_pop.upper()} Stimulation ---")
+                print(f"\n--- {target_pop.upper()} Stimulation (averaging over {config.n_trials} trials) ---")
             
-            opto_results = simulate_optogenetic_stimulation(
-                circuit_factory_data,
-                connection_modulation,
-                target_pop,
-                opto_targets.stimulation_intensity,
-                mec_current=config.mec_drive_levels[0]  # Use first MEC drive level
-            )
+            # Average over multiple trials
+            target_pop_opto_loss = 0.0
+    
+            for trial in range(config.n_trials):
 
-            # Evaluate optogenetic objectives
-            pop_opto_loss, loss_components = evaluate_optogenetic_objectives(
-                opto_results,
-                target_pop,
-                opto_targets,
-                verbose=verbose
-            )
+                if verbose and config.n_trials > 1:
+                    print(f"\n  Trial {trial + 1}/{config.n_trials}:")
+
+                    opto_results = simulate_optogenetic_stimulation(
+                        circuit_factory_data,
+                        connection_modulation,
+                        target_pop,
+                        opto_targets.stimulation_intensity,
+                        mec_current=config.mec_drive_levels[0]  # Use first MEC drive level
+                    )
+
+                    # Evaluate optogenetic objectives for this trial
+                    pop_opto_loss, loss_components = evaluate_optogenetic_objectives(
+                        opto_results,
+                        target_pop,
+                        opto_targets,
+                        verbose=verbose
+                    )
+
+                    target_pop_opto_loss += trial_opto_loss
+
+                
+            # Average over trials
+            target_pop_opto_loss /= config.n_trials
+
+            if verbose:
+                print(f"\n  Average {target_pop.upper()} stimulation loss over {config.n_trials} trials: {target_pop_opto_loss:.6f}")
+
+            opto_loss += target_pop_opto_loss
             
-            opto_loss += pop_opto_loss
-            opto_breakdown[target_pop] = {
-                'loss': pop_opto_loss,
-                'components': loss_components,
-                'results': opto_results
-            }
-        
         if verbose:
             print(f"\n  Total optogenetic loss: {opto_loss:.6f}")
         
@@ -628,12 +640,6 @@ def print_new_best_diagnostics(position, loss, connection_names,
         print("\n  Potential corner cases detected:")
         for issue in issues_detected:
             print(f"  {issue}")
-        
-        print("\nPossible causes:")
-        print("  1. Inhibition too strong -> suppresses all activity")
-        print("  2. Excitation too weak -> insufficient drive")
-        print("  3. Imbalanced E/I ratio -> network collapses to silent state")
-        print("  4. Penalty terms insufficient to prevent corner case")
         
         print("\nParameter analysis:")
         # Check for extreme values
