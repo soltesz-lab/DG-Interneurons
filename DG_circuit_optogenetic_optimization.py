@@ -526,7 +526,7 @@ def print_new_best_diagnostics(position, loss, connection_names,
     print(f"Loss: {loss:.6f}\n")
     
     # Evaluate with verbose output
-    evaluate_de_candidate_worker(
+    recomputed_loss = evaluate_de_candidate_worker(
         position, 
         connection_names, 
         circuit_factory_data, 
@@ -534,6 +534,13 @@ def print_new_best_diagnostics(position, loss, connection_names,
         config,
         verbose=True
     )
+
+    # Verify that optimizer loss matches recomputed loss
+    print(f"\n{'='*80}")
+    print("Loss verification")
+    print(f"{'='*80}")
+    print(f"  Loss from optimizer:  {loss:.6f}")
+    print(f"  Recomputed loss:      {recomputed_loss:.6f}")
     
     # Additional summary statistics
     connection_modulation = dict(zip(connection_names, position))
