@@ -176,9 +176,10 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
 
 def evaluate_optogenetic_objectives(opto_results: Dict, 
                                     target_pop: str,
-                                    opto_targets: OptogeneticTargets) -> Tuple[float, Dict]:
+                                    opto_targets: OptogeneticTargets,
+                                    verbose: bool = False) -> Tuple[float, Dict]:
     """
-    Calculate loss for optogenetic stimulation objectives
+    Calculate loss for optogenetic stimulation objectives with detailed diagnostics
     
     Returns:
         total_loss: Combined optogenetic loss
@@ -194,19 +195,34 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
         for affected_pop, target_fraction in opto_targets.target_rate_increases[target_pop].items():
             if affected_pop in opto_results and affected_pop != target_pop:
                 actual_fraction = opto_results[affected_pop]['activated_fraction']
+                actual_mean_change = opto_results[affected_pop]['mean_change']
+                baseline_mean = opto_results[affected_pop]['baseline_mean']
+                stim_mean = opto_results[affected_pop]['stim_mean']
 
-                print(f"Target {target_pop}: {affected_pop} target_fraction: {target_fraction} actual_fraction: {actual_fraction}")
+                if verbose:
+                    print(f"  {affected_pop.upper()}:")
+                    print(f"    Baseline rate: {baseline_mean:.3f} Hz")
+                    print(f"    Stim rate: {stim_mean:.3f} Hz")
+                    print(f"    Mean change: {actual_mean_change:+.3f} Hz")
+                    print(f"    Activated fraction: {actual_fraction:.3f} (target: {target_fraction:.3f})")
                 
                 # Squared error
                 error = (actual_fraction - target_fraction) ** 2
 
+                # Strong penalty for zero activation when non-zero is expected
                 if (np.abs(target_fraction) > 0) and (np.isclose(np.abs(actual_fraction), 0.0, 1e-2, 1e-2)):
-                    rate_increase_loss += 1e2
+                    penalty = 1e2
+                    rate_increase_loss += penalty
+                    if verbose:
+                        print(f"    Zero activation penalty: {penalty:.1f}")
                 else:
                     rate_increase_loss += error
+                    if verbose:
+                        print(f"    Squared error: {error:.6f}")
         
-
-        print(f"Target {target_pop}: rate increase loss is {rate_increase_loss}")
+        if verbose:
+            print(f"  Total rate increase loss: {rate_increase_loss:.6f}")
+        
         loss_components['rate_increase'] = rate_increase_loss
         total_loss += rate_increase_loss
     
@@ -214,13 +230,28 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
     if target_pop in opto_targets.target_gini_increase:
         gini_loss = 0.0
         
+        if verbose:
+            print(f"\n  Gini coefficient changes:")
+        
         for affected_pop, target_gini_change in opto_targets.target_gini_increase[target_pop].items():
             if affected_pop in opto_results and affected_pop != target_pop:
+                baseline_gini = opto_results[affected_pop]['baseline_gini']
+                stim_gini = opto_results[affected_pop]['stim_gini']
                 actual_gini_change = opto_results[affected_pop]['gini_change']
                 
                 # We want to match the target Gini increase
                 error = (actual_gini_change - target_gini_change) ** 2
                 gini_loss += error
+                
+                if verbose:
+                    print(f"  {affected_pop.upper()}:")
+                    print(f"    Baseline Gini: {baseline_gini:.4f}")
+                    print(f"    Stim Gini: {stim_gini:.4f}")
+                    print(f"    Change: {actual_gini_change:+.4f} (target: {target_gini_change:+.4f})")
+                    print(f"    Squared error: {error:.6f}")
+        
+        if verbose:
+            print(f"  Total Gini loss: {gini_loss:.6f}")
         
         loss_components['gini_increase'] = gini_loss
         total_loss += gini_loss
@@ -228,10 +259,14 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
     return total_loss, loss_components
 
 
+
 def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_data,
-                                 targets: CombinedOptimizationTargets, config):
+                                 targets: CombinedOptimizationTargets, config,
+                                 verbose: bool = False):
     """
-    Objective worker function including optogenetic objectives
+    Objective worker function with detailed diagnostics
+    
+    Set verbose=True to get detailed diagnostic output
     """
     try:
         from DG_circuit_dendritic_somatic_transfer import (
@@ -243,6 +278,14 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
         
         # Unpack circuit factory data
         circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print("Detailed evaluation of candidate parameters")
+            print(f"{'='*80}")
+            print("\nConnection modulation parameters:")
+            for conn, value in sorted(connection_modulation.items()):
+                print(f"  {conn}: {value:.3f}")
         
         # === BASELINE OBJECTIVES ===
         # Create synaptic parameters
@@ -261,8 +304,21 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
         
         # Evaluate baseline objectives
         baseline_loss = 0.0
+        baseline_loss_breakdown = {
+            'rate_losses': {},
+            'sparsity_losses': {},
+            'constraint_violations': []
+        }
         
-        for mec_drive in config.mec_drive_levels:
+        if verbose:
+            print(f"\n{'='*80}")
+            print("Baseline circuit evaluation")
+            print(f"{'='*80}")
+        
+        for mec_idx, mec_drive in enumerate(config.mec_drive_levels):
+            if verbose:
+                print(f"\n  MEC drive: {mec_drive} pA")
+            
             for trial in range(config.n_trials):
                 firing_rates = {}
                 circuit.reset_state()
@@ -294,16 +350,36 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
                             firing_rates[pop] = actual_rate
                             tolerance = targets.rate_tolerance[pop]
                             
-                            if np.isclose(actual_rate, 0.0, 1e-2, 1e-2):
+                            # Zero rate detection
+                            is_zero_rate = np.isclose(actual_rate, 0.0, 1e-2, 1e-2)
+                            
+                            if is_zero_rate:
                                 rate_loss = 1e2
+                                if verbose:
+                                    print(f"    {pop.upper()}: Zero rate (target: {target_rate:.2f} Hz)")
+                                    print(f"        Applied penalty: {rate_loss:.1f}")
                             else:
                                 error = abs(actual_rate - target_rate)
                                 if error > tolerance:
                                     rate_loss = error - tolerance
                                 else:
                                     rate_loss = 0.5 * (error / tolerance) ** 2
+                                
+                                if verbose:
+                                    print(f"    {pop.upper()}: {actual_rate:.3f} Hz (target: {target_rate:.2f} ± {tolerance:.2f})")
+                                    print(f"        Error: {error:.3f}, Loss: {rate_loss:.6f}")
                             
                             trial_loss += rate_loss
+                            
+                            # Track for diagnostics
+                            if pop not in baseline_loss_breakdown['rate_losses']:
+                                baseline_loss_breakdown['rate_losses'][pop] = []
+                            baseline_loss_breakdown['rate_losses'][pop].append({
+                                'target': target_rate,
+                                'actual': actual_rate,
+                                'loss': rate_loss,
+                                'is_zero': is_zero_rate
+                            })
                         
                         # Sparsity loss
                         if pop in targets.sparsity_targets:
@@ -311,25 +387,61 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
                             actual_sparsity = (torch.sum(mean_rates > targets.activity_threshold) / len(mean_rates)).item()
                             sparsity_error = (actual_sparsity - target_sparsity) ** 2
                             trial_loss += sparsity_error
+                            
+                            if verbose:
+                                print(f"        Sparsity: {actual_sparsity:.3f} (target: {target_sparsity:.2f})")
+                                print(f"        Sparsity loss: {sparsity_error:.6f}")
+                            
+                            # Track for diagnostics
+                            if pop not in baseline_loss_breakdown['sparsity_losses']:
+                                baseline_loss_breakdown['sparsity_losses'][pop] = []
+                            baseline_loss_breakdown['sparsity_losses'][pop].append({
+                                'target': target_sparsity,
+                                'actual': actual_sparsity,
+                                'loss': sparsity_error
+                            })
                 
                 # Add constraint violations
-                constraint_violation, _ = evaluate_rate_ordering_constraints(
+                constraint_violation, violations = evaluate_rate_ordering_constraints(
                     firing_rates, 
                     targets.rate_ordering_constraints
                 )
+                
+                if verbose and constraint_violation > 0:
+                    print(f"\n    Constraint violations:")
+                    for violation_info in violations:
+                        print(f"        {violation_info}")
+                
                 trial_loss += targets.constraint_violation_weight * constraint_violation
+                
+                baseline_loss_breakdown['constraint_violations'].append({
+                    'violation': constraint_violation,
+                    'weighted': targets.constraint_violation_weight * constraint_violation
+                })
                 
                 baseline_loss += trial_loss
         
         # Average baseline loss
         baseline_loss /= (len(config.mec_drive_levels) * config.n_trials)
+        
+        if verbose:
+            print(f"\n  Average baseline loss: {baseline_loss:.6f}")
 
         # === OPTOGENETIC OBJECTIVES ===
         opto_loss = 0.0
         opto_targets = targets.optogenetic_targets
+        opto_breakdown = {}
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print("Optogenetic stimulation evaluation")
+            print(f"{'='*80}")
         
         # Run optogenetic stimulation for PV and SST
         for target_pop in ['pv', 'sst']:
+            if verbose:
+                print(f"\n--- {target_pop.upper()} Stimulation ---")
+            
             opto_results = simulate_optogenetic_stimulation(
                 circuit_factory_data,
                 connection_modulation,
@@ -339,17 +451,37 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
             )
 
             # Evaluate optogenetic objectives
-            pop_opto_loss, _ = evaluate_optogenetic_objectives(
+            pop_opto_loss, loss_components = evaluate_optogenetic_objectives(
                 opto_results,
                 target_pop,
-                opto_targets
+                opto_targets,
+                verbose=verbose
             )
             
             opto_loss += pop_opto_loss
+            opto_breakdown[target_pop] = {
+                'loss': pop_opto_loss,
+                'components': loss_components,
+                'results': opto_results
+            }
+        
+        if verbose:
+            print(f"\n  Total optogenetic loss: {opto_loss:.6f}")
         
         # === COMBINED LOSS ===
         total_loss = (targets.baseline_weight * baseline_loss + 
                      targets.optogenetic_weight * opto_loss)
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print("Total loss breakdown")
+            print(f"{'='*80}")
+            print(f"  Baseline loss: {baseline_loss:.6f} (weight: {targets.baseline_weight})")
+            print(f"  Weighted baseline: {targets.baseline_weight * baseline_loss:.6f}")
+            print(f"  Optogenetic loss: {opto_loss:.6f} (weight: {targets.optogenetic_weight})")
+            print(f"  Weighted optogenetic: {targets.optogenetic_weight * opto_loss:.6f}")
+            print(f"  TOTAL: {total_loss:.6f}")
+            print(f"{'='*80}\n")
         
         return total_loss
         
@@ -358,7 +490,6 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
         import traceback
         traceback.print_exc()
         return 1e6
-
 
 def evaluate_particle_worker(args):
     """
@@ -380,8 +511,148 @@ def evaluate_particle_worker(args):
         return position, 1e6, dict(zip(connection_names, position))
 
 
-def run_global_optimization(optimization_config, n_workers=1, n_threads_per_worker=1,
-                            method='particle_swarm'):
+def print_new_best_diagnostics(position, loss, connection_names, 
+                               circuit_factory_data, targets, config):
+    """
+    Print comprehensive diagnostics when a new best solution is found
+    
+    This helps understand why certain parameter sets are being chosen,
+    especially when they lead to corner cases like zero firing rates
+    or zero paradoxical excitation.
+    """
+    print(f"\n{'#'*80}")
+    print("NEW BEST SOLUTION FOUND")
+    print(f"{'#'*80}")
+    print(f"Loss: {loss:.6f}\n")
+    
+    # Evaluate with verbose output
+    evaluate_de_candidate_worker(
+        position, 
+        connection_names, 
+        circuit_factory_data, 
+        targets, 
+        config,
+        verbose=True
+    )
+    
+    # Additional summary statistics
+    connection_modulation = dict(zip(connection_names, position))
+    
+    print(f"\n{'='*80}")
+    print("Corner case detection")
+    print(f"{'='*80}")
+    
+    # Quick check for potential issues
+    from DG_circuit_dendritic_somatic_transfer import (
+        DentateCircuit, PerConnectionSynapticParams
+    )
+    
+    circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
+    
+    synaptic_params = PerConnectionSynapticParams(
+        ampa_g_mean=base_synaptic_params_dict['ampa_g_mean'],
+        ampa_g_std=base_synaptic_params_dict['ampa_g_std'],
+        gaba_g_mean=base_synaptic_params_dict['gaba_g_mean'],
+        gaba_g_std=base_synaptic_params_dict['gaba_g_std'],
+        distribution=base_synaptic_params_dict['distribution'],
+        connection_modulation=connection_modulation
+    )
+    
+    circuit = DentateCircuit(circuit_params, synaptic_params, opsin_params)
+    circuit.reset_state()
+    
+    device = torch.device('cpu')
+    mec_input = torch.ones(circuit.circuit_params.n_mec, device=device) * config.mec_drive_levels[0]
+    
+    # Quick baseline check
+    activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+    for t in range(100):
+        external_drive = {'mec': mec_input}
+        activities = circuit({}, external_drive)
+        if t >= 50:
+            for pop in activities_over_time:
+                if pop in activities:
+                    activities_over_time[pop].append(activities[pop].clone().cpu())
+    
+    issues_detected = []
+    
+    for pop in activities_over_time:
+        if len(activities_over_time[pop]) > 0:
+            pop_time_series = torch.stack(activities_over_time[pop])
+            mean_rates = torch.mean(pop_time_series, dim=0)
+            avg_rate = torch.mean(mean_rates).item()
+            
+            if np.isclose(avg_rate, 0.0, 1e-2, 1e-2):
+                issues_detected.append(f"  {pop.upper()} has zero firing rate")
+    
+    # Check optogenetic response
+    for target_pop in ['pv', 'sst']:
+        opto_results = simulate_optogenetic_stimulation(
+            circuit_factory_data,
+            connection_modulation,
+            target_pop,
+            targets.optogenetic_targets.stimulation_intensity,
+            mec_current=config.mec_drive_levels[0]
+        )
+        
+        for affected_pop, data in opto_results.items():
+            if affected_pop != target_pop:
+                activated_frac = data['activated_fraction']
+                mean_change = data['mean_change']
+                
+                # Check for expected targets
+                target_increase = None
+                if target_pop in targets.optogenetic_targets.target_rate_increases:
+                    target_increase = targets.optogenetic_targets.target_rate_increases[target_pop].get(affected_pop)
+                
+                if target_increase is not None and target_increase != 0:
+                    if np.isclose(activated_frac, 0.0, 1e-2, 1e-2):
+                        issues_detected.append(
+                            f"  {target_pop.upper()} stim: {affected_pop.upper()} has zero activated fraction "
+                            f"(target: {target_increase:.2%})"
+                        )
+                    elif np.abs(mean_change) < 0.01:
+                        issues_detected.append(
+                            f"  {target_pop.upper()} stim: {affected_pop.upper()} has negligible rate change "
+                            f"({mean_change:+.3f} Hz)"
+                        )
+    
+    if issues_detected:
+        print("\n  Potential corner cases detected:")
+        for issue in issues_detected:
+            print(f"  {issue}")
+        
+        print("\nPossible causes:")
+        print("  1. Inhibition too strong -> suppresses all activity")
+        print("  2. Excitation too weak -> insufficient drive")
+        print("  3. Imbalanced E/I ratio -> network collapses to silent state")
+        print("  4. Penalty terms insufficient to prevent corner case")
+        
+        print("\nParameter analysis:")
+        # Check for extreme values
+        extreme_params = []
+        for conn, value in sorted(connection_modulation.items()):
+            bounds = targets.connection_bounds.get(conn, (0.1, 5.0))
+            if value < bounds[0] * 1.1 or value > bounds[1] * 0.9:
+                extreme_params.append(f"  {conn}: {value:.3f} (bounds: {bounds})")
+        
+        if extreme_params:
+            print("  Extreme parameter values near bounds:")
+            for param in extreme_params:
+                print(f"    {param}")
+        else:
+            print("  No extreme parameter values detected")
+            print("  -> Issue may be due to parameter interactions")
+    else:
+        print("\n No obvious corner cases detected")
+    
+    print(f"{'#'*80}\n")
+
+def run_global_optimization(optimization_config,
+                            n_workers=1,
+                            n_threads_per_worker=1,
+                            method='particle_swarm',
+                            diagnostic_frequency=5):
     """
     Run global optimization with optogenetic objectives
     
@@ -459,6 +730,9 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
     print(f"  Optogenetic weight: {targets.optogenetic_weight}")
     
     configure_torch_threads(n_threads_per_worker)
+
+    # Track number of new bests for diagnostic frequency
+    n_new_bests = [0]  # Use list to allow modification in closure
     
     if method == 'differential_evolution':
         # Use Differential Evolution
@@ -582,8 +856,15 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
                     global_best_position = position.copy()
                     best_params = connection_modulation.copy()
 
-                    print(f"  New global best: {global_best_score:.6f}")
+                    print(f"\n  New global best #{n_new_bests[0]}: {global_best_score:.6f}")
                     print(f"  Parameters: {best_params}")
+                    
+                    # Detailed diagnostics every N new bests
+                    if n_new_bests[0] % diagnostic_frequency == 0:
+                        print_new_best_diagnostics(
+                            position, score, connection_names,
+                            circuit_factory_data, targets, optimization_config
+                        )
                 
                 history['loss'].append(score)
                 history['parameters'].append(connection_modulation)
@@ -622,6 +903,12 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
                 velocities[i] = w * velocities[i] + cognitive + social
                 positions[i] += velocities[i]
                 positions[i] = np.clip(positions[i], lower_bounds, upper_bounds)
+        print("Optimization complete - final diagnostics")
+        print(f"{'='*80}")
+        print_new_best_diagnostics(
+            global_best_position, global_best_score, connection_names,
+            circuit_factory_data, targets, optimization_config
+        )
         
         return {
             'optimized_connection_modulation': dict(zip(connection_names, global_best_position)),
@@ -629,7 +916,8 @@ def run_global_optimization(optimization_config, n_workers=1, n_threads_per_work
             'n_evaluations': max_iterations * n_particles,
             'history': history,
             'method': 'particle_swarm',
-            'targets': targets
+            'targets': targets,
+            'n_new_bests': n_new_bests[0]
         }
     
     else:
