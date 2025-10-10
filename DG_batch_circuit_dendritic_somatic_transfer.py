@@ -510,6 +510,151 @@ class BatchDentateCircuit(nn.Module):
             }
 
 
+class BatchCircuitEvaluator:
+    """
+    Evaluates multiple parameter configurations in parallel using batched simulation
+    
+    Provides high-level interface for optimization algorithms to evaluate
+    batches of connection modulation parameters efficiently on GPU.
+    """
+    
+    def __init__(self,
+                 circuit_params,
+                 base_synaptic_params,
+                 opsin_params,
+                 targets,
+                 config,
+                 device: Optional[torch.device] = None):
+        """
+        Initialize batched circuit evaluator
+        
+        Args:
+            circuit_params: CircuitParams instance
+            base_synaptic_params: PerConnectionSynapticParams instance
+            opsin_params: OpsinParams instance
+            targets: OptimizationTargets instance (from DG_circuit_optimization)
+            config: OptimizationConfig instance (from DG_circuit_optimization)
+            device: Device to run simulations on
+        """
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        self.device = device if device is not None else get_default_device()
+        
+        print(f"BatchCircuitEvaluator initialized on device: {self.device}")
+    
+    def evaluate_parameter_batch(self,
+                                 parameter_batch: List[Dict[str, float]],
+                                 mec_drive: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Evaluate a batch of parameter configurations in parallel
+        
+        Args:
+            parameter_batch: List of connection_modulation dicts, length = batch_size
+                           Each dict maps connection_name -> modulation_factor
+            mec_drive: MEC drive level (pA)
+            
+        Returns:
+            losses: Tensor of shape [batch_size] with loss for each configuration
+            firing_rates_batch: Dict mapping pop_name -> firing rates [batch_size]
+        """
+        batch_size = len(parameter_batch)
+        
+        # Create batched circuit
+        circuit = BatchDentateCircuit(
+            batch_size=batch_size,
+            circuit_params=self.circuit_params,
+            synaptic_params=self.base_synaptic_params,
+            opsin_params=self.opsin_params,
+            device=self.device
+        )
+        
+        # Set per-batch connection modulation
+        circuit.set_connection_modulation_batch(parameter_batch)
+        
+        # Run simulation
+        circuit.reset_state()
+        
+        # MEC input: [batch_size, n_mec]
+        mec_input = torch.ones(batch_size, self.circuit_params.n_mec, 
+                              device=self.device) * mec_drive
+        
+        # Collect activities over time
+        activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+        
+        for t in range(self.config.simulation_duration):
+            external_drive = {'mec': mec_input}
+            activities = circuit({}, external_drive)
+            
+            if t >= self.config.warmup_duration:
+                for pop in activities_over_time:
+                    if pop in activities:
+                        # activities[pop] has shape [batch_size, n_neurons]
+                        activities_over_time[pop].append(activities[pop])
+        
+        # Calculate statistics and losses
+        # Stack time series: [time_steps, batch_size, n_neurons]
+        losses = torch.zeros(batch_size, device=self.device)
+        firing_rates_batch = {pop: torch.zeros(batch_size, device=self.device) 
+                             for pop in ['gc', 'mc', 'pv', 'sst']}
+        
+        for pop in activities_over_time:
+            if len(activities_over_time[pop]) > 0:
+                # Stack: [time, batch, neurons] -> mean over time: [batch, neurons]
+                pop_time_series = torch.stack(activities_over_time[pop], dim=0)
+                mean_rates = torch.mean(pop_time_series, dim=0)  # [batch, neurons]
+                
+                # Population average firing rate per batch element: [batch]
+                pop_firing_rates = torch.mean(mean_rates, dim=1)
+                firing_rates_batch[pop] = pop_firing_rates
+                
+                # Calculate loss components for this population
+                if pop in self.targets.target_rates:
+                    target_rate = self.targets.target_rates[pop]
+                    tolerance = self.targets.rate_tolerance[pop]
+                    
+                    # Vectorized loss calculation across batch
+                    errors = torch.abs(pop_firing_rates - target_rate)
+                    
+                    # Huber loss with tolerance
+                    rate_losses = torch.where(
+                        errors <= tolerance,
+                        0.5 * errors ** 2,
+                        tolerance * errors - 0.5 * tolerance ** 2
+                    )
+                    
+                    losses += rate_losses
+                
+                # Sparsity loss
+                if pop in self.targets.sparsity_targets:
+                    target_sparsity = self.targets.sparsity_targets[pop]
+                    # Sparsity per batch element: [batch]
+                    actual_sparsity = torch.sum(
+                        mean_rates > self.targets.activity_threshold, 
+                        dim=1
+                    ).float() / mean_rates.shape[1]
+                    
+                    sparsity_errors = (actual_sparsity - target_sparsity) ** 2
+                    losses += sparsity_errors * self.targets.loss_weights['sparsity']
+        
+        # Add constraint violations (requires converting to CPU for evaluation)
+        # Import here to avoid circular dependency
+        from DG_circuit_optimization import evaluate_rate_ordering_constraints
+        
+        for b in range(batch_size):
+            firing_rates_dict = {pop: firing_rates_batch[pop][b].item() 
+                                for pop in firing_rates_batch}
+            constraint_violation, _ = evaluate_rate_ordering_constraints(
+                firing_rates_dict,
+                self.targets.rate_ordering_constraints
+            )
+            losses[b] += self.targets.constraint_violation_weight * constraint_violation
+        
+        return losses, firing_rates_batch
+
+    
 def test_batch_circuit(batch_size: int = 8,
                         n_steps: int = 100,
                         device: Optional[torch.device] = None,
