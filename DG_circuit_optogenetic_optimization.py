@@ -878,7 +878,7 @@ def run_global_optimization(optimization_config,
                             position, score, connection_names,
                             circuit_factory_data, targets, optimization_config
                         )
-                
+
                 history['loss'].append(score)
                 history['parameters'].append(connection_modulation)
 

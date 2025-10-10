@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Enhanced Dendritic-Somatic Transfer Function for Dentate Gyrus Modeling
+Dendritic-Somatic Transfer Function for Dentate Gyrus Modeling
 
 Implements biophysically realistic two-stage dendritic integration and somatic 
 firing rate conversion with cell-type specific parameters.
+
 """
 
 import torch
@@ -12,13 +13,17 @@ import matplotlib.pyplot as plt
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
+def get_default_device() -> torch.device:
+    """Get default device (CUDA if available, else CPU)"""
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 @dataclass
 class DendriticParameters:
     """Cell-type specific dendritic integration parameters"""
     # Membrane properties
     v_rest: float = -70.0          # Resting potential (mV)
     v_thresh: float = -50.0        # Firing threshold (mV)
-    input_resistance: float = 200.0 # Input resistance (MΩ)
+    input_resistance: float = 200.0 # Input resistance (MOhm)
     membrane_tau: float = 20.0     # Membrane time constant (ms)
 
     # Synaptic reversal potentials
@@ -49,6 +54,13 @@ def nmda_voltage_dependence(voltage: torch.Tensor, mg_conc: float = 1.0) -> torc
     Calculate NMDA receptor Mg2+ block removal factor
     
     Based on Jahr & Stevens (1990) and Nowak et al. (1984)
+    
+    Args:
+        voltage: Membrane voltage (mV)
+        mg_conc: Extracellular Mg2+ concentration (mM)
+        
+    Returns:
+        mg_block: NMDA Mg2+ block removal factor (0-1)
     """
     # Standard NMDA Mg2+ block equation
     mg_block = 1.0 / (1.0 + (mg_conc / 3.57) * torch.exp(-0.062 * voltage))
@@ -61,6 +73,14 @@ def dendritic_spike_nonlinearity(voltage: torch.Tensor,
     Model dendritic Ca2+ spike generation
     
     Implements sigmoid-like dendritic spike when threshold is crossed
+    
+    Args:
+        voltage: Dendritic voltage (mV)
+        thresh: Threshold for dendritic spike (mV)
+        amplitude: Amplitude of dendritic spike (mV)
+        
+    Returns:
+        dendritic_boost: Additional voltage from dendritic spike (mV)
     """
     # Sigmoid activation for dendritic spikes
     above_thresh = voltage - thresh
@@ -74,7 +94,8 @@ def dendritic_somatic_transfer(ampa_conductance: torch.Tensor,
                                gaba_conductance: torch.Tensor,
                                nmda_conductance: torch.Tensor,
                                params: DendriticParameters,
-                               adaptation_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
+                               adaptation_state: Optional[torch.Tensor] = None,
+                               device: Optional[torch.device] = None) -> Tuple[torch.Tensor, Dict]:
     """
     Dendritic-somatic transfer function using conductance inputs from dynamic synapses
     
@@ -87,11 +108,16 @@ def dendritic_somatic_transfer(ampa_conductance: torch.Tensor,
         nmda_conductance: Total NMDA conductance before Mg2+ block (nS)
         params: Cell-type specific parameters
         adaptation_state: Previous adaptation level (optional)
+        device: Device to create new tensors on (optional, inferred from inputs)
         
     Returns:
         firing_rate: Output firing rate (Hz)
         states: Dictionary containing internal states
     """
+    
+    # Infer device from input tensors if not specified
+    if device is None:
+        device = ampa_conductance.device
     
     # Stage 1: Iterative Dendritic Integration
     # =======================================
@@ -118,7 +144,7 @@ def dendritic_somatic_transfer(ampa_conductance: torch.Tensor,
         # V = (g_ampa*E_exc + g_gaba*E_inh + g_nmda*E_exc + g_leak*E_rest) / (g_total + g_leak)
         
         # Assume leak conductance = 1nS (can be made parameter if needed)
-        g_leak = torch.ones_like(total_conductance)  # nS
+        g_leak = torch.ones_like(total_conductance, device=device)  # nS
         
         numerator = (ampa_conductance * params.e_exc + 
                     gaba_conductance * params.e_inh +
@@ -135,7 +161,7 @@ def dendritic_somatic_transfer(ampa_conductance: torch.Tensor,
             break
     
     # Apply dendritic nonlinearities (Ca2+ spikes)
-    dendritic_boost = torch.zeros_like(v_dendrite)
+    dendritic_boost = torch.zeros_like(v_dendrite, device=device)
     if params.ca_spike_enabled:
         dendritic_boost = dendritic_spike_nonlinearity(
             v_dendrite, params.dendritic_spike_thresh, params.dendritic_spike_amp
@@ -161,13 +187,13 @@ def dendritic_somatic_transfer(ampa_conductance: torch.Tensor,
         firing_rate = params.max_firing_rate * torch.expm1(above_threshold * params.rate_gain)
         firing_rate = torch.clamp(firing_rate, max=params.max_firing_rate)
     else:
-        firing_rate = torch.zeros_like(above_threshold)
+        firing_rate = torch.zeros_like(above_threshold, device=device)
     
     # Update adaptation state for next timestep
-    new_adaptation = adaptation_state if adaptation_state is not None else torch.zeros_like(firing_rate)
+    new_adaptation = adaptation_state if adaptation_state is not None else torch.zeros_like(firing_rate, device=device)
     if params.adaptation_enabled:
         # Simple exponential adaptation
-        adaptation_decay = torch.exp(torch.tensor(-1.0 / params.adaptation_tau))
+        adaptation_decay = torch.exp(torch.tensor(-1.0 / params.adaptation_tau, device=device))
         new_adaptation = adaptation_decay * new_adaptation + (1 - adaptation_decay) * firing_rate / params.max_firing_rate
     
     # Calculate final NMDA factor for output
@@ -278,17 +304,30 @@ def get_cell_type_parameters() -> Dict[str, DendriticParameters]:
     return cell_params
 
 
-def test_dendritic_somatic_transfer():
+def test_dendritic_somatic_transfer(device: Optional[torch.device] = None,
+                                    save_figures: bool = True):
     """
     Test the conductance-based dendritic-somatic transfer function
+    
+    Args:
+        device: Device to run tests on (None for auto-detect)
+        save_figures: Whether to save figure files
     """
-    print("Testing conductance-based dendritic-somatic transfer function...")
+    if device is None:
+        device = get_default_device()
+    
+    print("="*60)
+    print("Testing conductance-based dendritic-somatic transfer function")
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(device)}")
+    print("="*60)
     
     # Get parameters for different cell types
     cell_params = get_cell_type_parameters()
     
     # Test conductance range (nS)
-    conductance_range = torch.linspace(0, 30, 300)  # 0-30 nS
+    conductance_range = torch.linspace(0, 30, 300, device=device)
     
     fig, axes = plt.subplots(3, 2, figsize=(15, 16))
     axes = axes.flatten()
@@ -303,12 +342,13 @@ def test_dendritic_somatic_transfer():
         v_somas_ampa = []
         
         for conductance in conductance_range:
-            cond = torch.tensor([conductance.item()])
+            cond = torch.tensor([conductance.item()], device=device)
             fr, states = dendritic_somatic_transfer(
                 ampa_conductance=cond,
                 gaba_conductance=torch.zeros_like(cond),
                 nmda_conductance=torch.zeros_like(cond),
-                params=params
+                params=params,
+                device=device
             )
             
             firing_rates_ampa.append(fr.item())
@@ -323,7 +363,7 @@ def test_dendritic_somatic_transfer():
         convergence_iters = []
         
         for conductance in conductance_range:
-            cond = torch.tensor([conductance.item()])
+            cond = torch.tensor([conductance.item()], device=device)
             ampa_cond = cond * 0.7
             nmda_cond = cond * 0.3
             
@@ -331,7 +371,8 @@ def test_dendritic_somatic_transfer():
                 ampa_conductance=ampa_cond,
                 gaba_conductance=torch.zeros_like(cond),
                 nmda_conductance=nmda_cond,
-                params=params
+                params=params,
+                device=device
             )
             
             firing_rates_mixed.append(fr.item())
@@ -345,22 +386,23 @@ def test_dendritic_somatic_transfer():
         fixed_excitation = 2.5  # nS fixed excitatory conductance
         
         for inhib_cond in conductance_range:
-            cond_exc = torch.tensor([fixed_excitation])
-            cond_inh = torch.tensor([inhib_cond.item()])
+            cond_exc = torch.tensor([fixed_excitation], device=device)
+            cond_inh = torch.tensor([inhib_cond.item()], device=device)
             
             fr, states = dendritic_somatic_transfer(
                 ampa_conductance=cond_exc * 0.7,
                 gaba_conductance=cond_inh,
                 nmda_conductance=cond_exc * 0.3,
-                params=params
+                params=params,
+                device=device
             )
             
             firing_rates_inhib.append(fr.item())
         
         # Plot firing rate curves
-        ax.plot(conductance_range.numpy(), firing_rates_ampa, 'b-', 
+        ax.plot(conductance_range.cpu().numpy(), firing_rates_ampa, 'b-', 
                 linewidth=2.5, label='AMPA only')
-        ax.plot(conductance_range.numpy(), firing_rates_mixed, 'r-', 
+        ax.plot(conductance_range.cpu().numpy(), firing_rates_mixed, 'r-', 
                 linewidth=2.5, label='AMPA + NMDA (30%)')
         ax.set_xlabel('Excitatory Conductance (nS)', fontsize=10)
         ax.set_ylabel('Firing Rate (Hz)', color='b', fontsize=10)
@@ -370,9 +412,9 @@ def test_dendritic_somatic_transfer():
         
         # Add voltage traces on secondary axis
         ax2 = ax.twinx()
-        ax2.plot(conductance_range.numpy(), v_dendrites_mixed, 'g--', 
+        ax2.plot(conductance_range.cpu().numpy(), v_dendrites_mixed, 'g--', 
                 alpha=0.5, linewidth=1.5, label='V_dendrite')
-        ax2.plot(conductance_range.numpy(), v_somas_mixed, 'm--', 
+        ax2.plot(conductance_range.cpu().numpy(), v_somas_mixed, 'm--', 
                 alpha=0.5, linewidth=1.5, label='V_soma')
         ax2.axhline(y=params.v_thresh, color='k', linestyle=':', 
                    alpha=0.5, linewidth=1)
@@ -380,11 +422,11 @@ def test_dendritic_somatic_transfer():
         ax2.legend(loc='upper right', fontsize=7)
         
         # Add parameter info text box
-        param_text = (f"R_in={params.input_resistance:.0f}MΩ\n"
-                     f"Mg²⁺={params.mg_concentration:.1f}mM\n"
+        param_text = (f"R_in={params.input_resistance:.0f}M$\\Omega$\n"
+                     f"Mg$^{{2+}}$={params.mg_concentration:.1f}mM\n"
                      f"Max rate={params.max_firing_rate:.0f}Hz\n"
                      f"Gain={params.rate_gain:.3f}\n"
-                     f"Ca²⁺ spikes={'Yes' if params.ca_spike_enabled else 'No'}\n"
+                     f"Ca$^{{2+}}$ spikes={'Yes' if params.ca_spike_enabled else 'No'}\n"
                      f"Adapt={'Yes' if params.adaptation_enabled else 'No'}")
         ax.text(0.65, 0.05, param_text, transform=ax.transAxes, 
                verticalalignment='bottom', fontsize=7,
@@ -398,19 +440,20 @@ def test_dendritic_somatic_transfer():
         firing_rates_inhib_cell = []
         fixed_exc = 2.5
         
-        for inhib_cond in torch.linspace(0, 25, 100):
-            cond_exc = torch.tensor([fixed_exc])
-            cond_inh = torch.tensor([inhib_cond.item()])
+        for inhib_cond in torch.linspace(0, 25, 100, device=device):
+            cond_exc = torch.tensor([fixed_exc], device=device)
+            cond_inh = torch.tensor([inhib_cond.item()], device=device)
             
             fr, _ = dendritic_somatic_transfer(
                 ampa_conductance=cond_exc * 0.7,
                 gaba_conductance=cond_inh,
                 nmda_conductance=cond_exc * 0.3,
-                params=params
+                params=params,
+                device=device
             )
             firing_rates_inhib_cell.append(fr.item())
         
-        ax_inhib.plot(torch.linspace(0, 25, 100).numpy(), 
+        ax_inhib.plot(torch.linspace(0, 25, 100).cpu().numpy(), 
                      firing_rates_inhib_cell, linewidth=2, 
                      label=cell_type.upper())
     
@@ -421,7 +464,9 @@ def test_dendritic_somatic_transfer():
     ax_inhib.legend(fontsize=8)
     
     plt.tight_layout()
-    plt.savefig('conductance_based_transfer_functions.png', dpi=150)
+    if save_figures:
+        plt.savefig('conductance_based_transfer_functions.png', dpi=150)
+        print("\nSaved figure: conductance_based_transfer_functions.png")
     plt.show()
     
     # Additional analysis: NMDA voltage dependence
@@ -439,28 +484,29 @@ def test_dendritic_somatic_transfer():
         test_conductances = [2.5, 5.0, 10.0, 15.0, 20.0]  # nS
         
         for total_cond in test_conductances:
-            ampa_fractions = torch.linspace(0, 1, 50)
+            ampa_fractions = torch.linspace(0, 1, 50, device=device)
             firing_rates = []
             nmda_contributions = []
             
             for ampa_frac in ampa_fractions:
                 nmda_frac = 1 - ampa_frac
                 
-                ampa_cond = torch.tensor([total_cond * ampa_frac])
-                nmda_cond = torch.tensor([total_cond * nmda_frac])
+                ampa_cond = torch.tensor([total_cond * ampa_frac], device=device)
+                nmda_cond = torch.tensor([total_cond * nmda_frac], device=device)
                 
                 fr, states = dendritic_somatic_transfer(
                     ampa_conductance=ampa_cond,
                     gaba_conductance=torch.zeros_like(ampa_cond),
                     nmda_conductance=nmda_cond,
-                    params=params
+                    params=params,
+                    device=device
                 )
                 
                 firing_rates.append(fr.item())
                 effective_nmda = states['effective_nmda_conductance'].item()
                 nmda_contributions.append(effective_nmda / (total_cond + 1e-6))
             
-            ax.plot(ampa_fractions.numpy() * 100, firing_rates, 
+            ax.plot(ampa_fractions.cpu().numpy() * 100, firing_rates, 
                    linewidth=2, label=f'{total_cond}nS total')
         
         ax.set_xlabel('AMPA Fraction (%)', fontsize=10)
@@ -474,22 +520,23 @@ def test_dendritic_somatic_transfer():
     ax_conv = axes2[-1]
     
     for cell_type, params in cell_params.items():
-        conductance_test = torch.linspace(0, 30, 100)
+        conductance_test = torch.linspace(0, 30, 100, device=device)
         iterations_needed = []
         
         for cond in conductance_test:
-            ampa_cond = torch.tensor([cond.item() * 0.5])
-            nmda_cond = torch.tensor([cond.item() * 0.5])
+            ampa_cond = torch.tensor([cond.item() * 0.5], device=device)
+            nmda_cond = torch.tensor([cond.item() * 0.5], device=device)
             
             _, states = dendritic_somatic_transfer(
                 ampa_conductance=ampa_cond,
                 gaba_conductance=torch.zeros_like(ampa_cond),
                 nmda_conductance=nmda_cond,
-                params=params
+                params=params,
+                device=device
             )
             iterations_needed.append(states['convergence_iterations'])
         
-        ax_conv.plot(conductance_test.numpy(), iterations_needed, 
+        ax_conv.plot(conductance_test.cpu().numpy(), iterations_needed, 
                     linewidth=2, label=cell_type.upper(), marker='o', 
                     markersize=2, alpha=0.7)
     
@@ -501,7 +548,9 @@ def test_dendritic_somatic_transfer():
     ax_conv.set_ylim([0, 6])
     
     plt.tight_layout()
-    plt.savefig('nmda_voltage_dependence_analysis.png', dpi=150)
+    if save_figures:
+        plt.savefig('nmda_voltage_dependence_analysis.png', dpi=150)
+        print("Saved figure: nmda_voltage_dependence_analysis.png")
     plt.show()
     
     # Print summary statistics
@@ -523,8 +572,86 @@ def test_dendritic_somatic_transfer():
     return cell_params
 
 
+def benchmark_devices(n_tests: int = 1000):
+    """
+    Benchmark transfer function performance on CPU vs GPU
+    
+    Args:
+        n_tests: Number of transfer function calls to benchmark
+    """
+    print("="*60)
+    print("Device Benchmark for Dendritic-Somatic Transfer")
+    print("="*60)
+    
+    cell_params = get_cell_type_parameters()
+    gc_params = cell_params['gc']
+    
+    # Create test inputs
+    test_conductances = {
+        'ampa': 5.0,  # nS
+        'gaba': 2.0,  # nS
+        'nmda': 3.0,  # nS
+    }
+    
+    import time
+    
+    # CPU benchmark
+    print("\nCPU Benchmark:")
+    print("-"*60)
+    device_cpu = torch.device('cpu')
+    
+    ampa_cond_cpu = torch.tensor([test_conductances['ampa']], device=device_cpu)
+    gaba_cond_cpu = torch.tensor([test_conductances['gaba']], device=device_cpu)
+    nmda_cond_cpu = torch.tensor([test_conductances['nmda']], device=device_cpu)
+    
+    start = time.time()
+    for _ in range(n_tests):
+        fr, states = dendritic_somatic_transfer(
+            ampa_cond_cpu, gaba_cond_cpu, nmda_cond_cpu,
+            gc_params, device=device_cpu
+        )
+    cpu_time = time.time() - start
+    
+    print(f"Completed {n_tests} iterations in {cpu_time:.3f}s")
+    print(f"Average time per call: {cpu_time/n_tests*1000:.3f} ms")
+    
+    # GPU benchmark if available
+    if torch.cuda.is_available():
+        print("\nGPU Benchmark:")
+        print("-"*60)
+        device_gpu = torch.device('cuda')
+        
+        ampa_cond_gpu = torch.tensor([test_conductances['ampa']], device=device_gpu)
+        gaba_cond_gpu = torch.tensor([test_conductances['gaba']], device=device_gpu)
+        nmda_cond_gpu = torch.tensor([test_conductances['nmda']], device=device_gpu)
+        
+        # Warmup
+        for _ in range(10):
+            fr, states = dendritic_somatic_transfer(
+                ampa_cond_gpu, gaba_cond_gpu, nmda_cond_gpu,
+                gc_params, device=device_gpu
+            )
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        for _ in range(n_tests):
+            fr, states = dendritic_somatic_transfer(
+                ampa_cond_gpu, gaba_cond_gpu, nmda_cond_gpu,
+                gc_params, device=device_gpu
+            )
+        torch.cuda.synchronize()
+        gpu_time = time.time() - start
+        
+        print(f"Completed {n_tests} iterations in {gpu_time:.3f}s")
+        print(f"Average time per call: {gpu_time/n_tests*1000:.3f} ms")
+        print(f"\nSpeedup: {cpu_time/gpu_time:.2f}x")
+    else:
+        print("\nGPU not available for comparison")
+
+
 if __name__ == "__main__":
-    # Test the implementation
+    # Test with default device (auto-detect)
+    print("\nRunning transfer function tests with auto-detected device...")
     cell_params = test_dendritic_somatic_transfer()
     
     # Print parameter summary
@@ -532,9 +659,16 @@ if __name__ == "__main__":
     print("=" * 50)
     for cell_type, params in cell_params.items():
         print(f"{cell_type.upper()}:")
-        print(f"  Input Resistance: {params.input_resistance:.0f} MΩ")
+        print(f"  Input Resistance: {params.input_resistance:.0f} MOhm")
         print(f"  Max Rate: {params.max_firing_rate:.0f} Hz")
         print(f"  Rate Gain: {params.rate_gain:.3f}")
         print(f"  Ca2+ Spikes: {params.ca_spike_enabled}")
         print(f"  Adaptation: {params.adaptation_enabled}")
         print()
+    
+    # Run benchmark if GPU available
+    if torch.cuda.is_available():
+        print("\n" + "="*60)
+        print("Running device benchmark...")
+        print("="*60)
+        benchmark_devices(n_tests=1000)
