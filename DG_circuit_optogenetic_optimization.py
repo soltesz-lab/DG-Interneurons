@@ -273,10 +273,17 @@ def evaluate_optogenetic_objectives(opto_results: Dict,
     return total_loss, loss_components
 
 
+<<<<<<< HEAD
 def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_data,
                                  targets: CombinedOptimizationTargets, config,
                                  device: Optional[torch.device] = None,
                                  verbose: bool = False):
+=======
+
+def evaluate_candidate_worker(param_array, connection_names, circuit_factory_data,
+                              targets: CombinedOptimizationTargets, config,
+                              verbose: bool = False):
+>>>>>>> 8c504ed274620d21a13a6a8594f9b4617da999d4
     """
     Objective worker function with detailed diagnostics
     
@@ -412,10 +419,34 @@ def evaluate_de_candidate_worker(param_array, connection_names, circuit_factory_
                     device=device
                 )
 
+<<<<<<< HEAD
                 trial_opto_loss, _ = evaluate_optogenetic_objectives(
                     opto_results, target_pop, opto_targets, verbose=verbose
                 )
                 target_pop_opto_loss += trial_opto_loss
+=======
+                if verbose and config.n_trials > 1:
+                    print(f"\n  Trial {trial + 1}/{config.n_trials}:")
+
+                opto_results = simulate_optogenetic_stimulation(
+                    circuit_factory_data,
+                    connection_modulation,
+                    target_pop,
+                    opto_targets.stimulation_intensity,
+                    mec_current=config.mec_drive_levels[0]  # Use first MEC drive level
+                )
+
+                # Evaluate optogenetic objectives for this trial
+                trial_opto_loss, loss_components = evaluate_optogenetic_objectives(
+                    opto_results,
+                    target_pop,
+                    opto_targets,
+                    verbose=verbose
+                )
+
+                target_pop_opto_loss += trial_opto_loss
+
+>>>>>>> 8c504ed274620d21a13a6a8594f9b4617da999d4
                 
             target_pop_opto_loss /= config.n_trials
             opto_loss += target_pop_opto_loss
@@ -448,8 +479,13 @@ def evaluate_particle_worker(args):
     position, connection_names, circuit_factory_data, targets, config, device = args
     
     try:
+<<<<<<< HEAD
         loss = evaluate_de_candidate_worker(
             position, connection_names, circuit_factory_data, targets, config, device=device
+=======
+        loss = evaluate_candidate_worker(
+            position, connection_names, circuit_factory_data, targets, config
+>>>>>>> 8c504ed274620d21a13a6a8594f9b4617da999d4
         )
         connection_modulation = dict(zip(connection_names, position))
         return position, loss, connection_modulation
@@ -466,9 +502,39 @@ def print_new_best_diagnostics(position, loss, connection_names,
     print(f"{'#'*80}")
     print(f"Loss: {loss:.6f}\n")
     
+<<<<<<< HEAD
     recomputed_loss = evaluate_de_candidate_worker(
         position, connection_names, circuit_factory_data, 
         targets, config, device=device, verbose=True
+=======
+    # Evaluate with verbose output
+    recomputed_loss = evaluate_candidate_worker(
+        position, 
+        connection_names, 
+        circuit_factory_data, 
+        targets, 
+        config,
+        verbose=True
+    )
+
+    # Verify that optimizer loss matches recomputed loss
+    print(f"\n{'='*80}")
+    print("Loss verification")
+    print(f"{'='*80}")
+    print(f"  Loss from optimizer:  {loss:.6f}")
+    print(f"  Recomputed loss:      {recomputed_loss:.6f}")
+    
+    # Additional summary statistics
+    connection_modulation = dict(zip(connection_names, position))
+    
+    print(f"\n{'='*80}")
+    print("Corner case detection")
+    print(f"{'='*80}")
+    
+    # Quick check for potential issues
+    from DG_circuit_dendritic_somatic_transfer import (
+        DentateCircuit, PerConnectionSynapticParams
+>>>>>>> 8c504ed274620d21a13a6a8594f9b4617da999d4
     )
     
     print(f"\nLoss verification: {loss:.6f} vs {recomputed_loss:.6f}")
@@ -524,7 +590,7 @@ def run_global_optimization(optimization_config,
         rate_ordering_constraints=base_targets.rate_ordering_constraints,
         optogenetic_targets=OptogeneticTargets(),
         baseline_weight=1.0,
-        optogenetic_weight=4.0
+        optogenetic_weight=1.0
     )
     
     # Circuit factory data
@@ -557,7 +623,71 @@ def run_global_optimization(optimization_config,
     
     n_new_bests = [0]
     
+<<<<<<< HEAD
     if method == 'particle_swarm':
+=======
+    if method == 'differential_evolution':
+        # Use Differential Evolution
+        objective = partial(
+            evaluate_candidate_worker,
+            connection_names=connection_names,
+            circuit_factory_data=circuit_factory_data,
+            targets=targets,
+            config=optimization_config
+        )
+        
+        best_loss = float('inf')
+        best_params = None
+        history = {'loss': [], 'parameters': []}
+        
+        def callback(xk, convergence):
+            loss = evaluate_candidate_worker(
+                xk, connection_names, circuit_factory_data, targets, optimization_config
+            )
+            connection_modulation = dict(zip(connection_names, xk))
+            
+            history['loss'].append(loss)
+            history['parameters'].append(connection_modulation)
+            
+            nonlocal best_loss, best_params
+            if loss < best_loss:
+                best_loss = loss
+                best_params = connection_modulation.copy()
+                print(f"New best loss: {loss:.6f}")
+            
+            return False
+        
+        result = differential_evolution(
+            objective,
+            bounds,
+            maxiter=optimization_config.max_iterations,
+            popsize=20,
+            mutation=(0.5, 1.0),
+            recombination=0.7,
+            seed=42,
+            disp=True,
+            polish=False,
+            workers=n_workers if n_workers > 1 else 1,
+            updating='deferred',
+            callback=callback,
+        )
+        
+        return {
+            'optimized_connection_modulation': best_params,
+            'best_loss': best_loss,
+            'n_evaluations': result.nfev,
+            'n_iterations': result.nit,
+            'success': result.success,
+            'history': history,
+            'method': 'differential_evolution',
+            'targets': targets
+        }
+    
+    elif method == 'particle_swarm':
+        # Use Particle Swarm Optimization
+        n_particles = 142
+        n_dimensions = len(connection_names)
+>>>>>>> 8c504ed274620d21a13a6a8594f9b4617da999d4
         max_iterations = optimization_config.max_iterations
         w_max, w_min, w = 0.9, 0.2, 0.9
         
@@ -607,10 +737,20 @@ def run_global_optimization(optimization_config,
                     print(f"\n  New best: {global_best_score:.6f}")
                     
                     if n_new_bests[0] % diagnostic_frequency == 0:
+<<<<<<< HEAD
                         print_new_best_diagnostics(position, score, connection_names,
                                                   circuit_factory_data, targets, optimization_config, device)
                     n_new_bests[0] += 1
 
+=======
+                        print_new_best_diagnostics(
+                            position, score, connection_names,
+                            circuit_factory_data, targets, optimization_config
+                        )
+
+                    n_new_bests[0] += 1
+                    
+>>>>>>> 8c504ed274620d21a13a6a8594f9b4617da999d4
                 history['loss'].append(score)
                 history['parameters'].append(connection_modulation)
 
