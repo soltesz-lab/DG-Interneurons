@@ -5,17 +5,21 @@ Optimization framework including optogenetic stimulation effects
 Adds optogenetic stimulation objectives to the circuit optimization,
 targeting the paradoxical excitation effects observed by Hainmueller et al.
 
-Updated to use proper CPU/GPU device interface consistent with other modules.
+Updated to use batch evaluation GPU interface consistent with DG_circuit_optimization.py.
+Implements EvaluationStrategy pattern for automatic device-appropriate strategy selection.
 """
 import sys
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
 import torch
+import torch.nn as nn
 import numpy as np
 from functools import partial
 import tqdm
 import json
 from datetime import datetime
+import multiprocessing as mp
 
 # Import existing optimization components
 from DG_circuit_optimization import (
@@ -26,6 +30,15 @@ from DG_circuit_optimization import (
     get_default_device,
     create_default_targets
 )
+
+from DG_batch_circuit_dendritic_somatic_transfer import (
+    BatchDentateCircuit
+)
+
+from DG_circuit_dendritic_somatic_transfer import (
+    DentateCircuit, CircuitParams, OpsinParams, PerConnectionSynapticParams
+)
+
 
 @dataclass
 class OptogeneticTargets:
@@ -85,38 +98,632 @@ def calculate_gini_coefficient(values: np.ndarray) -> float:
     return max(0.0, gini)
 
 
-def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation,
-                                     target_pop: str, light_intensity: float,
-                                     mec_current: float = 80.0,
-                                     opsin_current: float = 200.0,
-                                     device: Optional[torch.device] = None) -> Dict:
+# ============================================================================
+# Batch Optogenetic Evaluator
+# ============================================================================
+
+class BatchOptogeneticEvaluator:
     """
-    Run optogenetic stimulation experiment on circuit
+    Evaluates multiple parameter configurations with optogenetic experiments in parallel
     
-    Args:
-        circuit_factory_data: Tuple of (circuit_params, base_params_dict, opsin_params)
-        connection_modulation: Dict of connection modulation parameters
-        target_pop: Population to stimulate ('pv' or 'sst')
-        light_intensity: Light intensity for stimulation
-        mec_current: MEC drive current (pA)
-        opsin_current: Opsin-induced current (pA)
-        device: Device to run simulation on (None for auto-detect)
-    
-    Returns:
-        Dict with firing rate statistics for all populations
+    Extends batch circuit evaluation to include optogenetic stimulation protocols.
+    Computes both baseline circuit objectives and optogenetic effect objectives.
     """
-    from DG_circuit_dendritic_somatic_transfer import (
-        PerConnectionSynapticParams
-    )
-    from DG_protocol import OpsinExpression, OptogeneticExperiment
     
-    if device is None:
-        device = get_default_device()
+    def __init__(self,
+                 circuit_params: CircuitParams,
+                 base_synaptic_params: PerConnectionSynapticParams,
+                 opsin_params: OpsinParams,
+                 targets: CombinedOptimizationTargets,
+                 config: OptimizationConfig,
+                 device: Optional[torch.device] = None):
+        """
+        Initialize batch optogenetic evaluator
+        
+        Args:
+            circuit_params: CircuitParams instance
+            base_synaptic_params: PerConnectionSynapticParams instance
+            opsin_params: OpsinParams instance
+            targets: CombinedOptimizationTargets instance
+            config: OptimizationConfig instance
+            device: Device to run simulations on
+        """
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        self.device = device if device is not None else get_default_device()
+        
+        print(f"BatchOptogeneticEvaluator initialized on device: {self.device}")
     
-    # Unpack circuit factory data
-    circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
+    def evaluate_parameter_batch(self,
+                                 parameter_batch: List[Dict[str, float]],
+                                 mec_drive: float) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Evaluate a batch of parameter configurations with full optogenetic protocol
+        
+        Args:
+            parameter_batch: List of connection_modulation dicts, length = batch_size
+            mec_drive: MEC drive level (pA)
+            
+        Returns:
+            losses: Tensor of shape [batch_size] with total loss for each configuration
+            details: Dict with baseline_losses, opto_losses, and firing_rates_batch
+        """
+        batch_size = len(parameter_batch)
+        
+        # === BASELINE EVALUATION ===
+        baseline_losses, baseline_rates = self._evaluate_baseline_batch(
+            parameter_batch, mec_drive
+        )
+        
+        # === OPTOGENETIC EVALUATION ===
+        opto_losses, opto_details = self._evaluate_optogenetic_batch(
+            parameter_batch, mec_drive
+        )
+        
+        # === COMBINE LOSSES ===
+        total_losses = (self.targets.baseline_weight * baseline_losses + 
+                       self.targets.optogenetic_weight * opto_losses)
+        
+        return total_losses, {
+            'baseline_losses': baseline_losses,
+            'opto_losses': opto_losses,
+            'baseline_rates': baseline_rates,
+            'opto_details': opto_details
+        }
     
-    # Create synaptic parameters
+    def _evaluate_baseline_batch(self,
+                                 parameter_batch: List[Dict[str, float]],
+                                 mec_drive: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Evaluate baseline circuit objectives for batch of parameters
+        
+        Returns:
+            losses: Tensor [batch_size]
+            firing_rates_batch: Dict mapping pop -> rates [batch_size]
+        """
+        batch_size = len(parameter_batch)
+        
+        # Create batch circuit
+        circuit = BatchDentateCircuit(
+            batch_size=batch_size,
+            circuit_params=self.circuit_params,
+            synaptic_params=self.base_synaptic_params,
+            opsin_params=self.opsin_params,
+            device=self.device
+        )
+        
+        # Set per-batch connection modulation
+        circuit.set_connection_modulation_batch(parameter_batch)
+        
+        # Average over trials
+        total_losses = torch.zeros(batch_size, device=self.device)
+        all_firing_rates = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+        
+        for trial in range(self.config.n_trials):
+            circuit.reset_state()
+            
+            # MEC input: [batch_size, n_mec]
+            mec_input = torch.ones(batch_size, self.circuit_params.n_mec,
+                                  device=self.device) * mec_drive
+            
+            # Collect activities over time
+            activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+            
+            for t in range(self.config.simulation_duration):
+                external_drive = {'mec': mec_input}
+                activities = circuit({}, external_drive)
+                
+                if t >= self.config.warmup_duration:
+                    for pop in activities_over_time:
+                        if pop in activities:
+                            activities_over_time[pop].append(activities[pop])
+            
+            # Calculate losses for this trial
+            trial_losses = torch.zeros(batch_size, device=self.device)
+            trial_firing_rates = {}
+            
+            for pop in activities_over_time:
+                if len(activities_over_time[pop]) > 0:
+                    # Stack time series: [time, batch, neurons]
+                    pop_time_series = torch.stack(activities_over_time[pop], dim=0)
+                    # Mean over time: [batch, neurons]
+                    mean_rates = torch.mean(pop_time_series, dim=0)
+                    
+                    # Population average per batch: [batch]
+                    pop_firing_rates = torch.mean(mean_rates, dim=1)
+                    trial_firing_rates[pop] = pop_firing_rates
+                    
+                    # Rate loss
+                    if pop in self.targets.target_rates:
+                        target_rate = self.targets.target_rates[pop]
+                        tolerance = self.targets.rate_tolerance[pop]
+                        
+                        errors = torch.abs(pop_firing_rates - target_rate)
+                        
+                        # Huber loss with tolerance
+                        rate_losses = torch.where(
+                            errors <= tolerance,
+                            0.5 * errors ** 2,
+                            tolerance * errors - 0.5 * tolerance ** 2
+                        )
+                        
+                        # Zero rate penalty
+                        zero_mask = torch.isclose(pop_firing_rates, 
+                                                 torch.tensor(0.0, device=self.device),
+                                                 atol=1e-2, rtol=1e-2)
+                        rate_losses = torch.where(zero_mask, 
+                                                 torch.tensor(1e2, device=self.device),
+                                                 rate_losses)
+                        
+                        trial_losses += rate_losses
+                    
+                    # Sparsity loss
+                    if pop in self.targets.sparsity_targets:
+                        target_sparsity = self.targets.sparsity_targets[pop]
+                        actual_sparsity = torch.sum(
+                            mean_rates > self.targets.activity_threshold,
+                            dim=1
+                        ).float() / mean_rates.shape[1]
+                        
+                        sparsity_errors = (actual_sparsity - target_sparsity) ** 2
+                        trial_losses += sparsity_errors * self.targets.loss_weights.get('sparsity', 0.5)
+            
+            # Add constraint violations
+            for b in range(batch_size):
+                firing_rates_dict = {pop: trial_firing_rates[pop][b].item()
+                                   for pop in trial_firing_rates}
+                constraint_violation, _ = evaluate_rate_ordering_constraints(
+                    firing_rates_dict,
+                    self.targets.rate_ordering_constraints
+                )
+                trial_losses[b] += self.targets.constraint_violation_weight * constraint_violation
+            
+            total_losses += trial_losses
+            
+            # Store firing rates
+            for pop in trial_firing_rates:
+                all_firing_rates[pop].append(trial_firing_rates[pop])
+        
+        # Average over trials
+        total_losses /= self.config.n_trials
+        avg_firing_rates = {pop: torch.stack(all_firing_rates[pop]).mean(dim=0)
+                           for pop in all_firing_rates if len(all_firing_rates[pop]) > 0}
+        
+        return total_losses, avg_firing_rates
+    
+    def _evaluate_optogenetic_batch(self,
+                                    parameter_batch: List[Dict[str, float]],
+                                    mec_drive: float) -> Tuple[torch.Tensor, Dict]:
+        """
+        Evaluate optogenetic objectives for batch of parameters
+        
+        Runs stimulation experiments for PV and SST populations and computes
+        optogenetic-specific loss components.
+        
+        Returns:
+            losses: Tensor [batch_size]
+            details: Dict with per-population results
+        """
+        batch_size = len(parameter_batch)
+        total_opto_losses = torch.zeros(batch_size, device=self.device)
+        
+        details = {'pv': {}, 'sst': {}}
+        
+        # Evaluate PV and SST stimulation
+        for target_pop in ['pv', 'sst']:
+            # Run stimulation experiment for batch
+            stim_results = self._simulate_batch_optogenetic_stimulation(
+                parameter_batch, target_pop, mec_drive
+            )
+            
+            # Calculate losses
+            pop_losses = self._calculate_optogenetic_losses_batch(
+                stim_results, target_pop
+            )
+            
+            total_opto_losses += pop_losses
+            details[target_pop] = stim_results
+        
+        return total_opto_losses, details
+    
+    def _simulate_batch_optogenetic_stimulation(self,
+                                               parameter_batch: List[Dict[str, float]],
+                                               target_pop: str,
+                                               mec_drive: float) -> Dict[str, torch.Tensor]:
+        """
+        Run optogenetic stimulation for a batch of parameter sets
+        
+        Returns dict with baseline and stimulation statistics for each population
+        """
+        from DG_protocol import OpsinExpression
+        
+        batch_size = len(parameter_batch)
+        
+        # Stimulation protocol parameters
+        stim_start = 550
+        duration = 1650
+        warmup = 150
+        opsin_current = 200.0
+        
+        # Create batch circuit
+        circuit = BatchDentateCircuit(
+            batch_size=batch_size,
+            circuit_params=self.circuit_params,
+            synaptic_params=self.base_synaptic_params,
+            opsin_params=self.opsin_params,
+            device=self.device
+        )
+        
+        circuit.set_connection_modulation_batch(parameter_batch)
+        
+        # Setup opsin expression for target population ONLY
+        from DG_protocol import OpsinExpression
+        
+        n_target_cells = getattr(self.circuit_params, f'n_{target_pop}')
+        opsin_expression = OpsinExpression(
+            self.opsin_params,
+            n_cells=n_target_cells,
+            device=self.device
+        )
+        
+        # Get positions for target population
+        target_positions = circuit.layout.positions[target_pop]
+        
+        # Calculate activation probability for target population neurons
+        # This returns a tensor of shape [n_target_cells] with activation probabilities
+        light_intensity = self.targets.optogenetic_targets.stimulation_intensity
+        activation_prob = opsin_expression.calculate_activation(target_positions, light_intensity)
+        
+        # Convert activation probabilities to optogenetic current for target neurons
+        # Shape: [n_target_cells]
+        target_opto_current = activation_prob * opsin_current
+        
+        # Storage for time series: [time, batch, neurons]
+        time_points = []
+        activities_time_series = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+        
+        # Run simulation
+        circuit.reset_state()
+        mec_input = torch.ones(batch_size, self.circuit_params.n_mec,
+                              device=self.device) * mec_drive
+        
+        for t in range(duration):
+            # Create per-population optogenetic drives
+            # Only target_pop receives non-zero drive
+            direct_activation = {}
+            
+            if t >= stim_start:
+                # Apply optogenetic stimulation only to target population
+                for pop, n_neurons in [('gc', self.circuit_params.n_gc),
+                                       ('mc', self.circuit_params.n_mc),
+                                       ('pv', self.circuit_params.n_pv),
+                                       ('sst', self.circuit_params.n_sst)]:
+                    if pop == target_pop:
+                        # Target population gets optogenetic drive
+                        # Replicate across batch: [n_neurons] -> [batch_size, n_neurons]
+                        direct_activation[pop] = target_opto_current.unsqueeze(0).expand(batch_size, -1)
+                    else:
+                        # Non-target populations get zero drive
+                        direct_activation[pop] = torch.zeros(batch_size, n_neurons,
+                                                            device=self.device)
+            else:
+                # No stimulation before stim_start - all populations get zero drive
+                for pop, n_neurons in [('gc', self.circuit_params.n_gc),
+                                       ('mc', self.circuit_params.n_mc),
+                                       ('pv', self.circuit_params.n_pv),
+                                       ('sst', self.circuit_params.n_sst)]:
+                    direct_activation[pop] = torch.zeros(batch_size, n_neurons,
+                                                        device=self.device)
+            
+            external_drive = {'mec': mec_input}
+            activities = circuit(direct_activation, external_drive)
+            
+            if t >= warmup:
+                time_points.append(t)
+                for pop in activities_time_series:
+                    if pop in activities:
+                        activities_time_series[pop].append(activities[pop])
+        
+        # Convert to tensors: [time, batch, neurons]
+        for pop in activities_time_series:
+            if len(activities_time_series[pop]) > 0:
+                activities_time_series[pop] = torch.stack(activities_time_series[pop], dim=0)
+        
+        time_tensor = torch.tensor(time_points, device=self.device)
+        
+        # Calculate statistics
+        baseline_mask = time_tensor < stim_start
+        stim_mask = time_tensor >= stim_start
+        
+        results = {}
+        for pop in activities_time_series:
+            if len(activities_time_series[pop]) > 0:
+                pop_series = activities_time_series[pop]  # [time, batch, neurons]
+                
+                # Baseline and stimulation periods
+                baseline_rates = torch.mean(pop_series[baseline_mask], dim=0)  # [batch, neurons]
+                stim_rates = torch.mean(pop_series[stim_mask], dim=0)  # [batch, neurons]
+                
+                # Changes
+                rate_changes = stim_rates - baseline_rates
+                baseline_std = torch.std(baseline_rates, dim=1, keepdim=True)  # [batch, 1]
+                
+                # Fraction activated (per batch element)
+                activated_fraction = torch.mean(
+                    (rate_changes > baseline_std).float(), dim=1
+                )  # [batch]
+                
+                baseline_mean = torch.mean(baseline_rates, dim=1)  # [batch]
+                stim_mean = torch.mean(stim_rates, dim=1)  # [batch]
+                mean_change = torch.mean(rate_changes, dim=1)  # [batch]
+                
+
+                # Gini coefficients (computed on CPU for numpy compatibility)
+                baseline_gini_list = []
+                stim_gini_list = []
+                
+                for b in range(batch_size):
+                    baseline_gini_list.append(
+                        calculate_gini_coefficient(baseline_rates[b].cpu().numpy())
+                    )
+                    stim_gini_list.append(
+                        calculate_gini_coefficient(stim_rates[b].cpu().numpy())
+                    )
+                
+                # Convert to torch tensors
+                baseline_gini = torch.tensor(baseline_gini_list, device=self.device)
+                stim_gini = torch.tensor(stim_gini_list, device=self.device)
+                gini_change = stim_gini - baseline_gini
+                
+                results[pop] = {
+                    'baseline_mean': baseline_mean,
+                    'stim_mean': stim_mean,
+                    'mean_change': mean_change,
+                    'activated_fraction': activated_fraction,
+                    'baseline_gini': baseline_gini,
+                    'stim_gini': stim_gini,
+                    'gini_change': gini_change,
+                }
+        
+        return results
+    
+    def _calculate_optogenetic_losses_batch(self,
+                                           opto_results: Dict,
+                                           target_pop: str) -> torch.Tensor:
+        """
+        Calculate optogenetic loss for batch from stimulation results
+        
+        Returns:
+            losses: Tensor [batch_size]
+        """
+        batch_size = list(opto_results.values())[0]['baseline_mean'].shape[0]
+        losses = torch.zeros(batch_size, device=self.device)
+        
+        opto_targets = self.targets.optogenetic_targets
+        
+        # Target rate increases
+        if target_pop in opto_targets.target_rate_increases:
+            for affected_pop, target_fraction in opto_targets.target_rate_increases[target_pop].items():
+                if affected_pop in opto_results and affected_pop != target_pop:
+                    actual_fraction = opto_results[affected_pop]['activated_fraction']
+                    
+                    # Squared error
+                    errors = (actual_fraction - target_fraction) ** 2
+                    
+                    # Zero activation penalty
+                    if abs(target_fraction) > 0:
+                        zero_mask = torch.isclose(
+                            torch.abs(actual_fraction),
+                            torch.tensor(0.0, device=self.device),
+                            atol=1e-2, rtol=1e-2
+                        )
+                        errors = torch.where(zero_mask,
+                                           torch.tensor(1e2, device=self.device),
+                                           errors)
+                    
+                    losses += errors
+        
+        # Target Gini increases
+        if target_pop in opto_targets.target_gini_increase:
+            for affected_pop, target_gini_change in opto_targets.target_gini_increase[target_pop].items():
+                if affected_pop in opto_results and affected_pop != target_pop:
+                    actual_gini_change = opto_results[affected_pop]['gini_change']
+                    errors = (actual_gini_change - target_gini_change) ** 2
+                    losses += errors
+        
+        return losses
+
+
+# ============================================================================
+# Evaluation Strategy Pattern for Optogenetics
+# ============================================================================
+
+class OptogeneticEvaluationStrategy(ABC):
+    """
+    Abstract base class for optogenetic parameter evaluation strategies
+    
+    Similar to EvaluationStrategy but specialized for combined baseline + optogenetic objectives
+    """
+    
+    @abstractmethod
+    def evaluate_batch(self,
+                      parameter_sets: List[Dict[str, float]],
+                      mec_drive: float,
+                      n_trials: int) -> Tuple[List[float], Dict]:
+        """
+        Evaluate a batch of parameter configurations with optogenetic protocols
+        
+        Args:
+            parameter_sets: List of connection_modulation dicts
+            mec_drive: MEC drive level
+            n_trials: Number of trials to average
+            
+        Returns:
+            losses: List of total loss values
+            details: Dict with loss breakdowns and firing rates
+        """
+        pass
+    
+    @abstractmethod
+    def get_strategy_info(self) -> Dict[str, any]:
+        """Return information about this strategy"""
+        pass
+
+
+class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
+    """Sequential evaluation for gradient-based or single evaluations"""
+    
+    def __init__(self, circuit_params, base_synaptic_params, opsin_params,
+                 targets, config, device):
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        self.device = device
+    
+    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+        """Evaluate configurations one at a time"""
+        losses = []
+        all_details = []
+        
+        for params in parameter_sets:
+            # Use batch evaluator with batch_size=1
+            evaluator = BatchOptogeneticEvaluator(
+                self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                self.targets, self.config, device=self.device
+            )
+            
+            loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_drive)
+            losses.append(loss_tensor.item())
+            all_details.append(details)
+        
+        return losses, all_details
+    
+    def get_strategy_info(self):
+        return {
+            'name': 'OptogeneticSequential',
+            'device': str(self.device),
+            'parallelism': 'None',
+            'description': 'Sequential evaluation with optogenetic protocols'
+        }
+
+
+class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
+    """Batch GPU evaluation for population-based optimization"""
+    
+    def __init__(self, circuit_params, base_synaptic_params, opsin_params,
+                 targets, config, device):
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        self.device = device
+        
+        # Create evaluator
+        self.evaluator = BatchOptogeneticEvaluator(
+            circuit_params, base_synaptic_params, opsin_params,
+            targets, config, device=device
+        )
+    
+    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+        """Evaluate all configurations in parallel on GPU"""
+        batch_size = len(parameter_sets)
+        
+        # Note: n_trials is handled internally by evaluator
+        # We just call once since BatchOptogeneticEvaluator handles trials
+        losses_tensor, details = self.evaluator.evaluate_parameter_batch(
+            parameter_sets, mec_drive
+        )
+        
+        # Convert to lists for consistent API
+        losses_list = losses_tensor.cpu().numpy().tolist()
+        
+        return losses_list, [details] * batch_size
+    
+    def get_strategy_info(self):
+        return {
+            'name': 'OptogeneticBatchGPU',
+            'device': str(self.device),
+            'parallelism': 'Data parallelism (batched optogenetic experiments)',
+            'description': f'Batch optogenetic evaluation on GPU'
+        }
+
+
+class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
+    """Multiprocess CPU evaluation for population-based optimization"""
+    
+    def __init__(self, circuit_params, base_synaptic_params, opsin_params,
+                 targets, config, device, n_workers=None, n_threads_per_worker=1):
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        self.device = device
+        
+        # Configure workers
+        n_cores = mp.cpu_count()
+        if n_workers is None:
+            self.n_workers = max(1, n_cores // max(1, n_threads_per_worker))
+        else:
+            self.n_workers = n_workers
+        self.n_threads_per_worker = n_threads_per_worker
+        
+        # Prepare data for workers
+        self.worker_data = (
+            circuit_params,
+            {
+                'ampa_g_mean': base_synaptic_params.ampa_g_mean,
+                'ampa_g_std': base_synaptic_params.ampa_g_std,
+                'gaba_g_mean': base_synaptic_params.gaba_g_mean,
+                'gaba_g_std': base_synaptic_params.gaba_g_std,
+                'distribution': base_synaptic_params.distribution,
+            },
+            opsin_params
+        )
+    
+    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+        """Evaluate configurations using multiprocessing"""
+        # Prepare arguments for workers
+        eval_args = [
+            (params, mec_drive, self.worker_data, self.targets, self.config)
+            for params in parameter_sets
+        ]
+        
+        configure_torch_threads(self.n_threads_per_worker)
+        
+        # Use multiprocessing pool
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=self.n_workers) as pool:
+            results = pool.map(_optogenetic_worker_evaluate, eval_args)
+        
+        # Unpack results
+        losses = [r[0] for r in results]
+        details = [r[1] for r in results]
+        
+        return losses, details
+    
+    def get_strategy_info(self):
+        return {
+            'name': 'OptogeneticMultiprocessCPU',
+            'device': str(self.device),
+            'parallelism': f'{self.n_workers} workers * {self.n_threads_per_worker} threads',
+            'description': f'Multiprocess optogenetic evaluation on CPU with {self.n_workers} workers'
+        }
+
+def _optogenetic_worker_evaluate(args):
+    """Worker function for multiprocess optogenetic evaluation"""
+    (connection_modulation, mec_drive, worker_data, targets, config) = args
+    
+    device = torch.device('cpu')
+    circuit_params, base_synaptic_params_dict, opsin_params = worker_data
+    
+    # Create synaptic params
     synaptic_params = PerConnectionSynapticParams(
         ampa_g_mean=base_synaptic_params_dict['ampa_g_mean'],
         ampa_g_std=base_synaptic_params_dict['ampa_g_std'],
@@ -126,406 +733,371 @@ def simulate_optogenetic_stimulation(circuit_factory_data, connection_modulation
         connection_modulation=connection_modulation
     )
     
-    # Create opto experiment on specified device
-    experiment = OptogeneticExperiment(circuit_params,
-                                       synaptic_params,
-                                       opsin_params,
-                                       device=device)
-
-    stim_start = 550.
-    duration = 1650.
-    warmup = 150.
-    
-    exp_result = experiment.simulate_stimulation(target_pop,
-                                                 light_intensity,
-                                                 duration = duration,
-                                                 stim_start = stim_start,
-                                                 mec_current = mec_current,
-                                                 opsin_current = opsin_current,
-                                                 plot_activity = False)
-
-    time = exp_result['time']
-    activity = exp_result['activity_trace']
-    baseline_mask = (time >= warmup) & (time < stim_start)  # Pre-stimulation
-    stim_mask = time >= stim_start     # During stimulation
-
-    # Calculate statistics
-    results = {}
-    
-    for pop in activity:
-        if len(activity[pop]) > 0:
-            pop_time_series = activity[pop]  # (neurons, time)
-            
-            # Baseline and stimulation periods
-            baseline_rates = torch.mean(pop_time_series[:, baseline_mask], dim=1)
-            stim_rates = torch.mean(pop_time_series[:, stim_mask], dim=1)
-            
-            # Changes
-            rate_changes = stim_rates - baseline_rates
-            baseline_std = torch.std(baseline_rates)
-
-            # Fraction activated
-            activated_fraction = torch.mean((rate_changes > baseline_std).float()).item()
-
-            baseline_mean = torch.mean(baseline_rates).item()
-            stim_mean = torch.mean(stim_rates).item()
-            
-            # Gini coefficients
-            baseline_gini = calculate_gini_coefficient(baseline_rates.cpu().numpy())
-            stim_gini = calculate_gini_coefficient(stim_rates.cpu().numpy())
-            gini_change = stim_gini - baseline_gini
-            
-            results[pop] = {
-                'baseline_mean': baseline_mean,
-                'stim_mean': stim_mean,
-                'mean_change': torch.mean(rate_changes).item(),
-                'activated_fraction': activated_fraction,
-                'baseline_gini': baseline_gini,
-                'stim_gini': stim_gini,
-                'gini_change': gini_change,
-            }
-    
-    return results
-
-
-def evaluate_optogenetic_objectives(opto_results: Dict, 
-                                    target_pop: str,
-                                    opto_targets: OptogeneticTargets,
-                                    verbose: bool = False) -> Tuple[float, Dict]:
-    """
-    Calculate loss for optogenetic stimulation objectives with detailed diagnostics
-    
-    Returns:
-        total_loss: Combined optogenetic loss
-        loss_components: Breakdown of loss components
-    """
-    loss_components = {}
-    total_loss = 0.0
-    
-    # Target rate increases
-    if target_pop in opto_targets.target_rate_increases:
-        rate_increase_loss = 0.0
-        
-        for affected_pop, target_fraction in opto_targets.target_rate_increases[target_pop].items():
-            if affected_pop in opto_results and affected_pop != target_pop:
-                actual_fraction = opto_results[affected_pop]['activated_fraction']
-                actual_mean_change = opto_results[affected_pop]['mean_change']
-                baseline_mean = opto_results[affected_pop]['baseline_mean']
-                stim_mean = opto_results[affected_pop]['stim_mean']
-
-                if verbose:
-                    print(f"  {affected_pop.upper()}:")
-                    print(f"    Baseline rate: {baseline_mean:.3f} Hz")
-                    print(f"    Stim rate: {stim_mean:.3f} Hz")
-                    print(f"    Mean change: {actual_mean_change:+.3f} Hz")
-                    print(f"    Activated fraction: {actual_fraction:.3f} (target: {target_fraction:.3f})")
-                
-                # Squared error
-                error = (actual_fraction - target_fraction) ** 2
-
-                # Strong penalty for zero activation when non-zero is expected
-                if (np.abs(target_fraction) > 0) and (np.isclose(np.abs(actual_fraction), 0.0, 1e-2, 1e-2)):
-                    penalty = 1e2
-                    rate_increase_loss += penalty
-                    if verbose:
-                        print(f"    Zero activation penalty: {penalty:.1f}")
-                else:
-                    rate_increase_loss += error
-                    if verbose:
-                        print(f"    Squared error: {error:.6f}")
-        
-        if verbose:
-            print(f"  Total rate increase loss: {rate_increase_loss:.6f}")
-        
-        loss_components['rate_increase'] = rate_increase_loss
-        total_loss += rate_increase_loss
-    
-    # Target Gini increases (inequality)
-    if target_pop in opto_targets.target_gini_increase:
-        gini_loss = 0.0
-        
-        if verbose:
-            print(f"\n  Gini coefficient changes:")
-        
-        for affected_pop, target_gini_change in opto_targets.target_gini_increase[target_pop].items():
-            if affected_pop in opto_results and affected_pop != target_pop:
-                baseline_gini = opto_results[affected_pop]['baseline_gini']
-                stim_gini = opto_results[affected_pop]['stim_gini']
-                actual_gini_change = opto_results[affected_pop]['gini_change']
-                
-                # We want to match the target Gini increase
-                error = (actual_gini_change - target_gini_change) ** 2
-                gini_loss += error
-                
-                if verbose:
-                    print(f"  {affected_pop.upper()}:")
-                    print(f"    Baseline Gini: {baseline_gini:.4f}")
-                    print(f"    Stim Gini: {stim_gini:.4f}")
-                    print(f"    Change: {actual_gini_change:+.4f} (target: {target_gini_change:+.4f})")
-                    print(f"    Squared error: {error:.6f}")
-        
-        if verbose:
-            print(f"  Total Gini loss: {gini_loss:.6f}")
-        
-        loss_components['gini_increase'] = gini_loss
-        total_loss += gini_loss
-    
-    return total_loss, loss_components
-
-
-def evaluate_candidate_worker(param_array, connection_names, circuit_factory_data,
-                              targets: CombinedOptimizationTargets,
-                              config,
-                              device: Optional[torch.device],
-                              verbose: bool = False):
-    """
-    Objective worker function with detailed diagnostics
-    
-    Args:
-        param_array: Array of connection modulation parameters
-        connection_names: List of connection names
-        circuit_factory_data: Tuple of circuit configuration data
-        targets: Combined optimization targets
-        config: Optimization configuration
-        device: Device to run simulation on (None for auto-detect)
-        verbose: Whether to print detailed diagnostics
-    """
-    try:
-        from DG_circuit_dendritic_somatic_transfer import (
-            DentateCircuit, PerConnectionSynapticParams
-        )
-        
-        if device is None:
-            device = get_default_device()
-        
-        # Convert parameter array to connection modulation dict
-        connection_modulation = dict(zip(connection_names, param_array))
-        
-        # Unpack circuit factory data
-        circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
-        
-        if verbose:
-            print(f"\n{'='*80}")
-            print("Detailed evaluation of candidate parameters")
-            print(f"{'='*80}")
-            print(f"Device: {device}")
-        
-        # === BASELINE OBJECTIVES ===
-        synaptic_params = PerConnectionSynapticParams(
-            ampa_g_mean=base_synaptic_params_dict['ampa_g_mean'],
-            ampa_g_std=base_synaptic_params_dict['ampa_g_std'],
-            gaba_g_mean=base_synaptic_params_dict['gaba_g_mean'],
-            gaba_g_std=base_synaptic_params_dict['gaba_g_std'],
-            distribution=base_synaptic_params_dict['distribution'],
-            connection_modulation=connection_modulation
-        )
-        
-        # Create circuit on specified device
-        circuit = DentateCircuit(circuit_params, synaptic_params, opsin_params, device=device)
-        
-        baseline_loss = 0.0
-        
-        if verbose:
-            print(f"\n{'='*80}")
-            print("Baseline circuit evaluation")
-            print(f"{'='*80}")
-        
-        for mec_drive in config.mec_drive_levels:
-            if verbose:
-                print(f"\n  MEC drive: {mec_drive} pA")
-            
-            for trial in range(config.n_trials):
-                firing_rates = {}
-                circuit.reset_state()
-                
-                mec_input = torch.ones(circuit.circuit_params.n_mec, device=device) * mec_drive
-                activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
-                
-                for t in range(config.simulation_duration):
-                    external_drive = {'mec': mec_input}
-                    activities = circuit({}, external_drive)
-                    
-                    if t >= config.warmup_duration:
-                        for pop in activities_over_time:
-                            if pop in activities:
-                                activities_over_time[pop].append(activities[pop].clone())
-                
-                trial_loss = 0.0
-                for pop in activities_over_time:
-                    if len(activities_over_time[pop]) > 0:
-                        pop_time_series = torch.stack(activities_over_time[pop])
-                        mean_rates = torch.mean(pop_time_series, dim=0)
-                        
-                        if pop in targets.target_rates:
-                            target_rate = targets.target_rates[pop]
-                            actual_rate = torch.mean(mean_rates).item()
-                            firing_rates[pop] = actual_rate
-                            tolerance = targets.rate_tolerance[pop]
-                            
-                            is_zero_rate = np.isclose(actual_rate, 0.0, 1e-2, 1e-2)
-                            
-                            if is_zero_rate:
-                                rate_loss = 1e2
-                            else:
-                                error = abs(actual_rate - target_rate)
-                                rate_loss = error if error > tolerance else 0.5 * (error / tolerance) ** 2
-                            
-                            trial_loss += rate_loss
-                        
-                        if pop in targets.sparsity_targets:
-                            target_sparsity = targets.sparsity_targets[pop]
-                            actual_sparsity = (torch.sum(mean_rates > targets.activity_threshold) / len(mean_rates)).item()
-                            trial_loss += (actual_sparsity - target_sparsity) ** 2
-                
-                constraint_violation, _ = evaluate_rate_ordering_constraints(
-                    firing_rates, targets.rate_ordering_constraints
-                )
-                trial_loss += targets.constraint_violation_weight * constraint_violation
-                baseline_loss += trial_loss
-        
-        baseline_loss /= (len(config.mec_drive_levels) * config.n_trials)
-        
-        if verbose:
-            print(f"\n  Average baseline loss: {baseline_loss:.6f}")
-
-        # === OPTOGENETIC OBJECTIVES ===
-        opto_loss = 0.0
-        opto_targets = targets.optogenetic_targets
-        
-        if verbose:
-            print(f"\n{'='*80}")
-            print("Optogenetic stimulation evaluation")
-            print(f"{'='*80}")
-        
-        for target_pop in ['pv', 'sst']:
-            if verbose:
-                print(f"\n--- {target_pop.upper()} Stimulation ---")
-            
-            target_pop_opto_loss = 0.0
-    
-            for trial in range(config.n_trials):
-                opto_results = simulate_optogenetic_stimulation(
-                    circuit_factory_data,
-                    connection_modulation,
-                    target_pop,
-                    opto_targets.stimulation_intensity,
-                    mec_current=config.mec_drive_levels[0],
-                    device=device
-                )
-
-                if verbose and config.n_trials > 1:
-                    print(f"\n  Trial {trial + 1}/{config.n_trials}:")
-
-                opto_results = simulate_optogenetic_stimulation(
-                    circuit_factory_data,
-                    connection_modulation,
-                    target_pop,
-                    opto_targets.stimulation_intensity,
-                    mec_current=config.mec_drive_levels[0]  # Use first MEC drive level
-                )
-
-                # Evaluate optogenetic objectives for this trial
-                trial_opto_loss, loss_components = evaluate_optogenetic_objectives(
-                    opto_results,
-                    target_pop,
-                    opto_targets,
-                    verbose=verbose
-                )
-
-                target_pop_opto_loss += trial_opto_loss
-                
-            target_pop_opto_loss /= config.n_trials
-            opto_loss += target_pop_opto_loss
-            
-        if verbose:
-            print(f"\n  Total optogenetic loss: {opto_loss:.6f}")
-        
-        # === COMBINED LOSS ===
-        total_loss = (targets.baseline_weight * baseline_loss + 
-                     targets.optogenetic_weight * opto_loss)
-        
-        if verbose:
-            print(f"\n{'='*80}")
-            print(f"  Baseline: {baseline_loss:.6f} x {targets.baseline_weight} = {targets.baseline_weight * baseline_loss:.6f}")
-            print(f"  Optogenetic: {opto_loss:.6f} x {targets.optogenetic_weight} = {targets.optogenetic_weight * opto_loss:.6f}")
-            print(f"  TOTAL: {total_loss:.6f}")
-            print(f"{'='*80}\n")
-        
-        return total_loss
-        
-    except Exception as e:
-        print(f"Worker error: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1e6
-
-
-def evaluate_particle_worker(args):
-    """Particle evaluation including optogenetic objectives"""
-    position, connection_names, circuit_factory_data, targets, config, device = args
-    
-    try:
-        loss = evaluate_candidate_worker(
-            position, connection_names, circuit_factory_data, targets, config, device=device
-        )
-        connection_modulation = dict(zip(connection_names, position))
-        return position, loss, connection_modulation
-    except Exception as e:
-        print(f"Particle worker error: {e}")
-        return position, 1e6, dict(zip(connection_names, position))
-
-
-def print_new_best_diagnostics(position, loss, connection_names, 
-                               circuit_factory_data, targets, config, device):
-    """Print comprehensive diagnostics when a new best solution is found"""
-    print(f"\n{'#'*80}")
-    print("NEW BEST SOLUTION FOUND")
-    print(f"{'#'*80}")
-    print(f"Loss: {loss:.6f}\n")
-    
-    # Evaluate with verbose output
-    recomputed_loss = evaluate_candidate_worker(
-        position, 
-        connection_names, 
-        circuit_factory_data, 
-        targets, 
-        config,
-        device=device, 
-        verbose=True
+    # Create evaluator
+    evaluator = BatchOptogeneticEvaluator(
+        circuit_params, synaptic_params, opsin_params,
+        targets, config, device=device
     )
-
-    # Verify that optimizer loss matches recomputed loss
-    print(f"\n{'='*80}")
-    print("Loss verification")
-    print(f"{'='*80}")
-    print(f"  Loss from optimizer:  {loss:.6f}")
-    print(f"  Recomputed loss:      {recomputed_loss:.6f}")
     
+    # Evaluate single parameter set
+    loss_tensor, details = evaluator.evaluate_parameter_batch(
+        [connection_modulation], mec_drive
+    )
+    
+    # Convert all tensors in details to Python types for safe multiprocessing
+    def tensor_to_python(obj):
+        """Recursively convert torch tensors to Python types"""
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist() if obj.numel() > 1 else obj.item()
+        elif isinstance(obj, dict):
+            return {k: tensor_to_python(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(tensor_to_python(item) for item in obj)
+        else:
+            return obj
+    
+    details_safe = tensor_to_python(details)
+    
+    return loss_tensor.item(), details_safe
 
+
+# ============================================================================
+# Main Optogenetic Optimizer Class
+# ============================================================================
+
+class OptogeneticCircuitOptimizer:
+    """
+    Optogenetic circuit optimizer with automatic evaluation strategy selection
+    
+    Extends CircuitOptimizer pattern to include optogenetic objectives.
+    Automatically chooses optimal strategy based on device and method.
+    """
+    
+    def __init__(self,
+                 circuit_params: CircuitParams,
+                 base_synaptic_params: PerConnectionSynapticParams,
+                 opsin_params: OpsinParams,
+                 targets: CombinedOptimizationTargets,
+                 config: OptimizationConfig,
+                 device: Optional[torch.device] = None):
+        
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        
+        # Set device
+        self.device = device if device is not None else get_default_device()
+        self.config.device = self.device
+        
+        # Storage
+        self.best_loss = float('inf')
+        self.best_params = None
+        self.best_iteration = 0
+        self.history = {'loss': [], 'parameters': []}
+        
+        print(f"OptogeneticCircuitOptimizer initialized on device: {self.device}")
+        print(f"  Baseline weight: {targets.baseline_weight}")
+        print(f"  Optogenetic weight: {targets.optogenetic_weight}")
+    
+    def _select_strategy(self, method: str, **kwargs) -> OptogeneticEvaluationStrategy:
+        """Select optimal evaluation strategy based on method and device"""
+        
+        if method == 'gradient':
+            strategy = OptogeneticSequentialStrategy(
+                self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                self.targets, self.config, self.device
+            )
+        
+        elif method in ['particle_swarm', 'genetic_algorithm']:
+            if self.device.type == 'cuda':
+                strategy = OptogeneticBatchGPUStrategy(
+                    self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                    self.targets, self.config, self.device
+                )
+            else:
+                strategy = OptogeneticMultiprocessCPUStrategy(
+                    self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                    self.targets, self.config, self.device,
+                    n_workers=kwargs.get('n_workers', None),
+                    n_threads_per_worker=kwargs.get('n_threads_per_worker', 1)
+                )
+        
+        elif method == 'differential_evolution':
+            if self.device.type == 'cuda':
+                raise NotImplementedError(
+                    "Differential Evolution on GPU not supported (scipy limitation). "
+                    "Use CPU or try 'particle_swarm' for GPU optimization."
+                )
+            strategy = OptogeneticMultiprocessCPUStrategy(
+                self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                self.targets, self.config, self.device,
+                n_workers=kwargs.get('n_workers', None),
+                n_threads_per_worker=kwargs.get('n_threads_per_worker', 1)
+            )
+        
+        else:
+            raise ValueError(f"Unknown optimization method: {method}")
+        
+        # Print strategy info
+        info = strategy.get_strategy_info()
+        print(f"\nEvaluation Strategy: {info['name']}")
+        print(f"  Device: {info['device']}")
+        print(f"  Parallelism: {info['parallelism']}")
+        print(f"  Description: {info['description']}\n")
+        
+        return strategy
+    
+    def optimize(self, method: str = 'particle_swarm', **kwargs) -> Dict:
+        """
+        Run optimization with automatic strategy selection
+        
+        Args:
+            method: 'gradient', 'particle_swarm', 'differential_evolution'
+            **kwargs: Method-specific arguments
+            
+        Returns:
+            Dict with optimization results
+        """
+        connection_names = list(self.targets.connection_bounds.keys())
+        
+        if method == 'particle_swarm':
+            return self._optimize_particle_swarm(connection_names, **kwargs)
+        elif method == 'differential_evolution':
+            return self._optimize_differential_evolution(connection_names, **kwargs)
+        elif method == 'gradient':
+            raise NotImplementedError("Gradient-based optimization not yet implemented for optogenetics")
+        else:
+            raise ValueError(f"Unknown method: {method}")
+    
+    def _optimize_particle_swarm(self, connection_names, n_particles=32, max_iterations=50,
+                                 n_workers=None, n_threads_per_worker=1,
+                                 diagnostic_frequency=5):
+        """Particle swarm optimization with automatic strategy"""
+        strategy = self._select_strategy('particle_swarm',
+                                         n_workers=n_workers,
+                                         n_threads_per_worker=n_threads_per_worker)
+        
+        n_dimensions = len(connection_names)
+        bounds = [self.targets.connection_bounds.get(name, (0.1, 5.0))
+                 for name in connection_names]
+        
+        print(f"Starting Particle Swarm Optimization...")
+        print(f"Particles: {n_particles}")
+        print(f"Iterations: {max_iterations}")
+        
+        # Initialize
+        lower_bounds = np.array([b[0] for b in bounds])
+        upper_bounds = np.array([b[1] for b in bounds])
+        
+        positions = np.random.uniform(lower_bounds, upper_bounds, (n_particles, n_dimensions))
+        velocities = np.random.randn(n_particles, n_dimensions) * 0.1
+        
+        personal_best_positions = positions.copy()
+        personal_best_scores = np.full(n_particles, float('inf'))
+        global_best_position = None
+        global_best_score = float('inf')
+        
+        # PSO parameters
+        w_max, w_min, w = 0.9, 0.2, 0.9
+        
+        n_new_bests = 0
+        previous_best = float('inf')
+        no_improvement = 0
+        
+        for iteration in range(max_iterations):
+            print(f"\nPSO Iteration {iteration+1}/{max_iterations}")
+            c1, c2 = np.random.uniform(1.5, 2.5), np.random.uniform(1.5, 2.5)
+            
+            # Convert positions to parameter dicts
+            parameter_sets = []
+            for i in range(n_particles):
+                param_dict = dict(zip(connection_names, positions[i]))
+                parameter_sets.append(param_dict)
+            
+            # Evaluate all particles
+            mec_drive = self.config.mec_drive_levels[0]
+            losses, _ = strategy.evaluate_batch(
+                parameter_sets, mec_drive, self.config.n_trials
+            )
+            losses = np.array(losses)
+            
+            # Update personal bests
+            improved = losses < personal_best_scores
+            personal_best_scores[improved] = losses[improved]
+            personal_best_positions[improved] = positions[improved]
+            
+            # Update global best
+            min_idx = np.argmin(losses)
+            if losses[min_idx] < global_best_score:
+                global_best_score = losses[min_idx]
+                global_best_position = positions[min_idx].copy()
+                self.best_params = dict(zip(connection_names, global_best_position))
+                print(f"\n  New best: {global_best_score:.6f}")
+                
+                if n_new_bests % diagnostic_frequency == 0:
+                    self._print_diagnostics(global_best_position, global_best_score, connection_names)
+                
+                n_new_bests += 1
+            
+            # Adapt inertia
+            improvement = previous_best - global_best_score
+            if improvement > 0.1:
+                w = min(w + 0.05, w_max)
+                no_improvement = 0
+            else:
+                w = max(w - 0.2 * w, w_min)
+                no_improvement += 1
+            
+            previous_best = global_best_score
+            
+            if no_improvement > 3:
+                w = w_max
+                no_improvement = 0
+            
+            # Update particles
+            for i in range(n_particles):
+                r1, r2 = np.random.random(n_dimensions), np.random.random(n_dimensions)
+                cognitive = c1 * r1 * (personal_best_positions[i] - positions[i])
+                social = c2 * r2 * (global_best_position - positions[i])
+                velocities[i] = w * velocities[i] + cognitive + social
+                positions[i] = np.clip(positions[i] + velocities[i], lower_bounds, upper_bounds)
+            
+            self.history['loss'].append(global_best_score)
+            self.history['parameters'].append(self.best_params.copy())
+        
+        print("\nFinal diagnostics:")
+        self._print_diagnostics(global_best_position, global_best_score, connection_names)
+        
+        self.best_loss = global_best_score
+        
+        return {
+            'optimized_connection_modulation': self.best_params,
+            'best_loss': self.best_loss,
+            'method': 'particle_swarm',
+            'n_particles': n_particles,
+            'device': str(self.device),
+            'strategy': strategy.get_strategy_info()['name'],
+            'history': self.history,
+            'targets': self.targets
+        }
+    
+    def _optimize_differential_evolution(self, connection_names, max_iterations=50,
+                                         n_workers=None, n_threads_per_worker=1):
+        """Differential evolution with multiprocess CPU"""
+        from scipy.optimize import differential_evolution
+        
+        strategy = self._select_strategy('differential_evolution',
+                                         n_workers=n_workers,
+                                         n_threads_per_worker=n_threads_per_worker)
+        
+        bounds = [self.targets.connection_bounds.get(name, (0.1, 5.0))
+                 for name in connection_names]
+        
+        print(f"Starting Differential Evolution...")
+        print(f"Iterations: {max_iterations}")
+        
+        def objective(param_array):
+            param_dict = dict(zip(connection_names, param_array))
+            mec_drive = self.config.mec_drive_levels[0]
+            losses, _ = strategy.evaluate_batch(
+                [param_dict], mec_drive, self.config.n_trials
+            )
+            return losses[0]
+        
+        result = differential_evolution(
+            objective,
+            bounds,
+            maxiter=max_iterations,
+            popsize=15,
+            workers=1,
+            disp=True
+        )
+        
+        self.best_params = dict(zip(connection_names, result.x))
+        self.best_loss = result.fun
+        
+        return {
+            'optimized_connection_modulation': self.best_params,
+            'best_loss': self.best_loss,
+            'method': 'differential_evolution',
+            'success': result.success,
+            'device': str(self.device),
+            'strategy': strategy.get_strategy_info()['name']
+        }
+    
+    def _print_diagnostics(self, position, loss, connection_names):
+        """Print detailed diagnostics for a configuration"""
+        print(f"\n{'#'*80}")
+        print("DETAILED DIAGNOSTICS")
+        print(f"{'#'*80}")
+        print(f"Loss: {loss:.6f}\n")
+        
+        param_dict = dict(zip(connection_names, position))
+        print("Connection modulation:")
+        for name, value in param_dict.items():
+            print(f"  {name}: {value:.3f}")
+    
+    def save_results(self, filename: str):
+        """Save optimization results to JSON"""
+        if self.best_params is None:
+            print("No results to save")
+            return
+        
+        results = {
+            'optimization_info': {
+                'timestamp': datetime.now().isoformat(),
+                'best_loss': float(self.best_loss),
+                'device': str(self.device),
+                'baseline_weight': self.targets.baseline_weight,
+                'optogenetic_weight': self.targets.optogenetic_weight
+            },
+            'targets': {
+                'baseline_rates': self.targets.target_rates,
+                'sparsity_targets': self.targets.sparsity_targets,
+                'optogenetic_targets': {
+                    'rate_increases': self.targets.optogenetic_targets.target_rate_increases,
+                    'gini_increases': self.targets.optogenetic_targets.target_gini_increase
+                }
+            },
+            'optimized_parameters': {
+                'connection_modulation': self.best_params
+            },
+            'history': self.history
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"\nResults saved to {filename}")
+
+
+# ============================================================================
+# Convenience Functions
+# ============================================================================
 
 def run_global_optimization(optimization_config,
-                            device: Optional[torch.device] = None,
-                            n_workers=1,
-                            n_threads_per_worker=1,
-                            method='particle_swarm',
-                            n_particles=20,
-                            diagnostic_frequency=5):
+                           device: Optional[torch.device] = None,
+                           n_workers=1,
+                           n_threads_per_worker=1,
+                           method='particle_swarm',
+                           n_particles=20,
+                           max_iterations=50,
+                           diagnostic_frequency=5):
     """
-    Run global optimization with optogenetic objectives
+    Run global optimization with optogenetic objectives using batch GPU interface
     
     Args:
         optimization_config: OptimizationConfig instance
         device: Device to run on (None for auto-detect, 'cpu', or 'cuda')
-        n_workers: Number of parallel workers (for CPU multiprocessing)
+        n_workers: Number of parallel workers (for CPU)
         n_threads_per_worker: Threads per worker
         method: 'particle_swarm' or 'differential_evolution'
+        n_particles: Number of particles for PSO
+        max_iterations: Maximum iterations
         diagnostic_frequency: How often to print detailed diagnostics
     """
-    from DG_circuit_dendritic_somatic_transfer import (
-        CircuitParams, PerConnectionSynapticParams, OpsinParams
-    )
-    from scipy.optimize import differential_evolution
-    import multiprocessing as mp
     
     # Device setup
     if device is None:
@@ -555,195 +1127,26 @@ def run_global_optimization(optimization_config,
         optogenetic_weight=1.0
     )
     
-    # Circuit factory data
-    circuit_factory_data = (
-        circuit_params,
-        {
-            'ampa_g_mean': base_synaptic_params.ampa_g_mean,
-            'ampa_g_std': base_synaptic_params.ampa_g_std,
-            'gaba_g_mean': base_synaptic_params.gaba_g_mean,
-            'gaba_g_std': base_synaptic_params.gaba_g_std,
-            'distribution': base_synaptic_params.distribution,
-        },
-        opsin_params
+    # Create optimizer
+    optimizer = OptogeneticCircuitOptimizer(
+        circuit_params, base_synaptic_params, opsin_params,
+        targets, optimization_config, device=device
     )
     
-    connection_names = list(targets.connection_bounds.keys())
-    bounds = [targets.connection_bounds.get(name, (0.1, 5.0)) for name in connection_names]
+    # Run optimization
+    results = optimizer.optimize(
+        method=method,
+        n_particles=n_particles,
+        max_iterations=max_iterations,
+        n_workers=n_workers,
+        n_threads_per_worker=n_threads_per_worker,
+        diagnostic_frequency=diagnostic_frequency
+    )
     
-    if device.type == 'cpu':
-        n_cores = mp.cpu_count()
-        if n_workers is None:
-            n_workers = max(1, n_cores // max(1, n_threads_per_worker))
-        configure_torch_threads(n_threads_per_worker)
+    # Save results
+    optimizer.save_results('DG_optogenetic_optimization_results.json')
     
-    print(f"Starting {method.upper()} optimization")
-    print(f"  Device: {device}")
-    if device.type == 'cpu':
-        print(f"  Workers: {n_workers}, Threads/worker: {n_threads_per_worker}")
-    print(f"  Baseline weight: {targets.baseline_weight}, Optogenetic weight: {targets.optogenetic_weight}")
-    
-    n_new_bests = [0]
-    
-    if method == 'differential_evolution':
-        # Use Differential Evolution
-        objective = partial(
-            evaluate_candidate_worker,
-            connection_names=connection_names,
-            circuit_factory_data=circuit_factory_data,
-            targets=targets,
-            config=optimization_config,
-            device=device
-        )
-        
-        best_loss = float('inf')
-        best_params = None
-        history = {'loss': [], 'parameters': []}
-        
-        def callback(xk, convergence):
-            loss = evaluate_candidate_worker(
-                xk, connection_names, circuit_factory_data, targets, optimization_config
-            )
-            connection_modulation = dict(zip(connection_names, xk))
-            
-            history['loss'].append(loss)
-            history['parameters'].append(connection_modulation)
-            
-            nonlocal best_loss, best_params
-            if loss < best_loss:
-                best_loss = loss
-                best_params = connection_modulation.copy()
-                print(f"New best loss: {loss:.6f}")
-            
-            return False
-        
-        result = differential_evolution(
-            objective,
-            bounds,
-            maxiter=optimization_config.max_iterations,
-            popsize=20,
-            mutation=(0.5, 1.0),
-            recombination=0.7,
-            seed=42,
-            disp=True,
-            polish=False,
-            workers=n_workers if n_workers > 1 else 1,
-            updating='deferred',
-            callback=callback,
-        )
-        
-        return {
-            'optimized_connection_modulation': best_params,
-            'best_loss': best_loss,
-            'n_evaluations': result.nfev,
-            'n_iterations': result.nit,
-            'success': result.success,
-            'history': history,
-            'method': 'differential_evolution',
-            'targets': targets
-        }
-    
-    elif method == 'particle_swarm':
-        # Use Particle Swarm Optimization
-        n_dimensions = len(connection_names)
-        max_iterations = optimization_config.max_iterations
-        w_max, w_min, w = 0.9, 0.2, 0.9
-        
-        lower_bounds = np.array([b[0] for b in bounds])
-        upper_bounds = np.array([b[1] for b in bounds])
-        
-        positions = np.random.uniform(lower_bounds, upper_bounds, (n_particles, len(connection_names)))
-        velocities = np.random.uniform(-0.1, 0.1, (n_particles, len(connection_names)))
-        
-        personal_best_positions = positions.copy()
-        personal_best_scores = np.full(n_particles, float('inf'))
-        global_best_position, global_best_score = None, float('inf')
-        
-        history = {'loss': [], 'parameters': []}
-        use_multiprocessing = device.type == 'cpu' and n_workers > 1
-        
-        if use_multiprocessing:
-            ctx = mp.get_context('spawn')
-        
-        previous_best, no_improvement = float('inf'), 0
-        
-        for iteration in range(max_iterations):
-            print(f"\nPSO Iteration {iteration+1}/{max_iterations}")
-            c1, c2 = np.random.uniform(1.5, 2.5), np.random.uniform(1.5, 2.5)
-            
-            eval_args = [
-                (positions[i], connection_names, circuit_factory_data, targets, optimization_config, device)
-                for i in range(n_particles)
-            ]
-            
-            if use_multiprocessing:
-                with ctx.Pool(processes=n_workers) as pool:
-                    results = list(tqdm.tqdm(pool.imap_unordered(evaluate_particle_worker, eval_args),
-                                            total=n_particles, desc="Evaluating"))
-            else:
-                results = [evaluate_particle_worker(args) for args in tqdm.tqdm(eval_args, desc="Evaluating")]
-
-            for i, (position, score, connection_modulation) in enumerate(results):
-                if score < personal_best_scores[i]:
-                    personal_best_scores[i] = score
-                    personal_best_positions[i] = position.copy()
-                
-                if score < global_best_score:
-                    global_best_score = score
-                    global_best_position = position.copy()
-                    best_params = connection_modulation.copy()
-                    print(f"\n  New best: {global_best_score:.6f}")
-                    
-                    if n_new_bests[0] % diagnostic_frequency == 0:
-                        print_new_best_diagnostics(
-                            position, score, connection_names,
-                            circuit_factory_data, targets, optimization_config
-                        )
-
-                    n_new_bests[0] += 1
-                    
-                history['loss'].append(score)
-                history['parameters'].append(connection_modulation)
-
-            # Adapt inertia
-            improvement = previous_best - global_best_score
-            if improvement > 0.1:
-                w = min(w + 0.05, w_max)
-                no_improvement = 0
-            else:
-                w = max(w - 0.2 * w, w_min)
-                no_improvement += 1
-                
-            previous_best = global_best_score
-
-            if no_improvement > 3:
-                w = w_max
-                no_improvement = 0
-            
-            # Update particles
-            for i in range(n_particles):
-                r1, r2 = np.random.random(len(connection_names)), np.random.random(len(connection_names))
-                cognitive = c1 * r1 * (personal_best_positions[i] - positions[i])
-                social = c2 * r2 * (global_best_position - positions[i])
-                velocities[i] = w * velocities[i] + cognitive + social
-                positions[i] = np.clip(positions[i] + velocities[i], lower_bounds, upper_bounds)
-        
-        print("\nFinal diagnostics:")
-        print_new_best_diagnostics(global_best_position, global_best_score, connection_names,
-                                  circuit_factory_data, targets, optimization_config, device)
-        
-        return {
-            'optimized_connection_modulation': dict(zip(connection_names, global_best_position)),
-            'best_loss': global_best_score,
-            'n_evaluations': max_iterations * n_particles,
-            'history': history,
-            'method': 'particle_swarm',
-            'targets': targets,
-            'device': str(device)
-        }
-    
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    return results, optimizer
 
 
 if __name__ == "__main__":
@@ -756,17 +1159,20 @@ if __name__ == "__main__":
     parser.add_argument('--n-workers', type=int, default=4)
     parser.add_argument('--n-threads', type=int, default=1)
     parser.add_argument('--n-particles', type=int, default=20)
-    parser.add_argument('--max-iterations', type=int, default=6)
+    parser.add_argument('--max-iterations', type=int, default=10)
     
     args = parser.parse_args()
     
     config = create_default_global_opt_config()
-    config.max_iterations = args.max_iterations
     
-    results = run_global_optimization(
-        config, device=args.device, n_workers=args.n_workers,
-        n_threads_per_worker=args.n_threads, method=args.method,
-        n_particles=args.n_particles
+    results, optimizer = run_global_optimization(
+        config,
+        device=args.device,
+        n_workers=args.n_workers,
+        n_threads_per_worker=args.n_threads,
+        method=args.method,
+        n_particles=args.n_particles,
+        max_iterations=args.max_iterations
     )
     
     print(f"\nOptimization Complete!")
