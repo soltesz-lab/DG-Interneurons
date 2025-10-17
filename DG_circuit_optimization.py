@@ -1243,25 +1243,13 @@ class CircuitOptimizer:
 # Convenience Functions
 # ============================================================================
 
-def create_default_config(device: Optional[torch.device] = None) -> OptimizationConfig:
-    """Create default optimization configuration"""
-    return OptimizationConfig(
-        learning_rate=0.1,
-        max_iterations=300,
-        mec_drive_levels=[40.0],
-        n_trials=2,
-        simulation_duration=600,
-        warmup_duration=100,
-        device=device
-    )
-
 def create_default_targets() -> OptimizationTargets:
     """Create default optimization targets based on experimental data"""
     return OptimizationTargets(
         target_rates={
             'gc': 0.5,  # Low granule cell activity for sparsity
             'mc': 1.1,   # Moderate mossy cell activity  
-            'pv': 6.0,   # Fast-spiking PV interneurons
+            'pv': 10.0,   # Fast-spiking PV interneurons
             'sst': 4.0,   # Slower SST interneurons
         },
         sparsity_targets={
@@ -1291,8 +1279,8 @@ def create_default_global_opt_config(device: Optional[torch.device] = None) -> O
         learning_rate=0.1,
         max_iterations=20,
         mec_drive_levels=[40.0],
-        n_trials=2,  # Reduce for faster iteration
-        simulation_duration=800,
+        n_trials=3,  # Reduce for faster iteration
+        simulation_duration=1000,
         warmup_duration=200,
         device=device
     )

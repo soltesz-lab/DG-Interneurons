@@ -375,8 +375,8 @@ class BatchOptogeneticEvaluator:
         
         # Stimulation protocol parameters
         stim_start = 550
-        duration = 1650
-        warmup = 150
+        duration = 1850
+        warmup = 250
         opsin_current = 200.0
         
         # Create batch circuit
