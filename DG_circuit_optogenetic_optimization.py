@@ -2,11 +2,11 @@
 """
 Optimization framework including optogenetic stimulation effects
 
-Adds optogenetic stimulation objectives to the circuit optimization,
-targeting the paradoxical excitation effects observed by Hainmueller et al.
+- Circuits are recreated for each trial with different seeds
+- Seed strategy: base_seed + trial_index ensures reproducibility
+- Maintains batch parallelism within each trial
 
-Updated to use batch evaluation GPU interface consistent with DG_circuit_optimization.py.
-Implements EvaluationStrategy pattern for automatic device-appropriate strategy selection.
+EvaluationStrategy pattern for automatic device-appropriate strategy selection.
 """
 import sys
 from typing import Dict, List, Tuple, Optional, Any
@@ -39,6 +39,34 @@ from DG_circuit_dendritic_somatic_transfer import (
     DentateCircuit, CircuitParams, OpsinParams, PerConnectionSynapticParams
 )
 
+
+# ============================================================================
+# Random Seed Management
+# ============================================================================
+
+def set_random_seed(seed: int, device: Optional[torch.device] = None):
+    """
+    Set random seeds for reproducible connectivity generation
+    
+    Args:
+        seed: Random seed value
+        device: Device to set CUDA seed for (if applicable)
+    
+    Note:
+        This affects torch and numpy random number generators, which are
+        used in SpatialLayout and ConnectivityMatrix initialization.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    if device is not None and device.type == 'cuda':
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================================
+# Optogenetic Targets
+# ============================================================================
 
 @dataclass
 class OptogeneticTargets:
@@ -106,6 +134,13 @@ class BatchOptogeneticEvaluator:
     """
     Evaluates multiple parameter configurations with optogenetic experiments in parallel
     
+    Each trial now uses different connectivity seeds for circuit generation
+    
+    Seeding Strategy:
+    - Base seed can be provided or defaults to 42
+    - Each trial uses: base_seed + trial_index
+    - This ensures reproducibility while capturing connectivity variability
+    
     Extends batch circuit evaluation to include optogenetic stimulation protocols.
     Computes both baseline circuit objectives and optogenetic effect objectives.
     """
@@ -116,7 +151,8 @@ class BatchOptogeneticEvaluator:
                  opsin_params: OpsinParams,
                  targets: CombinedOptimizationTargets,
                  config: OptimizationConfig,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 base_seed: int = 42):
         """
         Initialize batch optogenetic evaluator
         
@@ -127,6 +163,7 @@ class BatchOptogeneticEvaluator:
             targets: CombinedOptimizationTargets instance
             config: OptimizationConfig instance
             device: Device to run simulations on
+            base_seed: Base random seed for reproducibility (default: 42)
         """
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
@@ -134,14 +171,18 @@ class BatchOptogeneticEvaluator:
         self.targets = targets
         self.config = config
         self.device = device if device is not None else get_default_device()
+        self.base_seed = base_seed
         
         print(f"BatchOptogeneticEvaluator initialized on device: {self.device}")
+        print(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
     
     def evaluate_parameter_batch(self,
                                  parameter_batch: List[Dict[str, float]],
                                  mec_drive: float) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Evaluate a batch of parameter configurations with full optogenetic protocol
+        
+        Circuits are recreated for each trial with different seeds
         
         Args:
             parameter_batch: List of connection_modulation dicts, length = batch_size
@@ -180,29 +221,39 @@ class BatchOptogeneticEvaluator:
         """
         Evaluate baseline circuit objectives for batch of parameters
         
+        REFACTORED: Creates new circuit for each trial with different seed
+        
         Returns:
             losses: Tensor [batch_size]
             firing_rates_batch: Dict mapping pop -> rates [batch_size]
         """
         batch_size = len(parameter_batch)
         
-        # Create batch circuit
-        circuit = BatchDentateCircuit(
-            batch_size=batch_size,
-            circuit_params=self.circuit_params,
-            synaptic_params=self.base_synaptic_params,
-            opsin_params=self.opsin_params,
-            device=self.device
-        )
-        
-        # Set per-batch connection modulation
-        circuit.set_connection_modulation_batch(parameter_batch)
-        
         # Average over trials
         total_losses = torch.zeros(batch_size, device=self.device)
         all_firing_rates = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
         
         for trial in range(self.config.n_trials):
+            # Set seed for this trial (base_seed + trial_index)
+            trial_seed = self.base_seed + trial
+            set_random_seed(trial_seed, self.device)
+            
+            if trial == 0:
+                print(f"  Trial {trial + 1}/{self.config.n_trials}: Creating circuit with seed {trial_seed}...")
+            
+            # Create circuit for this trial with fresh connectivity
+            circuit = BatchDentateCircuit(
+                batch_size=batch_size,
+                circuit_params=self.circuit_params,
+                synaptic_params=self.base_synaptic_params,
+                opsin_params=self.opsin_params,
+                device=self.device
+            )
+            
+            # Set per-batch connection modulation
+            circuit.set_connection_modulation_batch(parameter_batch)
+            
+            # Reset state (activities, but connectivity is already new)
             circuit.reset_state()
             
             # MEC input: [batch_size, n_mec]
@@ -286,6 +337,11 @@ class BatchOptogeneticEvaluator:
             # Store firing rates
             for pop in trial_firing_rates:
                 all_firing_rates[pop].append(trial_firing_rates[pop])
+            
+            # Clean up circuit to free memory
+            del circuit
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
         
         # Average over trials
         total_losses /= self.config.n_trials
@@ -300,6 +356,8 @@ class BatchOptogeneticEvaluator:
         """
         Evaluate optogenetic objectives for batch of parameters
         
+        Each trial creates new circuit with different seed
+        
         Runs stimulation experiments for PV and SST populations and computes
         optogenetic-specific loss components. Averages over multiple trials.
         
@@ -313,15 +371,19 @@ class BatchOptogeneticEvaluator:
         # Accumulate results over trials
         accumulated_details = {'pv': {}, 'sst': {}}
         
-        # Run multiple trials
+        # Run multiple trials with different connectivity
         for trial in range(self.config.n_trials):
+            # Set seed for this trial
+            trial_seed = self.base_seed + trial
+            set_random_seed(trial_seed, self.device)
+            
             trial_losses = torch.zeros(batch_size, device=self.device)
             
             # Evaluate PV and SST stimulation
             for target_pop in ['pv', 'sst']:
-                # Run stimulation experiment for batch
+                # Run stimulation experiment for batch (creates new circuit inside)
                 stim_results = self._simulate_batch_optogenetic_stimulation(
-                    parameter_batch, target_pop, mec_drive
+                    parameter_batch, target_pop, mec_drive, trial_seed
                 )
                 
                 # Calculate losses
@@ -363,9 +425,18 @@ class BatchOptogeneticEvaluator:
     def _simulate_batch_optogenetic_stimulation(self,
                                                parameter_batch: List[Dict[str, float]],
                                                target_pop: str,
-                                               mec_drive: float) -> Dict[str, torch.Tensor]:
+                                               mec_drive: float,
+                                               trial_seed: int) -> Dict[str, torch.Tensor]:
         """
         Run optogenetic stimulation for a batch of parameter sets
+        
+        Uses provided trial_seed for circuit creation
+        
+        Args:
+            parameter_batch: List of connection modulation dicts
+            target_pop: Population to stimulate ('pv' or 'sst')
+            mec_drive: MEC drive level
+            trial_seed: Random seed for this trial (already set externally)
         
         Returns dict with baseline and stimulation statistics for each population
         """
@@ -379,7 +450,8 @@ class BatchOptogeneticEvaluator:
         warmup = 250
         opsin_current = 200.0
         
-        # Create batch circuit
+        # Create new batch circuit with current random seed
+        # Note: seed was already set by caller, this ensures fresh connectivity
         circuit = BatchDentateCircuit(
             batch_size=batch_size,
             circuit_params=self.circuit_params,
@@ -391,8 +463,6 @@ class BatchOptogeneticEvaluator:
         circuit.set_connection_modulation_batch(parameter_batch)
         
         # Setup opsin expression for target population ONLY
-        from DG_protocol import OpsinExpression
-        
         n_target_cells = getattr(self.circuit_params, f'n_{target_pop}')
         opsin_expression = OpsinExpression(
             self.opsin_params,
@@ -404,12 +474,10 @@ class BatchOptogeneticEvaluator:
         target_positions = circuit.layout.positions[target_pop]
         
         # Calculate activation probability for target population neurons
-        # This returns a tensor of shape [n_target_cells] with activation probabilities
         light_intensity = self.targets.optogenetic_targets.stimulation_intensity
         activation_prob = opsin_expression.calculate_activation(target_positions, light_intensity)
         
         # Convert activation probabilities to optogenetic current for target neurons
-        # Shape: [n_target_cells]
         target_opto_current = activation_prob * opsin_current
         
         # Storage for time series: [time, batch, neurons]
@@ -423,7 +491,6 @@ class BatchOptogeneticEvaluator:
         
         for t in range(duration):
             # Create per-population optogenetic drives
-            # Only target_pop receives non-zero drive
             direct_activation = {}
             
             if t >= stim_start:
@@ -434,14 +501,13 @@ class BatchOptogeneticEvaluator:
                                        ('sst', self.circuit_params.n_sst)]:
                     if pop == target_pop:
                         # Target population gets optogenetic drive
-                        # Replicate across batch: [n_neurons] -> [batch_size, n_neurons]
                         direct_activation[pop] = target_opto_current.unsqueeze(0).expand(batch_size, -1)
                     else:
                         # Non-target populations get zero drive
                         direct_activation[pop] = torch.zeros(batch_size, n_neurons,
                                                             device=self.device)
             else:
-                # No stimulation before stim_start - all populations get zero drive
+                # No stimulation before stim_start
                 for pop, n_neurons in [('gc', self.circuit_params.n_gc),
                                        ('mc', self.circuit_params.n_mc),
                                        ('pv', self.circuit_params.n_pv),
@@ -517,6 +583,11 @@ class BatchOptogeneticEvaluator:
                     'stim_gini': stim_gini,
                     'gini_change': gini_change,
                 }
+        
+        # Clean up
+        del circuit
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         return results
     
@@ -607,13 +678,14 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
     """Sequential evaluation for gradient-based or single evaluations"""
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
-                 targets, config, device):
+                 targets, config, device, base_seed=42):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
         self.targets = targets
         self.config = config
         self.device = device
+        self.base_seed = base_seed
     
     def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
         """Evaluate configurations one at a time"""
@@ -624,7 +696,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
             # Use batch evaluator with batch_size=1
             evaluator = BatchOptogeneticEvaluator(
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
-                self.targets, self.config, device=self.device
+                self.targets, self.config, device=self.device, base_seed=self.base_seed
             )
             
             loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_drive)
@@ -638,7 +710,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
             'name': 'OptogeneticSequential',
             'device': str(self.device),
             'parallelism': 'None',
-            'description': 'Sequential evaluation with optogenetic protocols'
+            'description': 'Sequential evaluation with optogenetic protocols (different seeds per trial)'
         }
 
 
@@ -646,18 +718,19 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
     """Batch GPU evaluation for population-based optimization"""
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
-                 targets, config, device):
+                 targets, config, device, base_seed=42):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
         self.targets = targets
         self.config = config
         self.device = device
+        self.base_seed = base_seed
         
         # Create evaluator
         self.evaluator = BatchOptogeneticEvaluator(
             circuit_params, base_synaptic_params, opsin_params,
-            targets, config, device=device
+            targets, config, device=device, base_seed=base_seed
         )
     
     def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
@@ -665,7 +738,6 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
         batch_size = len(parameter_sets)
         
         # Note: n_trials is handled internally by evaluator
-        # We just call once since BatchOptogeneticEvaluator handles trials
         losses_tensor, details = self.evaluator.evaluate_parameter_batch(
             parameter_sets, mec_drive
         )
@@ -680,7 +752,7 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
             'name': 'OptogeneticBatchGPU',
             'device': str(self.device),
             'parallelism': 'Data parallelism (batched optogenetic experiments)',
-            'description': f'Batch optogenetic evaluation on GPU'
+            'description': f'Batch optogenetic evaluation on GPU (seed {self.base_seed} + trial_idx)'
         }
 
 
@@ -688,13 +760,15 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
     """Multiprocess CPU evaluation for population-based optimization"""
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
-                 targets, config, device, n_workers=None, n_threads_per_worker=1):
+                 targets, config, device, n_workers=None, n_threads_per_worker=1,
+                 base_seed=42):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
         self.targets = targets
         self.config = config
         self.device = device
+        self.base_seed = base_seed
         
         # Configure workers
         n_cores = mp.cpu_count()
@@ -721,7 +795,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
         """Evaluate configurations using multiprocessing"""
         # Prepare arguments for workers
         eval_args = [
-            (params, mec_drive, self.worker_data, self.targets, self.config)
+            (params, mec_drive, self.worker_data, self.targets, self.config, self.base_seed)
             for params in parameter_sets
         ]
         
@@ -743,13 +817,13 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
             'name': 'OptogeneticMultiprocessCPU',
             'device': str(self.device),
             'parallelism': f'{self.n_workers} workers * {self.n_threads_per_worker} threads',
-            'description': f'Multiprocess optogenetic evaluation on CPU with {self.n_workers} workers'
+            'description': f'Multiprocess optogenetic evaluation on CPU (seed {self.base_seed} + trial_idx)'
         }
 
 
 def _optogenetic_worker_evaluate(args):
     """Worker function for multiprocess optogenetic evaluation"""
-    (connection_modulation, mec_drive, worker_data, targets, config) = args
+    (connection_modulation, mec_drive, worker_data, targets, config, base_seed) = args
     
     device = torch.device('cpu')
     circuit_params, base_synaptic_params_dict, opsin_params = worker_data
@@ -764,10 +838,10 @@ def _optogenetic_worker_evaluate(args):
         connection_modulation=connection_modulation
     )
     
-    # Create evaluator
+    # Create evaluator with base seed
     evaluator = BatchOptogeneticEvaluator(
         circuit_params, synaptic_params, opsin_params,
-        targets, config, device=device
+        targets, config, device=device, base_seed=base_seed
     )
     
     # Evaluate single parameter set
@@ -800,8 +874,11 @@ class OptogeneticCircuitOptimizer:
     """
     Optogenetic circuit optimizer with automatic evaluation strategy selection
     
+    Uses different connectivity seeds for each trial
+    
     Extends CircuitOptimizer pattern to include optogenetic objectives.
     Automatically chooses optimal strategy based on device and method.
+    Each trial regenerates circuit connectivity for proper averaging.
     """
     
     def __init__(self,
@@ -810,13 +887,15 @@ class OptogeneticCircuitOptimizer:
                  opsin_params: OpsinParams,
                  targets: CombinedOptimizationTargets,
                  config: OptimizationConfig,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 base_seed: int = 42):
         
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
         self.targets = targets
         self.config = config
+        self.base_seed = base_seed
         
         # Set device
         self.device = device if device is not None else get_default_device()
@@ -829,6 +908,7 @@ class OptogeneticCircuitOptimizer:
         self.history = {'loss': [], 'parameters': []}
         
         print(f"OptogeneticCircuitOptimizer initialized on device: {self.device}")
+        print(f"  Base seed: {base_seed}")
         print(f"  Baseline weight: {targets.baseline_weight}")
         print(f"  Optogenetic weight: {targets.optogenetic_weight}")
     
@@ -838,21 +918,22 @@ class OptogeneticCircuitOptimizer:
         if method == 'gradient':
             strategy = OptogeneticSequentialStrategy(
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
-                self.targets, self.config, self.device
+                self.targets, self.config, self.device, base_seed=self.base_seed
             )
         
         elif method in ['particle_swarm', 'genetic_algorithm']:
             if self.device.type == 'cuda':
                 strategy = OptogeneticBatchGPUStrategy(
                     self.circuit_params, self.base_synaptic_params, self.opsin_params,
-                    self.targets, self.config, self.device
+                    self.targets, self.config, self.device, base_seed=self.base_seed
                 )
             else:
                 strategy = OptogeneticMultiprocessCPUStrategy(
                     self.circuit_params, self.base_synaptic_params, self.opsin_params,
                     self.targets, self.config, self.device,
                     n_workers=kwargs.get('n_workers', None),
-                    n_threads_per_worker=kwargs.get('n_threads_per_worker', 1)
+                    n_threads_per_worker=kwargs.get('n_threads_per_worker', 1),
+                    base_seed=self.base_seed
                 )
         
         elif method == 'differential_evolution':
@@ -865,7 +946,8 @@ class OptogeneticCircuitOptimizer:
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
                 self.targets, self.config, self.device,
                 n_workers=kwargs.get('n_workers', None),
-                n_threads_per_worker=kwargs.get('n_threads_per_worker', 1)
+                n_threads_per_worker=kwargs.get('n_threads_per_worker', 1),
+                base_seed=self.base_seed
             )
         
         else:
@@ -917,6 +999,7 @@ class OptogeneticCircuitOptimizer:
         print(f"Starting Particle Swarm Optimization...")
         print(f"Particles: {n_particles}")
         print(f"Iterations: {max_iterations}")
+        print(f"Trials per evaluation: {self.config.n_trials}")
         
         # Initialize
         lower_bounds = np.array([b[0] for b in bounds])
@@ -1010,6 +1093,7 @@ class OptogeneticCircuitOptimizer:
             'n_particles': n_particles,
             'device': str(self.device),
             'strategy': strategy.get_strategy_info()['name'],
+            'base_seed': self.base_seed,
             'history': self.history,
             'targets': self.targets
         }
@@ -1028,6 +1112,7 @@ class OptogeneticCircuitOptimizer:
         
         print(f"Starting Differential Evolution...")
         print(f"Iterations: {max_iterations}")
+        print(f"Trials per evaluation: {self.config.n_trials}")
         
         def objective(param_array):
             param_dict = dict(zip(connection_names, param_array))
@@ -1055,7 +1140,8 @@ class OptogeneticCircuitOptimizer:
             'method': 'differential_evolution',
             'success': result.success,
             'device': str(self.device),
-            'strategy': strategy.get_strategy_info()['name']
+            'strategy': strategy.get_strategy_info()['name'],
+            'base_seed': self.base_seed
         }
     
     def _print_diagnostics(self, position, loss, connection_names):
@@ -1075,11 +1161,12 @@ class OptogeneticCircuitOptimizer:
         print("Detailed evaluation of candidate parameters")
         print(f"{'='*80}")
         print(f"Device: {self.device}")
+        print(f"Base seed: {self.base_seed} (trials use base_seed + trial_idx)")
         
         # Create evaluator for detailed diagnostics
         evaluator = BatchOptogeneticEvaluator(
             self.circuit_params, self.base_synaptic_params, self.opsin_params,
-            self.targets, self.config, device=self.device
+            self.targets, self.config, device=self.device, base_seed=self.base_seed
         )
         
         # Evaluate configuration
@@ -1116,6 +1203,7 @@ class OptogeneticCircuitOptimizer:
         print(f"\n{'='*80}")
         print("Optogenetic stimulation evaluation")
         print(f"{'='*80}")
+        print(f"  Note: Averaged over {self.config.n_trials} trials with different connectivity")
         
         opto_details = details['opto_details']
         for target_pop in ['pv', 'sst']:
@@ -1181,8 +1269,10 @@ class OptogeneticCircuitOptimizer:
                 'timestamp': datetime.now().isoformat(),
                 'best_loss': float(self.best_loss),
                 'device': str(self.device),
+                'base_seed': self.base_seed,
                 'baseline_weight': self.targets.baseline_weight,
-                'optogenetic_weight': self.targets.optogenetic_weight
+                'optogenetic_weight': self.targets.optogenetic_weight,
+                'n_trials': self.config.n_trials
             },
             'targets': {
                 'baseline_rates': self.targets.target_rates,
@@ -1215,9 +1305,12 @@ def run_global_optimization(optimization_config,
                            method='particle_swarm',
                            n_particles=20,
                            max_iterations=50,
-                           diagnostic_frequency=5):
+                           diagnostic_frequency=5,
+                           base_seed=42):
     """
     Run global optimization with optogenetic objectives using batch GPU interface
+    
+    Supports base_seed parameter for reproducible trials.
     
     Args:
         optimization_config: OptimizationConfig instance
@@ -1228,6 +1321,7 @@ def run_global_optimization(optimization_config,
         n_particles: Number of particles for PSO
         max_iterations: Maximum iterations
         diagnostic_frequency: How often to print detailed diagnostics
+        base_seed: Base random seed for reproducibility (default: 42)
     """
     
     # Device setup
@@ -1261,7 +1355,7 @@ def run_global_optimization(optimization_config,
     # Create optimizer
     optimizer = OptogeneticCircuitOptimizer(
         circuit_params, base_synaptic_params, opsin_params,
-        targets, optimization_config, device=device
+        targets, optimization_config, device=device, base_seed=base_seed
     )
     
     # Run optimization
@@ -1291,6 +1385,7 @@ if __name__ == "__main__":
     parser.add_argument('--n-threads', type=int, default=1)
     parser.add_argument('--n-particles', type=int, default=20)
     parser.add_argument('--max-iterations', type=int, default=6)
+    parser.add_argument('--base-seed', type=int, default=42, help='Base random seed for reproducibility')
     
     args = parser.parse_args()
     
@@ -1303,9 +1398,11 @@ if __name__ == "__main__":
         n_threads_per_worker=args.n_threads,
         method=args.method,
         n_particles=args.n_particles,
-        max_iterations=args.max_iterations
+        max_iterations=args.max_iterations,
+        base_seed=args.base_seed
     )
     
     print(f"\nOptimization Complete!")
     print(f"Best loss: {results['best_loss']:.6f}")
     print(f"Device: {results['device']}")
+    print(f"Base seed: {results['base_seed']}")
