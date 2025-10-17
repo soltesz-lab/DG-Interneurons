@@ -301,33 +301,64 @@ class BatchOptogeneticEvaluator:
         Evaluate optogenetic objectives for batch of parameters
         
         Runs stimulation experiments for PV and SST populations and computes
-        optogenetic-specific loss components.
+        optogenetic-specific loss components. Averages over multiple trials.
         
         Returns:
             losses: Tensor [batch_size]
-            details: Dict with per-population results
+            details: Dict with per-population results (averaged over trials)
         """
         batch_size = len(parameter_batch)
         total_opto_losses = torch.zeros(batch_size, device=self.device)
         
-        details = {'pv': {}, 'sst': {}}
+        # Accumulate results over trials
+        accumulated_details = {'pv': {}, 'sst': {}}
         
-        # Evaluate PV and SST stimulation
-        for target_pop in ['pv', 'sst']:
-            # Run stimulation experiment for batch
-            stim_results = self._simulate_batch_optogenetic_stimulation(
-                parameter_batch, target_pop, mec_drive
-            )
+        # Run multiple trials
+        for trial in range(self.config.n_trials):
+            trial_losses = torch.zeros(batch_size, device=self.device)
             
-            # Calculate losses
-            pop_losses = self._calculate_optogenetic_losses_batch(
-                stim_results, target_pop
-            )
+            # Evaluate PV and SST stimulation
+            for target_pop in ['pv', 'sst']:
+                # Run stimulation experiment for batch
+                stim_results = self._simulate_batch_optogenetic_stimulation(
+                    parameter_batch, target_pop, mec_drive
+                )
+                
+                # Calculate losses
+                pop_losses = self._calculate_optogenetic_losses_batch(
+                    stim_results, target_pop
+                )
+                
+                trial_losses += pop_losses
+                
+                # Accumulate results for averaging
+                if trial == 0:
+                    # Initialize accumulators on first trial
+                    accumulated_details[target_pop] = {
+                        pop: {k: v.clone() if isinstance(v, torch.Tensor) else v 
+                              for k, v in pop_data.items()}
+                        for pop, pop_data in stim_results.items()
+                    }
+                else:
+                    # Add to accumulators
+                    for pop in stim_results:
+                        for key, value in stim_results[pop].items():
+                            if isinstance(value, torch.Tensor):
+                                accumulated_details[target_pop][pop][key] += value
             
-            total_opto_losses += pop_losses
-            details[target_pop] = stim_results
+            total_opto_losses += trial_losses
         
-        return total_opto_losses, details
+        # Average over trials
+        total_opto_losses /= self.config.n_trials
+        
+        # Average accumulated details
+        for target_pop in accumulated_details:
+            for pop in accumulated_details[target_pop]:
+                for key in accumulated_details[target_pop][pop]:
+                    if isinstance(accumulated_details[target_pop][pop][key], torch.Tensor):
+                        accumulated_details[target_pop][pop][key] /= self.config.n_trials
+        
+        return total_opto_losses, accumulated_details
     
     def _simulate_batch_optogenetic_stimulation(self,
                                                parameter_batch: List[Dict[str, float]],
@@ -460,7 +491,6 @@ class BatchOptogeneticEvaluator:
                 stim_mean = torch.mean(stim_rates, dim=1)  # [batch]
                 mean_change = torch.mean(rate_changes, dim=1)  # [batch]
                 
-
                 # Gini coefficients (computed on CPU for numpy compatibility)
                 baseline_gini_list = []
                 stim_gini_list = []
@@ -715,6 +745,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
             'parallelism': f'{self.n_workers} workers * {self.n_threads_per_worker} threads',
             'description': f'Multiprocess optogenetic evaluation on CPU with {self.n_workers} workers'
         }
+
 
 def _optogenetic_worker_evaluate(args):
     """Worker function for multiprocess optogenetic evaluation"""
@@ -1030,14 +1061,114 @@ class OptogeneticCircuitOptimizer:
     def _print_diagnostics(self, position, loss, connection_names):
         """Print detailed diagnostics for a configuration"""
         print(f"\n{'#'*80}")
-        print("DETAILED DIAGNOSTICS")
+        print("NEW BEST SOLUTION FOUND")
         print(f"{'#'*80}")
         print(f"Loss: {loss:.6f}\n")
         
         param_dict = dict(zip(connection_names, position))
-        print("Connection modulation:")
+        print("Connection modulation parameters:")
         for name, value in param_dict.items():
             print(f"  {name}: {value:.3f}")
+        
+        # Detailed evaluation with verbose output
+        print(f"\n{'='*80}")
+        print("Detailed evaluation of candidate parameters")
+        print(f"{'='*80}")
+        print(f"Device: {self.device}")
+        
+        # Create evaluator for detailed diagnostics
+        evaluator = BatchOptogeneticEvaluator(
+            self.circuit_params, self.base_synaptic_params, self.opsin_params,
+            self.targets, self.config, device=self.device
+        )
+        
+        # Evaluate configuration
+        mec_drive = self.config.mec_drive_levels[0]
+        total_loss_tensor, details = evaluator.evaluate_parameter_batch(
+            [param_dict], mec_drive
+        )
+        recomputed_loss = total_loss_tensor.item()
+        
+        # Extract components
+        baseline_loss = details['baseline_losses'].item()
+        opto_loss = details['opto_losses'].item()
+        baseline_rates = details['baseline_rates']
+        
+        print(f"\n{'='*80}")
+        print("Baseline circuit evaluation")
+        print(f"{'='*80}")
+        print(f"  MEC drive: {mec_drive} pA\n")
+        
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            if pop in baseline_rates:
+                actual_rate = baseline_rates[pop].item()
+                target_rate = self.targets.target_rates.get(pop, 0.0)
+                tolerance = self.targets.rate_tolerance.get(pop, 0.0)
+                error = abs(actual_rate - target_rate)
+                
+                print(f"  {pop.upper()}:")
+                print(f"    Target: {target_rate:.3f} Hz ± {tolerance:.3f}")
+                print(f"    Actual: {actual_rate:.3f} Hz")
+                print(f"    Error:  {error:.3f} Hz")
+        
+        print(f"\n  Baseline loss: {baseline_loss:.6f}")
+        
+        print(f"\n{'='*80}")
+        print("Optogenetic stimulation evaluation")
+        print(f"{'='*80}")
+        
+        opto_details = details['opto_details']
+        for target_pop in ['pv', 'sst']:
+            if target_pop in opto_details:
+                print(f"\n--- {target_pop.upper()} Stimulation ---")
+                pop_results = opto_details[target_pop]
+                
+                for affected_pop in ['gc', 'mc', 'pv', 'sst']:
+                    if affected_pop in pop_results and affected_pop != target_pop:
+                        result = pop_results[affected_pop]
+                        
+                        baseline_mean = result['baseline_mean'].item()
+                        stim_mean = result['stim_mean'].item()
+                        mean_change = result['mean_change'].item()
+                        activated_fraction = result['activated_fraction'].item()
+                        gini_change = result['gini_change'].item()
+                        
+                        print(f"\n  {affected_pop.upper()}:")
+                        print(f"    Baseline rate: {baseline_mean:.3f} Hz")
+                        print(f"    Stim rate: {stim_mean:.3f} Hz")
+                        print(f"    Mean change: {mean_change:+.3f} Hz")
+                        print(f"    Activated fraction: {activated_fraction:.3f}")
+                        
+                        # Show target if available
+                        opto_targets = self.targets.optogenetic_targets
+                        if (target_pop in opto_targets.target_rate_increases and 
+                            affected_pop in opto_targets.target_rate_increases[target_pop]):
+                            target_frac = opto_targets.target_rate_increases[target_pop][affected_pop]
+                            print(f"      (target: {target_frac:.3f})")
+                        
+                        print(f"    Gini change: {gini_change:+.4f}")
+                        if (target_pop in opto_targets.target_gini_increase and
+                            affected_pop in opto_targets.target_gini_increase[target_pop]):
+                            target_gini = opto_targets.target_gini_increase[target_pop][affected_pop]
+                            print(f"      (target: {target_gini:+.4f})")
+        
+        print(f"\n  Total optogenetic loss: {opto_loss:.6f}")
+        
+        print(f"\n{'='*80}")
+        print("Combined loss breakdown")
+        print(f"{'='*80}")
+        print(f"  Baseline: {baseline_loss:.6f} × {self.targets.baseline_weight} = {baseline_loss * self.targets.baseline_weight:.6f}")
+        print(f"  Optogenetic: {opto_loss:.6f} × {self.targets.optogenetic_weight} = {opto_loss * self.targets.optogenetic_weight:.6f}")
+        print(f"  TOTAL: {recomputed_loss:.6f}")
+        
+        print(f"\n{'='*80}")
+        print("Loss verification")
+        print(f"{'='*80}")
+        print(f"  Loss from optimizer:  {loss:.6f}")
+        print(f"  Recomputed loss:      {recomputed_loss:.6f}")
+        if abs(loss - recomputed_loss) > 1e-4:
+            print(f"  WARNING: Loss mismatch!")
+        print(f"{'='*80}\n")
     
     def save_results(self, filename: str):
         """Save optimization results to JSON"""
@@ -1159,7 +1290,7 @@ if __name__ == "__main__":
     parser.add_argument('--n-workers', type=int, default=4)
     parser.add_argument('--n-threads', type=int, default=1)
     parser.add_argument('--n-particles', type=int, default=20)
-    parser.add_argument('--max-iterations', type=int, default=10)
+    parser.add_argument('--max-iterations', type=int, default=6)
     
     args = parser.parse_args()
     
