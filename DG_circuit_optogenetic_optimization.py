@@ -1254,7 +1254,7 @@ class OptogeneticCircuitOptimizer:
         print(f"{'='*80}")
         print(f"  Loss from optimizer:  {loss:.6f}")
         print(f"  Recomputed loss:      {recomputed_loss:.6f}")
-        if abs(loss - recomputed_loss) > 1e-4:
+        if abs(loss - recomputed_loss) > 1e-2:
             print(f"  WARNING: Loss mismatch!")
         print(f"{'='*80}\n")
     

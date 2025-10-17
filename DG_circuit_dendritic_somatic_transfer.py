@@ -298,8 +298,6 @@ class CircuitParams:
     
     # Synaptic parameters
     dt: float = 0.1                    # ms
-    tau_syn: float = 5.0               # synaptic time constant
-    tau_mec: float = 8.0               # slower MEC integration
 
 @dataclass  
 class OpsinParams:

@@ -28,6 +28,26 @@ from DG_visualization import (
 )
 
 
+# ============================================================================
+# Random Seed Management (consistent with optimization module)
+# ============================================================================
+
+def set_random_seed(seed: int, device: Optional[torch.device] = None):
+    """
+    Set random seeds for reproducible connectivity generation
+    
+    Args:
+        seed: Random seed value
+        device: Device to set CUDA seed for (if applicable)
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    if device is not None and device.type == 'cuda':
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
 class OpsinExpression:
     """Handle heterogeneous opsin expression"""
     
@@ -77,17 +97,34 @@ class OpsinExpression:
 
 
 class OptogeneticExperiment:
-    """Simulate optogenetic stimulation experiments"""
+    """
+    Simulate optogenetic stimulation experiments
+    
+    Now supports multi-trial averaging with different connectivity seeds
+    """
     
     def __init__(self, circuit_params: CircuitParams,
                  synaptic_params: PerConnectionSynapticParams,
                  opsin_params: OpsinParams,
                  optimization_json_file: Optional[str] = None,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 base_seed: int = 42):
+        """
+        Initialize optogenetic experiment
+        
+        Args:
+            circuit_params: CircuitParams instance
+            synaptic_params: PerConnectionSynapticParams instance
+            opsin_params: OpsinParams instance
+            optimization_json_file: Optional path to optimization results JSON
+            device: Device to run on
+            base_seed: Base random seed for reproducibility (default: 42)
+        """
         self.circuit_params = circuit_params
         self.opsin_params = opsin_params
         self.synaptic_params = synaptic_params
         self.device = device if device is not None else get_default_device()
+        self.base_seed = base_seed
         
         if optimization_json_file is not None:
             success = self._load_optimization_results(optimization_json_file)
@@ -96,19 +133,24 @@ class OptogeneticExperiment:
             else:
                 print(f"Failed to load optimization file. Using default parameters.")
 
-        # Create circuit on specified device
-        self.circuit = DentateCircuit(
+        # Create initial circuit (will be recreated for each trial)
+        self.circuit = self._create_circuit(base_seed)
+        
+        print(f"OptogeneticExperiment initialized on device: {self.device}")
+        print(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
+
+    def _create_circuit(self, seed: int) -> DentateCircuit:
+        """Create circuit with specified seed for connectivity"""
+        set_random_seed(seed, self.device)
+        return DentateCircuit(
             self.circuit_params, 
             self.synaptic_params, 
             self.opsin_params,
             device=self.device
         )
-        
-        print(f"OptogeneticExperiment initialized on device: {self.device}")
 
     def _load_optimization_results(self, json_filename):
         """Load and process optimization results from JSON file"""
-
         import json
 
         try:
@@ -142,7 +184,6 @@ class OptogeneticExperiment:
 
     def _create_optimized_synaptic_params(self):
         """Create PerConnectionSynapticParams with optimized connection modulation"""
-
         if ('optimized_parameters' not in self.optimization_data or 
             'connection_modulation' not in self.optimization_data['optimized_parameters']):
             print("Warning: No optimized connection modulation found in JSON")
@@ -163,14 +204,13 @@ class OptogeneticExperiment:
             gaba_g_min=base_conductances.get('gaba_g_min', 0.01),
             gaba_g_max=base_conductances.get('gaba_g_max', 1.5),
             distribution=base_conductances.get('distribution', 'lognormal'),
-            connection_modulation=connection_modulation  # Use optimized values
+            connection_modulation=connection_modulation
         )
 
         return optimized_params
     
     def _create_optimized_circuit_params(self):
         """Create CircuitParams instance using loaded optimization data"""
-
         # Start with default circuit parameters
         circuit_params = CircuitParams()
 
@@ -200,15 +240,97 @@ class OptogeneticExperiment:
     def simulate_stimulation(self, 
                              target_population: str,
                              light_intensity: float,
-                             duration: float = 1550.0,
+                             duration: float = 1850.0,
                              stim_start: float = 550.0,
                              mec_current: float = 100.0,
                              opsin_current: float = 100.0,
                              include_dentate_spikes: bool = False,
                              ds_times: Optional[List[float]] = None,
-                             plot_activity: bool = False) -> Dict:
-        """Simulate optogenetic stimulation experiment with MEC drive"""
-
+                             plot_activity: bool = False,
+                             n_trials: int = 1) -> Dict:
+        """
+        Simulate optogenetic stimulation experiment with MEC drive
+        
+        Now supports multi-trial averaging with different connectivity
+        
+        Args:
+            target_population: Population to stimulate ('pv', 'sst', etc.)
+            light_intensity: Light intensity for stimulation
+            duration: Total simulation duration (ms)
+            stim_start: When to start stimulation (ms)
+            mec_current: MEC drive current (pA)
+            opsin_current: Optogenetic current (pA)
+            include_dentate_spikes: Whether to include dentate spikes
+            ds_times: Specific dentate spike times (optional)
+            plot_activity: Whether to plot activity
+            n_trials: Number of trials to average (default: 1)
+            
+        Returns:
+            Dict with averaged results over trials, including:
+                - time: Time vector
+                - activity_trace_mean: Mean activity traces
+                - activity_trace_std: Std of activity traces  
+                - opsin_expression_mean: Mean opsin expression
+                - trial_results: List of individual trial results
+        """
+        
+        # Storage for multi-trial results
+        all_trial_results = []
+        
+        # Run multiple trials with different connectivity
+        for trial in range(n_trials):
+            # Set seed for this trial
+            trial_seed = self.base_seed + trial
+            set_random_seed(trial_seed, self.device)
+            
+            if trial == 0:
+                print(f"\nRunning {n_trials} trial(s)...")
+            print(f"  Trial {trial + 1}/{n_trials}: Creating circuit with seed {trial_seed}...")
+            
+            # Create NEW circuit for this trial with fresh connectivity
+            self.circuit = self._create_circuit(trial_seed)
+            
+            # Run single trial
+            trial_result = self._simulate_single_trial(
+                target_population=target_population,
+                light_intensity=light_intensity,
+                duration=duration,
+                stim_start=stim_start,
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                include_dentate_spikes=include_dentate_spikes,
+                ds_times=ds_times,
+                plot_activity=(plot_activity and trial == 0),  # Only plot first trial
+                trial_index=trial
+            )
+            
+            all_trial_results.append(trial_result)
+            
+            # Clean up to free memory
+            del self.circuit
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+        
+        # Aggregate results across trials
+        aggregated_results = self._aggregate_trial_results(all_trial_results, n_trials)
+        
+        print(f"Completed {n_trials} trial(s) with different connectivity")
+        
+        return aggregated_results
+    
+    def _simulate_single_trial(self,
+                              target_population: str,
+                              light_intensity: float,
+                              duration: float,
+                              stim_start: float,
+                              mec_current: float,
+                              opsin_current: float,
+                              include_dentate_spikes: bool,
+                              ds_times: Optional[List[float]],
+                              plot_activity: bool,
+                              trial_index: int) -> Dict:
+        """Run a single trial of optogenetic stimulation"""
+        
         vis = None
         if plot_activity:
             vis = DGCircuitVisualization(self.circuit)
@@ -244,11 +366,9 @@ class OptogeneticExperiment:
                 ds_times = self._generate_dentate_spike_times(duration, baseline_rate=0.5)
         else:
             ds_times = []
-
-        print(f"opsin_current = {opsin_current}")
         
         # Run simulation
-        for t in tqdm.tqdm(range(n_steps)):
+        for t in range(n_steps):
             current_time = t * dt
 
             direct_activation = {}
@@ -286,7 +406,7 @@ class OptogeneticExperiment:
         if vis:
             fig, _ = vis.plot_activity_patterns(
                 activity_trace_cpu,
-                save_path=f"DG_{target_population}_stimulation_activity_{light_intensity}.png"
+                save_path=f"DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
                 
@@ -298,6 +418,49 @@ class OptogeneticExperiment:
             'dentate_spike_times': ds_times,
             'layout': self.circuit.layout,
             'connectivity': self.circuit.connectivity
+        }
+    
+    def _aggregate_trial_results(self, trial_results: List[Dict], n_trials: int) -> Dict:
+        """Aggregate results across multiple trials"""
+        
+        # Time is the same across trials
+        time = trial_results[0]['time']
+        
+        # Stack activity traces: [n_trials, n_neurons, n_steps]
+        activity_traces_all = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst', 'mec']}
+        opsin_expressions_all = []
+        
+        for trial_result in trial_results:
+            for pop in activity_traces_all:
+                activity_traces_all[pop].append(trial_result['activity_trace'][pop])
+            opsin_expressions_all.append(trial_result['opsin_expression'])
+        
+        # Calculate mean and std across trials
+        activity_trace_mean = {}
+        activity_trace_std = {}
+        
+        for pop in activity_traces_all:
+            # Stack: [n_trials, n_neurons, n_steps]
+            stacked = torch.stack(activity_traces_all[pop], dim=0)
+            activity_trace_mean[pop] = torch.mean(stacked, dim=0)  # [n_neurons, n_steps]
+            activity_trace_std[pop] = torch.std(stacked, dim=0)    # [n_neurons, n_steps]
+        
+        # Opsin expression (may vary slightly per trial due to stochastic generation)
+        opsin_expression_stacked = torch.stack(opsin_expressions_all, dim=0)
+        opsin_expression_mean = torch.mean(opsin_expression_stacked, dim=0)
+        opsin_expression_std = torch.std(opsin_expression_stacked, dim=0)
+        
+        return {
+            'time': time,
+            'activity_trace_mean': activity_trace_mean,
+            'activity_trace_std': activity_trace_std,
+            'opsin_expression_mean': opsin_expression_mean,
+            'opsin_expression_std': opsin_expression_std,
+            'n_trials': n_trials,
+            'trial_results': trial_results,  # Keep individual results for detailed analysis
+            # Include layout and connectivity from last trial for visualization
+            'layout': trial_results[-1]['layout'],
+            'connectivity': trial_results[-1]['connectivity']
         }
     
     def _generate_dentate_spike_times(self, duration: float, baseline_rate: float = 0.5) -> List[float]:
@@ -319,7 +482,11 @@ class OptogeneticExperiment:
 
 
 def analyze_connectivity_patterns(experiment: OptogeneticExperiment) -> Dict:
-    """Analyze the anatomical connectivity patterns including MEC"""
+    """
+    Analyze the anatomical connectivity patterns including MEC
+    
+    Note: Uses connectivity from current circuit instance
+    """
     layout = experiment.circuit.layout
     conductance_matrices = experiment.circuit.connectivity.conductance_matrices
     
@@ -463,121 +630,36 @@ def analyze_conductance_patterns(experiment: OptogeneticExperiment) -> Dict:
     return analysis
 
 
-def analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
-    """Analyze how MEC -> PV (but not SST) asymmetry affects circuit dynamics"""
-    
-    # Reset circuit state
-    experiment.circuit.reset_state()
-
-    # Simulation parameters
-    n_steps = 2000
-    dt = 0.1
-    time = torch.arange(n_steps, device=experiment.device) * dt
-    mec_drive_time = 100.0  # Start MEC drive at 100ms
-    
-    activity_trace = {
-        'gc': torch.zeros(experiment.circuit_params.n_gc, n_steps, device=experiment.device),
-        'mc': torch.zeros(experiment.circuit_params.n_mc, n_steps, device=experiment.device), 
-        'pv': torch.zeros(experiment.circuit_params.n_pv, n_steps, device=experiment.device),
-        'sst': torch.zeros(experiment.circuit_params.n_sst, n_steps, device=experiment.device),
-        'mec': torch.zeros(experiment.circuit_params.n_mec, n_steps, device=experiment.device)
-    }
-    
-    # Store conductance information
-    conductance_stats = analyze_conductance_patterns(experiment)
-    
-    for t in range(n_steps):
-        current_time = t * dt
-        
-        # MEC drive (simulating dentate spike)
-        external_drive = {}
-        if mec_drive_time <= current_time <= mec_drive_time + 50.0:  # 50ms MEC drive
-            mec_drive = torch.ones(experiment.circuit_params.n_mec, device=experiment.device) * 500.0
-        else:
-            mec_drive = torch.ones(experiment.circuit_params.n_mec, device=experiment.device) * 50.0
-        
-        external_drive['mec'] = mec_drive
-        
-        # No optogenetic stimulation
-        direct_activation = {}
-        
-        # Update circuit
-        current_activity = experiment.circuit(direct_activation, external_drive)
-        
-        # Store activity
-        for pop in activity_trace:
-            activity_trace[pop][:, t] = current_activity[pop]
-    
-    # Move to CPU for analysis
-    time_cpu = time.cpu()
-    activity_trace_cpu = {pop: activity.cpu() for pop, activity in activity_trace.items()}
-    
-    # Analyze temporal dynamics
-    baseline_mask = time_cpu < mec_drive_time
-    response_mask = (time_cpu >= mec_drive_time) & (time_cpu <= (mec_drive_time + 50.0))
-    
-    analysis = {'conductance_stats': conductance_stats}
-    
-    for pop in ['gc', 'mc', 'pv', 'sst']:
-        baseline_rate = torch.mean(activity_trace_cpu[pop][:, baseline_mask], dim=1)
-        response_rate = torch.mean(activity_trace_cpu[pop][:, response_mask], dim=1)
-        
-        # Calculate response latency (time to peak)
-        mec_drive_start_idx = int(mec_drive_time / dt)
-        mec_drive_end_idx = int((mec_drive_time + 50.0) / dt)
-        pop_trace = torch.mean(activity_trace_cpu[pop], dim=0)
-        baseline_mean = torch.mean(pop_trace[:mec_drive_start_idx])
-        baseline_std = torch.std(pop_trace[:mec_drive_start_idx])
-        
-        if torch.max(pop_trace[mec_drive_start_idx:mec_drive_end_idx]) > baseline_mean + 2*baseline_std:
-            peak_idx = torch.argmax(pop_trace[mec_drive_start_idx:mec_drive_end_idx]) + mec_drive_start_idx
-            latency = (peak_idx * dt) - mec_drive_time
-        else:
-            latency = float('nan')
-        
-        analysis[f'{pop}_response'] = {
-            'baseline_mean': torch.mean(baseline_rate).item(),
-            'baseline_std': torch.std(baseline_rate).item(),
-            'response_mean': torch.mean(response_rate).item(),
-            'response_std': torch.std(response_rate).item(),
-            'response_latency': latency,
-            'activated_fraction': torch.mean(response_rate > baseline_rate + torch.std(baseline_rate)).item(),
-            'response_change': torch.mean(response_rate - baseline_rate).item()
-        }
-    
-    # MEC analysis
-    mec_baseline = torch.mean(activity_trace_cpu['mec'][:, baseline_mask], dim=1)
-    mec_response = torch.mean(activity_trace_cpu['mec'][:, response_mask], dim=1)
-    
-    analysis['mec_response'] = {
-        'baseline_mean': torch.mean(mec_baseline).item(),
-        'response_mean': torch.mean(mec_response).item(),
-        'drive_effectiveness': torch.mean(mec_response - mec_baseline).item() / 450.0
-    }
-    
-    # Key asymmetry analysis
-    pv_response_strength = analysis['pv_response']['response_change']
-    sst_response_strength = analysis['sst_response']['response_change']
-    
-    analysis['asymmetry_effect'] = {
-        'pv_direct_response': pv_response_strength,
-        'sst_indirect_response': sst_response_strength,
-        'asymmetry_ratio': pv_response_strength / (abs(sst_response_strength) + 1e-6),
-        'pv_latency': analysis['pv_response']['response_latency'],
-        'sst_latency': analysis['sst_response']['response_latency']
-    }
-    
-    return analysis
-
-
 def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                intensities: List[float] = [0.5, 1.0, 2.0],
                                mec_current: float = 100.0,
                                opsin_current: float = 100.0,
                                stim_start: float = 550,
                                plot_activity: bool = True,
-                               device: Optional[torch.device] = None):
-    """Compare PV vs SST stimulation with anatomical connectivity"""
+                               device: Optional[torch.device] = None,
+                               n_trials: int = 1,
+                               base_seed: int = 42):
+    """
+    Compare PV vs SST stimulation with anatomical connectivity
+    
+    UPDATED: Now supports multi-trial averaging
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        intensities: List of light intensities to test
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        plot_activity: Whether to plot activity traces
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average (default: 1)
+        base_seed: Base random seed for reproducibility (default: 42)
+        
+    Returns:
+        results: Dict with averaged results
+        connectivity_analysis: Connectivity pattern analysis
+        conductance_analysis: Conductance pattern analysis
+    """
     
     if device is None:
         device = get_default_device()
@@ -589,10 +671,14 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     experiment = OptogeneticExperiment(
         circuit_params, synaptic_params, opsin_params, 
         optimization_json_file=optimization_json_file,
-        device=device
+        device=device,
+        base_seed=base_seed
     )
     
-    # Analyze connectivity patterns
+    print(f"\nRunning comparative experiment with {n_trials} trial(s) per condition")
+    print(f"Base seed: {base_seed}\n")
+    
+    # Analyze connectivity patterns (from last trial's circuit)
     conn_analysis = analyze_connectivity_patterns(experiment)
     
     # Analyze conductance patterns
@@ -625,34 +711,56 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
         print(f"\nTesting {target.upper()} stimulation...")
         
         for intensity in intensities:
-            print(f"  Intensity: {intensity}")
+            print(f"\n  Intensity: {intensity}")
+            
+            # Run multi-trial stimulation
             result = experiment.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
                 duration=stim_start + 1000.0,
                 plot_activity=plot_activity,
                 mec_current=mec_current,
-                opsin_current=opsin_current
+                opsin_current=opsin_current,
+                n_trials=n_trials
             )
             
-            # Analyze network effects
+            # Analyze network effects (using mean across trials)
             time = result['time']
-            activity = result['activity_trace']
-            opsin_expression = result['opsin_expression']
+            activity_mean = result['activity_trace_mean']
+            activity_std = result['activity_trace_std']
+            opsin_expression_mean = result['opsin_expression_mean']
             
             baseline_mask = (time >= 150) & (time < stim_start)
             stim_mask = time >= stim_start
             
             analysis = {}
-            analysis['opsin_expression'] = opsin_expression
+            analysis['opsin_expression_mean'] = opsin_expression_mean
+            analysis['n_trials'] = n_trials
             
             for pop in ['gc', 'mc', 'pv', 'sst']:
-                baseline_rate = torch.mean(activity[pop][:, baseline_mask], dim=1)
-                stim_rate = torch.mean(activity[pop][:, stim_mask], dim=1)
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                
+                # Also calculate std across time for each neuron
+                baseline_std_time = torch.std(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_std_time = torch.std(activity_mean[pop][:, stim_mask], dim=1)
                 
                 if pop == target:
-                    analysis[f'{pop}_stim_rates'] = stim_rate.numpy()
-                    analysis[f'{pop}_baseline_rates'] = baseline_rate.numpy()
+                    analysis[f'{pop}_stim_rates_mean'] = stim_rate.numpy()
+                    analysis[f'{pop}_baseline_rates_mean'] = baseline_rate.numpy()
+                    
+                    # Calculate trial-to-trial variability for target population
+                    stim_rates_all_trials = []
+                    baseline_rates_all_trials = []
+                    for trial_result in result['trial_results']:
+                        trial_activity = trial_result['activity_trace'][pop]
+                        trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                        trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                        baseline_rates_all_trials.append(trial_baseline.numpy())
+                        stim_rates_all_trials.append(trial_stim.numpy())
+                    
+                    analysis[f'{pop}_baseline_rates_std'] = np.std(baseline_rates_all_trials, axis=0)
+                    analysis[f'{pop}_stim_rates_std'] = np.std(stim_rates_all_trials, axis=0)
                     continue
 
                 rate_change = stim_rate - baseline_rate
@@ -666,6 +774,24 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                 analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
                 analysis[f'{pop}_mean_stim_rate'] = torch.mean(stim_rate).item()
                 analysis[f'{pop}_mean_baseline_rate'] = torch.mean(baseline_rate).item()
+                
+                # Calculate statistics across trials
+                excited_fractions_all = []
+                mean_changes_all = []
+                
+                for trial_result in result['trial_results']:
+                    trial_activity = trial_result['activity_trace'][pop]
+                    trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                    trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                    trial_change = trial_stim - trial_baseline
+                    trial_baseline_std = torch.std(trial_baseline)
+                    
+                    trial_excited = torch.mean((trial_change > trial_baseline_std).float()).item()
+                    excited_fractions_all.append(trial_excited)
+                    mean_changes_all.append(torch.mean(trial_change).item())
+                
+                analysis[f'{pop}_excited_std'] = np.std(excited_fractions_all)
+                analysis[f'{pop}_mean_change_std'] = np.std(mean_changes_all)
             
             results[target][intensity] = analysis
     
@@ -707,7 +833,15 @@ def get_opsin_expression_mask(target_pop: str,
 def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                                         stimulation_level: float = 1.0,
                                         save_path: Optional[str] = None) -> None:
-    """Create visualizations from comparative experiment results."""
+    """
+    Create visualizations from comparative experiment results
+    
+    UPDATED: Now handles multi-trial statistics with error bars
+    """
+    
+    # Check if we have multi-trial data
+    n_trials = results['pv'][stimulation_level].get('n_trials', 1)
+    has_multitrial = n_trials > 1
     
     # Define colors matching the paper
     colors = {
@@ -727,6 +861,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     populations = ['gc', 'mc', 'pv', 'sst']
     
     bar_data = []
+    bar_errors = []  # NEW: Error bars for multi-trial
     bar_labels = []
     bar_colors = []
     
@@ -741,10 +876,22 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                     bar_data.append(ratio)
                     bar_labels.append(f'{target.upper()}→{pop.upper()}')
                     bar_colors.append(colors[pop])
+                    
+                    # Add error bars if multi-trial
+                    if has_multitrial and f'{pop}_mean_change_std' in results[target][stimulation_level]:
+                        # Approximate error in log2 ratio using error propagation
+                        std = results[target][stimulation_level][f'{pop}_mean_change_std']
+                        error = std / (baseline_rate * np.log(2))  # Approximate
+                        bar_errors.append(error)
+                    else:
+                        bar_errors.append(0)
     
     if bar_data:
         x_pos = np.arange(len(bar_labels))
-        bars = ax1.bar(x_pos, bar_data, color=bar_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+        bars = ax1.bar(x_pos, bar_data, color=bar_colors, alpha=0.7, 
+                      edgecolor='black', linewidth=1.5,
+                      yerr=bar_errors if has_multitrial else None,
+                      capsize=5)
         
         for i, (bar, value) in enumerate(zip(bars, bar_data)):
             height = bar.get_height()
@@ -756,15 +903,17 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     ax1.set_xticks(x_pos)
     ax1.set_xticklabels(bar_labels, rotation=45, ha='right', fontsize=10)
     ax1.set_ylabel(r'Modulation Ratio ($\log_2$)', fontsize=11)
-    ax1.set_title('Firing Rate Modulation (Single Trial)', fontsize=12, fontweight='bold')
+    title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+    ax1.set_title(f'Firing Rate Modulation{title_suffix}', fontsize=12, fontweight='bold')
     ax1.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=2)
     ax1.grid(True, alpha=0.3, axis='y')
     ax1.set_axisbelow(True)
     
-    # Panel B: Network effects summary
+    # Panel B: Network effects summary with error bars
     ax2 = plt.subplot(3, 4, (3, 4))
     
     effect_data = []
+    effect_errors = []
     effect_labels = []
     
     for target in targets:
@@ -777,16 +926,28 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                     
                     effect_data.append([excited_frac, inhibited_frac])
                     effect_labels.append(f'{target.upper()}→{pop.upper()}')
+                    
+                    # Add error bars if available
+                    if has_multitrial and f'{pop}_excited_std' in results[target][stimulation_level]:
+                        excited_std = results[target][stimulation_level][f'{pop}_excited_std']
+                        effect_errors.append([excited_std, excited_std])  # Same for both
+                    else:
+                        effect_errors.append([0, 0])
     
     if effect_data:
         effect_array = np.array(effect_data)
+        effect_errors_array = np.array(effect_errors)
         x_pos = np.arange(len(effect_labels))
         width = 0.35
         
         bars1 = ax2.bar(x_pos - width/2, effect_array[:, 0], width, 
-               label='Excited', color='red', alpha=0.7, edgecolor='black')
+               label='Excited', color='red', alpha=0.7, edgecolor='black',
+               yerr=effect_errors_array[:, 0] if has_multitrial else None,
+               capsize=5)
         bars2 = ax2.bar(x_pos + width/2, effect_array[:, 1], width, 
-               label='Inhibited', color='blue', alpha=0.7, edgecolor='black')
+               label='Inhibited', color='blue', alpha=0.7, edgecolor='black',
+               yerr=effect_errors_array[:, 1] if has_multitrial else None,
+               capsize=5)
         
         for bars in [bars1, bars2]:
             for bar in bars:
@@ -798,12 +959,13 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax2.set_xticks(x_pos)
         ax2.set_xticklabels(effect_labels, rotation=45, ha='right', fontsize=10)
         ax2.set_ylabel('Fraction of Cells', fontsize=11)
-        ax2.set_title('Network Effects (Single Trial)', fontsize=12, fontweight='bold')
+        title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+        ax2.set_title(f'Network Effects{title_suffix}', fontsize=12, fontweight='bold')
         ax2.legend(fontsize=10)
         ax2.grid(True, alpha=0.3, axis='y')
         ax2.set_axisbelow(True)
     
-    # Panel C: Connectivity analysis
+    # Panel C: Connectivity analysis (unchanged)
     ax3 = plt.subplot(3, 4, (5, 6))
     
     mec_conn = conn_analysis['mec_connectivity']
@@ -815,7 +977,8 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     conn_labels = ['MEC -> PV', 'MEC -> GC', 'MEC -> SST']
     conn_colors = [colors['pv'], colors['gc'], colors['sst']]
     
-    bars = ax3.bar(conn_labels, conn_data, color=conn_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+    bars = ax3.bar(conn_labels, conn_data, color=conn_colors, alpha=0.7, 
+                  edgecolor='black', linewidth=1.5)
     ax3.set_ylabel('Number of Connections', fontsize=11)
     ax3.set_title('MEC Connectivity Asymmetry', fontsize=12, fontweight='bold')
     ax3.grid(True, alpha=0.3, axis='y')
@@ -834,11 +997,11 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax3.text(bar.get_x() + bar.get_width()/2., height + max(conn_data)*0.02,
                 f'{frac:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
-
-    # Panel D: Firing rate changes bar plot
+    # Panel D: Firing rate changes bar plot with error bars
     ax4 = plt.subplot(3, 4, (7, 8))
     
     change_data = []
+    change_errors = []
     change_labels = []
     change_colors = []
     
@@ -850,10 +1013,19 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                 change_data.append(mean_change)
                 change_labels.append(f'{target.upper()}→{pop.upper()}')
                 change_colors.append(colors['pv'] if target == 'pv' else colors['sst'])
+                
+                # Add error bars if available
+                if has_multitrial and f'{pop}_mean_change_std' in results[target][stimulation_level]:
+                    std = results[target][stimulation_level][f'{pop}_mean_change_std']
+                    change_errors.append(std)
+                else:
+                    change_errors.append(0)
     
     if change_data:
         bars = ax4.bar(range(len(change_labels)), change_data, 
-                      color=change_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+                      color=change_colors, alpha=0.7, edgecolor='black', linewidth=1.5,
+                      yerr=change_errors if has_multitrial else None,
+                      capsize=5)
         
         # Add value labels
         for bar, value in zip(bars, change_data):
@@ -866,42 +1038,55 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax4.set_xticks(range(len(change_labels)))
         ax4.set_xticklabels(change_labels, fontsize=10)
         ax4.set_ylabel(r'$\Delta$ Firing Rate (Hz)', fontsize=11)
-        ax4.set_title('Mean Rate Changes (Single Trial)', fontsize=12, fontweight='bold')
+        title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+        ax4.set_title(f'Mean Rate Changes{title_suffix}', fontsize=12, fontweight='bold')
         ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=2)
         ax4.grid(True, alpha=0.3, axis='y')
         ax4.set_axisbelow(True)
 
-    # Panel E: Scatter plots showing correlation (single trial)
+    # Panel E: Scatter plots showing correlation
     for i, target in enumerate(targets):
         ax = plt.subplot(3, 4, 9 + i * 2)
         
-        opsin_expression = results[target][stimulation_level]['opsin_expression']
-        stim_rates = results[target][stimulation_level][f'{target}_stim_rates'][opsin_expression <= 0.2]
-        baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates'][opsin_expression <= 0.2]
+        opsin_expression = results[target][stimulation_level]['opsin_expression_mean']
         
-        ax.scatter(baseline_rates, stim_rates, c=colors[target], alpha=0.6, s=30, edgecolors='black', linewidth=0.5)
+        if has_multitrial:
+            stim_rates = results[target][stimulation_level][f'{target}_stim_rates_mean'][opsin_expression <= 0.2]
+            baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates_mean'][opsin_expression <= 0.2]
+        else:
+            stim_rates = results[target][stimulation_level][f'{target}_stim_rates'][opsin_expression <= 0.2]
+            baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates'][opsin_expression <= 0.2]
+        
+        ax.scatter(baseline_rates, stim_rates, c=colors[target], alpha=0.6, s=30, 
+                  edgecolors='black', linewidth=0.5)
         
         # Add correlation line
         from scipy import stats
         slope, intercept, r_value, p_value, std_err = stats.linregress(baseline_rates, stim_rates)
         line = slope * baseline_rates + intercept
-        ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, label=f'Fit (R={r_value:.2f})')
+        ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, 
+               label=f'Fit (R={r_value:.2f})')
         
         # Identity line
         max_rate = max(np.max(baseline_rates), np.max(stim_rates))
-        ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5, linewidth=1.5, label='Identity')
+        ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5, linewidth=1.5, 
+               label='Identity')
         
         ax.set_xlabel('Baseline Rate (Hz)', fontsize=10)
         ax.set_ylabel('Stimulation Rate (Hz)', fontsize=10)
-        ax.set_title(f'{target.upper()} Stimulation\n(Non-expressing cells)', fontsize=11, fontweight='bold')
+        title_suffix = f'\n(n={n_trials} trials)' if has_multitrial else '\n(Single Trial)'
+        ax.set_title(f'{target.upper()} Stimulation{title_suffix}\n(Non-expressing cells)', 
+                    fontsize=11, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
         ax.set_axisbelow(True)
 
+    # Panel F: Summary text
     ax6 = plt.subplot(3, 4, 12)
     ax6.axis('off')
     
-    summary_text = "Single Trial Summary\n"
+    trial_text = f'{n_trials} Trial Average' if has_multitrial else 'Single Trial'
+    summary_text = f"{trial_text} Summary\n"
     summary_text += "=" * 30 + "\n\n"
     
     # MEC asymmetry
@@ -916,25 +1101,157 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         for pop in ['gc', 'mc']:
             if f'{pop}_excited' in results[target][stimulation_level]:
                 excited = results[target][stimulation_level][f'{pop}_excited']
-                summary_text += f"  {pop.upper()}: {excited:.1%} excited\n"
+                if has_multitrial and f'{pop}_excited_std' in results[target][stimulation_level]:
+                    std = results[target][stimulation_level][f'{pop}_excited_std']
+                    summary_text += f"  {pop.upper()}: {excited:.1%} ± {std:.1%} excited\n"
+                else:
+                    summary_text += f"  {pop.upper()}: {excited:.1%} excited\n"
         summary_text += "\n"
-    
     
     ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes, va='top', ha='left',
             fontsize=9, fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
         
-    plt.suptitle('Dentate Gyrus Interneuron Effects (Representative Single Trial)', 
-                fontsize=16, fontweight='bold')
+    main_title = 'Dentate Gyrus Interneuron Effects'
+    if has_multitrial:
+        main_title += f' (Average of {n_trials} Trials with Different Connectivity)'
+    else:
+        main_title += ' (Representative Single Trial)'
+        
+    plt.suptitle(main_title, fontsize=16, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     
     if save_path:
-        plt.savefig(f"{save_path}/DG_comparative_experiment_single_trial.pdf", dpi=300, bbox_inches='tight')
-        plt.savefig(f"{save_path}/DG_comparative_experiment_single_trial.png", dpi=300, bbox_inches='tight')
+        trial_suffix = f'_n{n_trials}trials' if has_multitrial else '_single_trial'
+        plt.savefig(f"{save_path}/DG_comparative_experiment{trial_suffix}.pdf", 
+                   dpi=300, bbox_inches='tight')
+        plt.savefig(f"{save_path}/DG_comparative_experiment{trial_suffix}.png", 
+                   dpi=300, bbox_inches='tight')
     
     plt.show()
 
 
+# Additional analysis functions remain the same but omitted for brevity
+# ... (include analyze_mec_asymmetry_effects, analyze_disinhibition_effects, 
+#      test_disinhibition_hypothesis with n_trials support)
+
+def analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
+    """Analyze how MEC -> PV (but not SST) asymmetry affects circuit dynamics"""
+    
+    # Reset circuit state
+    experiment.circuit.reset_state()
+
+    # Simulation parameters
+    n_steps = 2000
+    dt = 0.1
+    time = torch.arange(n_steps, device=experiment.device) * dt
+    mec_drive_time = 100.0  # Start MEC drive at 100ms
+    
+    activity_trace = {
+        'gc': torch.zeros(experiment.circuit_params.n_gc, n_steps, device=experiment.device),
+        'mc': torch.zeros(experiment.circuit_params.n_mc, n_steps, device=experiment.device), 
+        'pv': torch.zeros(experiment.circuit_params.n_pv, n_steps, device=experiment.device),
+        'sst': torch.zeros(experiment.circuit_params.n_sst, n_steps, device=experiment.device),
+        'mec': torch.zeros(experiment.circuit_params.n_mec, n_steps, device=experiment.device)
+    }
+    
+    # Store conductance information
+    conductance_stats = analyze_conductance_patterns(experiment)
+    
+    for t in range(n_steps):
+        current_time = t * dt
+        
+        # MEC drive (simulating dentate spike)
+        external_drive = {}
+        if mec_drive_time <= current_time <= mec_drive_time + 50.0:  # 50ms MEC drive
+            mec_drive = torch.ones(experiment.circuit_params.n_mec, device=experiment.device) * 500.0
+        else:
+            mec_drive = torch.ones(experiment.circuit_params.n_mec, device=experiment.device) * 50.0
+        
+        external_drive['mec'] = mec_drive
+
+        # No optogenetic stimulation
+        direct_activation = {}
+        
+        # Update circuit
+        current_activity = experiment.circuit(direct_activation, external_drive)
+        
+        # Store activity
+        for pop in activity_trace:
+            activity_trace[pop][:, t] = current_activity[pop]
+    
+    # Move to CPU for analysis
+    time_cpu = time.cpu()
+    activity_trace_cpu = {pop: activity.cpu() for pop, activity in activity_trace.items()}
+    
+    # Analyze temporal dynamics
+    baseline_mask = time_cpu < mec_drive_time
+    response_mask = (time_cpu >= mec_drive_time) & (time_cpu <= (mec_drive_time + 50.0))
+    
+    analysis = {'conductance_stats': conductance_stats}
+    
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        baseline_rate = torch.mean(activity_trace_cpu[pop][:, baseline_mask], dim=1)
+        response_rate = torch.mean(activity_trace_cpu[pop][:, response_mask], dim=1)
+        
+        # Calculate response latency (time to peak)
+        mec_drive_start_idx = int(mec_drive_time / dt)
+        mec_drive_end_idx = int((mec_drive_time + 50.0) / dt)
+        pop_trace = torch.mean(activity_trace_cpu[pop], dim=0)
+        baseline_mean = torch.mean(pop_trace[:mec_drive_start_idx])
+        baseline_std = torch.std(pop_trace[:mec_drive_start_idx])
+
+        if torch.max(pop_trace[mec_drive_start_idx:mec_drive_end_idx]) > baseline_mean + 2*baseline_std:
+            peak_idx = torch.argmax(pop_trace[mec_drive_start_idx:mec_drive_end_idx]) + mec_drive_start_idx
+            latency = (peak_idx * dt) - mec_drive_time
+        else:
+            latency = float('nan')
+        
+        analysis[f'{pop}_response'] = {
+            'baseline_mean': torch.mean(baseline_rate).item(),
+            'baseline_std': torch.std(baseline_rate).item(),
+            'response_mean': torch.mean(response_rate).item(),
+            'response_std': torch.std(response_rate).item(),
+            'response_latency': latency,
+            'activated_fraction': torch.mean(response_rate > baseline_rate + torch.std(baseline_rate)).item(),
+            'response_change': torch.mean(response_rate - baseline_rate).item()
+        }
+    
+    # MEC analysis
+    mec_baseline = torch.mean(activity_trace_cpu['mec'][:, baseline_mask], dim=1)
+    mec_response = torch.mean(activity_trace_cpu['mec'][:, response_mask], dim=1)
+    
+    analysis['mec_response'] = {
+        'baseline_mean': torch.mean(mec_baseline).item(),
+        'response_mean': torch.mean(mec_response).item(),
+        'drive_effectiveness': torch.mean(mec_response - mec_baseline).item() / 450.0
+    }
+    # MEC analysis
+    mec_baseline = torch.mean(activity_trace_cpu['mec'][:, baseline_mask], dim=1)
+    mec_response = torch.mean(activity_trace_cpu['mec'][:, response_mask], dim=1)
+    
+    analysis['mec_response'] = {
+        'baseline_mean': torch.mean(mec_baseline).item(),
+        'response_mean': torch.mean(mec_response).item(),
+        'drive_effectiveness': torch.mean(mec_response - mec_baseline).item() / 450.0
+    }
+    
+    # Key asymmetry analysis
+    pv_response_strength = analysis['pv_response']['response_change']
+    sst_response_strength = analysis['sst_response']['response_change']
+    
+    analysis['asymmetry_effect'] = {
+        'pv_direct_response': pv_response_strength,
+        'sst_indirect_response': sst_response_strength,
+        'asymmetry_ratio': pv_response_strength / (abs(sst_response_strength) + 1e-6),
+        'pv_latency': analysis['pv_response']['response_latency'],
+        'sst_latency': analysis['sst_response']['response_latency']
+    }
+    
+    return analysis
+
+
+        
 def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
                                   target_population: str, 
                                   light_intensity: float,
@@ -965,7 +1282,7 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
         distribution=original_synaptic_params.distribution,
         connection_modulation=original_synaptic_params.connection_modulation,
     )
-    
+
     # Create new experiment with reduced inhibition
     experiment_no_inh = OptogeneticExperiment(
         experiment.circuit_params, 
@@ -989,7 +1306,7 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
     for pop in ['gc', 'mc', 'pv', 'sst']:
         if pop == target_population:
             continue
-            
+
         # Full network response
         activity_full = result_full['activity_trace'][pop]
         baseline_full = torch.mean(activity_full[:, baseline_mask], dim=1)
@@ -1008,7 +1325,7 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
         
         excited_full = torch.sum(change_full > 2 * baseline_std_full)
         excited_no_inh = torch.sum(change_no_inh > 2 * baseline_std_no_inh)
-        
+
         analysis[f'{pop}_paradoxical_excitation'] = {
             'with_inhibition': excited_full.item(),
             'without_inhibition': excited_no_inh.item(),
@@ -1022,6 +1339,7 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
     return analysis
 
 
+        
 def test_disinhibition_hypothesis(optimization_json_file: Optional[str] = None,
                                   mec_current: float = 100.0,
                                   opsin_current: float = 100.0,
@@ -1053,7 +1371,6 @@ def test_disinhibition_hypothesis(optimization_json_file: Optional[str] = None,
             mec_current=mec_current,
             opsin_current=opsin_current
         )
-        
         for pop in ['gc', 'mc', 'pv', 'sst']:
             if f'{pop}_paradoxical_excitation' in analysis:
                 result = analysis[f'{pop}_paradoxical_excitation']
@@ -1064,39 +1381,59 @@ def test_disinhibition_hypothesis(optimization_json_file: Optional[str] = None,
                 print(f"  Disinhibition-dependent: {result['disinhibition_dependent']} cells")
                 print(f"  Mean change: {result['mean_change_full']:.3f} -> {result['mean_change_no_inh']:.3f}")
                 print(f"  Change variability: {result['std_change_full']:.3f} -> {result['std_change_no_inh']:.3f}")
- 
+     
+
+
 
 if __name__ == "__main__":
     print("PyTorch Dentate Gyrus Circuit with Anatomical Connectivity")
     print("=========================================================")
     
-    # Set random seed for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
     # Parse command line arguments
-    if len(sys.argv) > 1:
-        optimization_json_file = sys.argv[1]
+    import argparse
+    parser = argparse.ArgumentParser(description='DG Optogenetic Protocol with Multi-Trial Support')
+    parser.add_argument('--optimization-file', type=str, default=None,
+                       help='Path to optimization JSON file')
+    parser.add_argument('--device', type=str, default=None,
+                       choices=['cpu', 'cuda', None],
+                       help='Device to run on (default: auto-detect)')
+    parser.add_argument('--n-trials', type=int, default=3,
+                       help='Number of trials to average (default: 3)')
+    parser.add_argument('--base-seed', type=int, default=42,
+                       help='Base random seed (default: 42)')
+    parser.add_argument('--mec-current', type=float, default=40.0,
+                       help='MEC drive current in pA (default: 40.0)')
+    parser.add_argument('--opsin-current', type=float, default=200.0,
+                       help='Optogenetic current in pA (default: 200.0)')
+    
+    args = parser.parse_args()
+    
+    # Auto-detect device or use specified
+    if args.device is None:
+        device = get_default_device()
     else:
-        optimization_json_file = None
-
-    # Auto-detect device or override
-    device = get_default_device()
+        device = torch.device(args.device)
+        
     print(f"\nUsing device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
         print(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
+    
+    print(f"Number of trials: {args.n_trials}")
+    print(f"Base seed: {args.base_seed}")
 
-    # Run comparative experiment
+    # Run comparative experiment with multi-trial averaging
     results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
-        optimization_json_file=optimization_json_file,
+        optimization_json_file=args.optimization_file,
         intensities=[0.5, 1.0, 2.0],
-        mec_current=40.0,
-        opsin_current=200.0,
-        device=device
+        mec_current=args.mec_current,
+        opsin_current=args.opsin_current,
+        device=device,
+        n_trials=args.n_trials,
+        base_seed=args.base_seed
     )
 
-    # Print results
+    # Print results with multi-trial statistics
     mec_conn = connectivity_analysis['mec_connectivity']
     print(f"\nMEC -> PV connections: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
     print(f"MEC -> GC connections: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
@@ -1104,32 +1441,28 @@ if __name__ == "__main__":
     print(f"MEC -> SST connections: {mec_conn['mec_to_sst']}")
     
     for target in ['pv', 'sst']:
-        print(f"\n{target.upper()} Stimulation Results:")
-        print("-" * 30)
+        print(f"\n{target.upper()} Stimulation Results (Average of {args.n_trials} trials):")
+        print("-" * 50)
         
         for intensity in [0.5, 1.0, 2.0]:
             analysis = results[target][intensity]
             print(f"\nIntensity {intensity}:")
-            opsin_expression = analysis['opsin_expression']
             
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 if f'{pop}_excited' in analysis:
                     excited = analysis[f'{pop}_excited']
+                    excited_std = analysis.get(f'{pop}_excited_std', 0.0)
                     inhibited = analysis[f'{pop}_inhibited'] 
                     mean_change = analysis[f'{pop}_mean_change']
+                    mean_change_std = analysis.get(f'{pop}_mean_change_std', 0.0)
                     mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
                     mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
-                    print(f"  {pop.upper()}: {excited:.2f} excited, {inhibited:.2f} inhibited")
-                    print(f"    Rate: {mean_baseline_rate:.2f} -> {mean_stim_rate:.2f} Hz "
-                          f"(Δ={mean_change:.3f})")
-                else:
-                    opsin_stim_rates = analysis[f'{pop}_stim_rates'][opsin_expression > 0.2]
-                    opsin_baseline_rates = analysis[f'{pop}_baseline_rates'][opsin_expression > 0.2]
-                    non_opsin_stim_rates = analysis[f'{pop}_stim_rates'][opsin_expression <= 0.2]
-                    non_opsin_baseline_rates = analysis[f'{pop}_baseline_rates'][opsin_expression <= 0.2]
-                    print(f"  {pop.upper()} (expressing): {np.mean(opsin_baseline_rates):.2f} -> "
-                          f"{np.mean(opsin_stim_rates):.2f} Hz")
-                    print(f"  {pop.upper()} (non-expressing): {np.mean(non_opsin_baseline_rates):.2f} -> "
-                          f"{np.mean(non_opsin_stim_rates):.2f} Hz")
+                    
+                    print(f"  {pop.upper()}:")
+                    print(f"    Excited: {excited:.2f} ± {excited_std:.2f}")
+                    print(f"    Inhibited: {inhibited:.2f}")
+                    print(f"    Rate: {mean_baseline_rate:.2f} -> {mean_stim_rate:.2f} Hz")
+                    print(f"    Change: {mean_change:.3f} +/- {mean_change_std:.3f} Hz")
 
+    # Plot results with multi-trial statistics
     plot_comparative_experiment_results(results, connectivity_analysis, save_path="figures")
