@@ -82,6 +82,227 @@ class StatisticalResults:
     interpretation: str
 
 
+# ============================================================================
+# Module-level worker function for multiprocessing
+# ============================================================================
+
+def _worker_run_single_trial(trial_args: Tuple) -> Tuple[int, str, Optional[Dict]]:
+    """
+    Module-level worker function for parallel trial execution
+    
+    This must be at module level (not a class method) for proper multiprocessing
+    pickling. Recreates the experiment from scratch in each worker process.
+    
+    Args:
+        trial_args: Tuple of all necessary parameters
+        
+    Returns:
+        Tuple of (trial_idx, condition_name, trial_result or None)
+    """
+    (trial_idx, target_population, light_intensity, condition_name,
+     condition_params, trial_seed, mec_current, opsin_current,
+     duration, stim_start, circuit_params_dict, synaptic_params_dict, 
+     opsin_params_dict, optimization_json_file) = trial_args
+    
+    try:
+        # Force CPU usage and prevent nested parallelism
+        import torch
+        torch.set_num_threads(1)
+        
+        # Set random seed for this trial
+        torch.manual_seed(trial_seed)
+        np.random.seed(trial_seed)
+        
+        # Recreate circuit parameters from dicts
+        circuit_params = CircuitParams()
+        
+        # Recreate base synaptic parameters
+        base_synaptic_params = PerConnectionSynapticParams(
+            ampa_g_mean=synaptic_params_dict['ampa_g_mean'],
+            ampa_g_std=synaptic_params_dict['ampa_g_std'],
+            ampa_g_min=synaptic_params_dict['ampa_g_min'],
+            ampa_g_max=synaptic_params_dict['ampa_g_max'],
+            gaba_g_mean=synaptic_params_dict['gaba_g_mean'],
+            gaba_g_std=synaptic_params_dict['gaba_g_std'],
+            gaba_g_min=synaptic_params_dict['gaba_g_min'],
+            gaba_g_max=synaptic_params_dict['gaba_g_max'],
+            distribution=synaptic_params_dict['distribution'],
+            connection_modulation=synaptic_params_dict['connection_modulation'].copy()
+        )
+        
+        # Apply condition modifications to synaptic parameters
+        modified_params = PerConnectionSynapticParams(
+            ampa_g_mean=base_synaptic_params.ampa_g_mean,
+            ampa_g_std=base_synaptic_params.ampa_g_std,
+            ampa_g_min=base_synaptic_params.ampa_g_min,
+            ampa_g_max=base_synaptic_params.ampa_g_max,
+            gaba_g_mean=base_synaptic_params.gaba_g_mean,
+            gaba_g_std=base_synaptic_params.gaba_g_std,
+            gaba_g_min=base_synaptic_params.gaba_g_min,
+            gaba_g_max=base_synaptic_params.gaba_g_max,
+            distribution=base_synaptic_params.distribution,
+            connection_modulation=base_synaptic_params.connection_modulation.copy()
+        )
+        
+        # Apply condition-specific modifications
+        if 'inhibition_scale' in condition_params:
+            scale = condition_params['inhibition_scale']
+            modified_params.gaba_g_mean *= scale
+            modified_params.gaba_g_std *= scale
+            modified_params.gaba_g_min *= scale
+            modified_params.gaba_g_max *= scale
+        
+        if 'excitation_scale' in condition_params:
+            scale = condition_params['excitation_scale']
+            modified_params.ampa_g_mean *= scale
+            modified_params.ampa_g_std *= scale
+            modified_params.ampa_g_min *= scale
+            modified_params.ampa_g_max *= scale
+        
+        if 'pv_inhibition_scale' in condition_params:
+            scale = condition_params['pv_inhibition_scale']
+            for conn in ['pv_gc', 'pv_mc', 'pv_pv', 'pv_sst']:
+                if conn in modified_params.connection_modulation:
+                    modified_params.connection_modulation[conn] *= scale
+        
+        if 'sst_inhibition_scale' in condition_params:
+            scale = condition_params['sst_inhibition_scale']
+            for conn in ['sst_gc', 'sst_mc', 'sst_pv', 'sst_sst']:
+                if conn in modified_params.connection_modulation:
+                    modified_params.connection_modulation[conn] *= scale
+        
+        if 'connection_modulation' in condition_params:
+            for conn, scale in condition_params['connection_modulation'].items():
+                if conn in modified_params.connection_modulation:
+                    modified_params.connection_modulation[conn] *= scale
+        
+        # Recreate opsin parameters
+        opsin_params = OpsinParams()
+        
+        # Create experiment
+        experiment = OptogeneticExperiment(
+            circuit_params,
+            modified_params,
+            opsin_params,
+            base_seed=trial_seed,
+            optimization_json_file=optimization_json_file
+        )
+        
+        # Check for no stimulation condition
+        if condition_params.get('no_stimulation', False):
+            light_intensity = 0.0
+            opsin_current = 0.0
+        
+        # Run simulation
+        result = experiment.simulate_stimulation(
+            target_population,
+            light_intensity,
+            duration=duration,
+            stim_start=stim_start,
+            mec_current=mec_current,
+            opsin_current=opsin_current,
+            plot_activity=False
+        )
+        
+        # Analyze trial results (inline to avoid method call issues)
+        print(f"result keys: {list(result.keys())}")
+        time = result['time']
+        activity = result['activity_trace_mean']
+        opsin_expression = result['opsin_expression_mean']
+        
+        # Define time windows
+        baseline_mask = (time >= 150) & (time < stim_start)
+        stim_mask = time >= stim_start
+        
+        trial_metrics = {
+            'opsin_expression_mean': torch.mean(opsin_expression).item(),
+            'opsin_expression_fraction': torch.mean((opsin_expression > 0.1).float()).item()
+        }
+        
+        # Helper function for Gini coefficient
+        def calculate_gini(rates_tensor):
+            rates_np = rates_tensor.detach().cpu().numpy()
+            rates_sorted = np.sort(rates_np)
+            n = len(rates_sorted)
+            if n == 0 or np.sum(rates_sorted) == 0:
+                return 0.0
+            cumsum = np.cumsum(rates_sorted)
+            gini = (2 * np.sum((np.arange(1, n + 1) * rates_sorted))) / (n * np.sum(rates_sorted)) - (n + 1) / n
+            return float(gini)
+        
+        # Analyze each population
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            if pop == target_population:
+                # For stimulated population, analyze opsin vs non-opsin cells
+                expressing_mask = opsin_expression > 0.2
+                non_expressing_mask = opsin_expression <= 0.2
+                
+                pop_activity = activity[pop]
+                baseline_rate = torch.mean(pop_activity[:, baseline_mask], dim=1)
+                stim_rate = torch.mean(pop_activity[:, stim_mask], dim=1)
+                
+                if torch.sum(expressing_mask) > 0:
+                    trial_metrics[f'{pop}_opsin_baseline_mean'] = torch.mean(baseline_rate[expressing_mask]).item()
+                    trial_metrics[f'{pop}_opsin_stim_mean'] = torch.mean(stim_rate[expressing_mask]).item()
+                
+                if torch.sum(non_expressing_mask) > 0:
+                    non_expr_baseline = baseline_rate[non_expressing_mask]
+                    non_expr_stim = stim_rate[non_expressing_mask]
+                    rate_change = non_expr_stim - non_expr_baseline
+                    
+                    trial_metrics[f'{pop}_non_opsin_baseline_mean'] = torch.mean(non_expr_baseline).item()
+                    trial_metrics[f'{pop}_non_opsin_stim_mean'] = torch.mean(non_expr_stim).item()
+                    trial_metrics[f'{pop}_non_opsin_change_mean'] = torch.mean(rate_change).item()
+                
+                continue
+            
+            # For non-stimulated populations
+            pop_activity = activity[pop]
+            baseline_rate = torch.mean(pop_activity[:, baseline_mask], dim=1)
+            stim_rate = torch.mean(pop_activity[:, stim_mask], dim=1)
+            rate_change = stim_rate - baseline_rate
+            
+            baseline_mean = torch.mean(baseline_rate)
+            baseline_std = torch.std(baseline_rate)
+            
+            paradoxically_excited = rate_change > baseline_std
+            paradoxically_inhibited = rate_change < -baseline_std
+            
+            trial_metrics[f'{pop}_paradoxical_fraction'] = torch.mean(paradoxically_excited.float()).item()
+            trial_metrics[f'{pop}_inhibited_fraction'] = torch.mean(paradoxically_inhibited.float()).item()
+            trial_metrics[f'{pop}_mean_baseline'] = baseline_mean.item()
+            trial_metrics[f'{pop}_std_baseline'] = baseline_std.item()
+            trial_metrics[f'{pop}_mean_stim'] = torch.mean(stim_rate).item()
+            trial_metrics[f'{pop}_mean_rate_change'] = torch.mean(rate_change).item()
+            trial_metrics[f'{pop}_std_rate_change'] = torch.std(rate_change).item()
+            
+            gini_baseline = calculate_gini(baseline_rate)
+            gini_stim = calculate_gini(stim_rate)
+            trial_metrics[f'{pop}_gini_baseline'] = gini_baseline
+            trial_metrics[f'{pop}_gini_stim'] = gini_stim
+            trial_metrics[f'{pop}_gini_change'] = gini_stim - gini_baseline
+        
+        # Network metrics
+        trial_metrics['network_total_paradoxical'] = sum(
+            trial_metrics.get(f'{pop}_paradoxical_fraction', 0) 
+            for pop in ['gc', 'mc', 'pv', 'sst'] 
+            if pop != target_population
+        )
+        
+        return (trial_idx, condition_name, trial_metrics)
+        
+    except Exception as e:
+        import traceback
+        print(f"    Warning: Trial {trial_idx} in {condition_name} failed: {e}")
+        traceback.print_exc()
+        return (trial_idx, condition_name, None)
+
+
+# ============================================================================
+# DisinhibitionHypothesisTester Class
+# ============================================================================
+
+
 class DisinhibitionHypothesisTester:
     """
     Statistical testing framework for disinhibition hypothesis
@@ -217,6 +438,7 @@ class DisinhibitionHypothesisTester:
             self.circuit_params,
             trial_synaptic_params,
             self.opsin_params,
+            base_seed=trial_seed,
             optimization_json_file=self.optimization_json_file
         )
         
@@ -252,16 +474,22 @@ class DisinhibitionHypothesisTester:
                             stim_start: float = 550.0,
                             device: Optional[torch.device] = None) -> List[Dict]:
         """
-        Run multiple trials in parallel on GPU using batch circuit
+        Run multiple trials on GPU (processed sequentially due to connectivity differences)
         
-        Each batch element represents a different trial with different connectivity seed
+        NOTE: Despite the name, this does NOT batch trials in parallel. Each trial requires
+        different connectivity (different seed), and BatchDentateCircuit shares connectivity
+        across its batch dimension. The speedup comes from GPU-accelerated operations within
+        each trial, not from parallel trial processing.
+        
+        Each batch element represents a different trial with different connectivity seed.
+        Trials are processed sequentially to allow different connectivity per trial.
         
         Args:
             target_population: 'pv' or 'sst'
             light_intensity: Optogenetic stimulation intensity
             condition_params: Pharmacological condition parameters
-            batch_size: Number of trials to run in parallel
-            starting_seed: Starting seed for batch
+            batch_size: Number of trials to process (processed sequentially, not batched)
+            starting_seed: Starting seed for this batch
             mec_current: MEC drive current (pA)
             opsin_current: Direct opsin activation current (pA)
             duration: Total simulation duration (ms)
@@ -286,18 +514,22 @@ class DisinhibitionHypothesisTester:
         # Storage for batch results
         batch_trial_metrics = []
         
-        # Run each trial with different seed - circuits must be recreated
-        # Note: We can't batch across different seeds in the connectivity generation
-        # So we'll batch the time evolution for each seed sequentially
+        # IMPORTANT: We must create separate circuits for each trial because each needs
+        # different connectivity (different seed). The BatchDentateCircuit's batch dimension
+        # is designed for different parameters with SAME connectivity, not different
+        # connectivity realizations.
+        #
+        # GPU speedup comes from fast matrix operations within each trial, not from
+        # parallel processing of trials.
         for trial_idx in range(batch_size):
             trial_seed = starting_seed + trial_idx
             
-            # Set seed for this trial
+            # Set seed for this trial - this affects connectivity generation
             torch.manual_seed(trial_seed)
             np.random.seed(trial_seed)
             
-            # Create batch circuit with batch_size=1 for this single trial
-            # This allows us to use the GPU for the time evolution
+            # Create circuit with batch_size=1 for this single trial
+            # This uses GPU for efficient time evolution
             circuit = BatchDentateCircuit(
                 batch_size=1,
                 circuit_params=self.circuit_params,
@@ -367,10 +599,11 @@ class DisinhibitionHypothesisTester:
                         # Store activity: [1, n_neurons] -> [n_neurons]
                         activities_time_series[pop].append(activities[pop].squeeze(0))
             
-            # Convert to tensors: [time, n_neurons]
+            # Convert to tensors: [time, n_neurons] -> transpose to [n_neurons, time]
             for pop in activities_time_series:
                 if len(activities_time_series[pop]) > 0:
-                    activities_time_series[pop] = torch.stack(activities_time_series[pop], dim=0)
+                    # Stack to [time, n_neurons] then transpose to [n_neurons, time]
+                    activities_time_series[pop] = torch.stack(activities_time_series[pop], dim=0).T
             
             # Create result dict similar to OptogeneticExperiment output
             result = {
@@ -390,44 +623,6 @@ class DisinhibitionHypothesisTester:
         
         return batch_trial_metrics
 
-    def _run_trial_worker(self, trial_args: Tuple) -> Tuple[int, str, Optional[Dict]]:
-        """
-        Worker function for parallel trial execution
-        
-        Args:
-            trial_args: Tuple of (trial_idx, target_population, light_intensity, 
-                                  condition_params, trial_seed, mec_current, opsin_current,
-                                  duration, stim_start)
-        
-        Returns:
-            Tuple of (trial_idx, condition_name, trial_result or None)
-        """
-        (trial_idx, target_population, light_intensity, condition_name,
-         condition_params, trial_seed, mec_current, opsin_current,
-         duration, stim_start) = trial_args
-        
-        try:
-            # Force CPU usage for multiprocessing (GPU doesn't work well with fork)
-            import torch
-            torch.set_num_threads(1)  # Prevent nested parallelism
-
-            trial_result = self.run_single_trial(
-                target_population,
-                light_intensity,
-                condition_params,
-                trial_seed,
-                mec_current=mec_current,
-                opsin_current=opsin_current,
-                duration=duration,
-                stim_start=stim_start
-            )
-            return (trial_idx, condition_name, trial_result)
-            
-        except Exception as e:
-            print(f"    Warning: Trial {trial_idx} failed: {e}")
-            return (trial_idx, condition_name, None)
-
-    
     def _analyze_single_trial(self, 
                              simulation_result: Dict,
                              target_population: str,
@@ -543,9 +738,22 @@ class DisinhibitionHypothesisTester:
         Run Monte Carlo analysis with multiple independent trials
         
         Automatically selects best evaluation strategy:
-        - GPU: Batch evaluation with sequential batches (different connectivity per trial)
-        - CPU with multiprocessing: Parallel process pool
+        - GPU: Sequential trial processing on GPU (fast matrix ops per trial)
+        - CPU with multiprocessing: Parallel process pool across trials
         - CPU sequential: Simple loop
+        
+        NOTE ON GPU BATCHING:
+        The gpu_batch_size parameter controls how many trials are processed together
+        before cleaning up GPU memory, NOT parallel batch processing. Each trial
+        requires different connectivity (different random seed), and BatchDentateCircuit
+        shares connectivity across its batch dimension. Therefore, trials must be
+        processed sequentially.
+        
+        GPU speedup comes from:
+        1. Fast GPU matrix operations within each trial's time evolution
+        2. NOT from parallel processing of multiple trials
+        
+        For true parallel trial processing, use CPU multiprocessing instead.
         
         Args:
             target_population: 'pv' or 'sst'
@@ -555,7 +763,7 @@ class DisinhibitionHypothesisTester:
             n_workers: Number of parallel processes (for CPU multiprocessing)
             use_multiprocessing: Whether to use parallel processing (CPU only)
             device: Device to use (None = auto-detect)
-            gpu_batch_size: Batch size for GPU evaluation (trials per batch)
+            gpu_batch_size: Number of trials per memory cleanup cycle (NOT parallel batch size)
         
         Returns:
             Dictionary with raw results and statistical analysis
@@ -569,8 +777,12 @@ class DisinhibitionHypothesisTester:
         
         print(f"\nRunning Monte Carlo analysis: {self.n_trials} trials for {target_population.upper()} stimulation")
         if use_gpu:
-            print(f"Using GPU batch evaluation (batch_size={gpu_batch_size})")
-            print(f"Device: {torch.cuda.get_device_name(device)}")
+            print(f"Using GPU for fast matrix operations (trials processed sequentially)")
+            print(f"  Memory cleanup every {gpu_batch_size} trials")
+            print(f"  Device: {torch.cuda.get_device_name(device)}")
+            print(f"  Note: Trials require different connectivity (different seeds),")
+            print(f"        so cannot be batched in parallel. Use CPU multiprocessing")
+            print(f"        for true parallel trial processing.")
         elif use_multiprocessing:
             if n_workers is None:
                 n_workers = max(1, mp.cpu_count() - 1)
@@ -699,7 +911,26 @@ class DisinhibitionHypothesisTester:
             
         # CPU MULTIPROCESSING EVALUATION
         elif use_multiprocessing:
-            # Parallel execution
+            # Parallel execution using module-level worker function
+            
+            # Prepare parameter dicts for serialization
+            circuit_params_dict = {}  # CircuitParams uses defaults
+            
+            synaptic_params_dict = {
+                'ampa_g_mean': self.synaptic_params.ampa_g_mean,
+                'ampa_g_std': self.synaptic_params.ampa_g_std,
+                'ampa_g_min': self.synaptic_params.ampa_g_min,
+                'ampa_g_max': self.synaptic_params.ampa_g_max,
+                'gaba_g_mean': self.synaptic_params.gaba_g_mean,
+                'gaba_g_std': self.synaptic_params.gaba_g_std,
+                'gaba_g_min': self.synaptic_params.gaba_g_min,
+                'gaba_g_max': self.synaptic_params.gaba_g_max,
+                'distribution': self.synaptic_params.distribution,
+                'connection_modulation': self.synaptic_params.connection_modulation.copy()
+            }
+            
+            opsin_params_dict = {}  # OpsinParams uses defaults
+            
             all_trial_args = []
             for condition, params in conditions.items():
                 for trial in range(self.n_trials):
@@ -714,17 +945,21 @@ class DisinhibitionHypothesisTester:
                         mec_current,
                         opsin_current,
                         1550.0,  # duration
-                        550.0    # stim_start
+                        550.0,   # stim_start
+                        circuit_params_dict,
+                        synaptic_params_dict,
+                        opsin_params_dict,
+                        self.optimization_json_file
                     )
                     all_trial_args.append(trial_args)
             
-            # Run trials in parallel
+            # Run trials in parallel using module-level worker
             print(f"\nRunning {len(all_trial_args)} total trials across {len(conditions)} conditions...")
             
             with mp.Pool(processes=n_workers) as pool:
                 # Use imap_unordered for progress tracking
                 trial_results = list(tqdm.tqdm(
-                    pool.imap_unordered(self._run_trial_worker, all_trial_args),
+                    pool.imap_unordered(_worker_run_single_trial, all_trial_args),
                     total=len(all_trial_args),
                     desc="Processing trials"
                 ))
@@ -3246,7 +3481,7 @@ def plot_violin_primary_comparison(ax, raw_results, populations, colors, target_
             labels.extend([f'{pop.upper()}\nFull', f'{pop.upper()}\nBlocked\nExc->Int'])
             plot_colors.extend([colors[pop], '#CCCCCC'])
     
-    # ✓ Check if we have any valid data
+    # Check if we have any valid data
     if not violin_data or len(violin_data) == 0:
         ax.text(0.5, 0.5, 'No valid data for comparison', 
                 transform=ax.transAxes, ha='center', va='center')
@@ -3823,7 +4058,8 @@ def run_statistical_analysis(
     device: Optional[str] = None,
     gpu_batch_size: int = 8,
     optimization_json_file: str = None,
-    output_dir: str = "./statistical_results"):
+    output_dir: str = "./statistical_results",
+    show_plots: bool = False):
     """
     Run statistical analysis for both PV and SST stimulation
     
@@ -3838,6 +4074,7 @@ def run_statistical_analysis(
         gpu_batch_size: Batch size for GPU evaluation (trials per batch)
         optimization_json_file: Path to optimization results (optional)
         output_dir: Directory for saving results
+        show_plots: Whether to display plots (default: False, only save to files)
     """
     
     print("=" * 80)
@@ -3906,12 +4143,34 @@ def run_statistical_analysis(
         # Save results
         tester.save_results(mc_results, validation_results, output_dir=str(output_path))
         
-        # Create plots (implementations preserved from original)
+        # Create plots
         print("\nGenerating statistical analysis plots...")
-        # plot_monte_carlo_results(mc_results, validation_results, ...)
-        # plot_disinhibition_test_results(mc_results, ...)
-        # plot_paradoxical_excitation_violins(mc_results, ...)
-        # create_violin_plots(mc_results, validation_results, ...)
+        
+        # Generate comprehensive Monte Carlo results visualization
+        print(f"  - Monte Carlo results plot...")
+        plot_monte_carlo_results(
+            mc_results, 
+            validation_results, 
+            output_dir=str(output_path),
+            show_plots=show_plots
+        )
+        
+        # Generate mechanistic dissection plots
+        print(f"  - Disinhibition test results plot...")
+        plot_disinhibition_test_results(
+            mc_results, 
+            output_dir=str(output_path),
+            show_plots=show_plots
+        )
+        
+        # Generate detailed violin plots
+        print(f"  - Detailed violin plots...")
+        create_violin_plots(
+            mc_results, 
+            validation_results, 
+            output_dir=str(output_path),
+            show_plots=show_plots
+        )
         
         all_results[target] = {
             'mc_results': mc_results,
@@ -3920,8 +4179,13 @@ def run_statistical_analysis(
         }
 
     if 'pv' in all_results and 'sst' in all_results:
-        print("\nGenerating overall statistical validity summary plot...")
-        # plot_statistical_validity_summary(all_results['pv']['mc_results'], ...)
+        print("\nGenerating cross-comparison plot (PV vs SST)...")
+        plot_statistical_validity_summary(
+            all_results['pv']['mc_results'], 
+            all_results['sst']['mc_results'],
+            output_dir=str(output_path),
+            show_plots=show_plots
+        )
         
     print("\n" + "=" * 80)
     print(f"Analysis complete. Results saved to: {output_path}")
@@ -3955,6 +4219,8 @@ if __name__ == "__main__":
                        help='Output directory (default: ./statistical_results)')
     parser.add_argument('--targets', nargs='+', default=['sst', 'pv'],
                        help='Target populations to test (default: sst pv)')
+    parser.add_argument('--show-plots', action='store_true',
+                       help='Display plots interactively (default: False, only save to files)')
     
     args = parser.parse_args()
     
@@ -3970,6 +4236,7 @@ if __name__ == "__main__":
     print(f"  MEC current: {args.mec_current} pA")
     print(f"  Opsin current: {args.opsin_current} pA")
     print(f"  Target populations: {args.targets}")
+    print(f"  Show plots: {args.show_plots}")
     
     if args.optimization_file:
         print(f"  Using optimization results: {args.optimization_file}")
@@ -3985,5 +4252,6 @@ if __name__ == "__main__":
         device=args.device,
         gpu_batch_size=args.gpu_batch_size,
         optimization_json_file=args.optimization_file,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        show_plots=args.show_plots
     )

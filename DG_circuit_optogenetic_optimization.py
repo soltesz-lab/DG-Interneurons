@@ -983,117 +983,93 @@ class OptogeneticCircuitOptimizer:
             raise NotImplementedError("Gradient-based optimization not yet implemented for optogenetics")
         else:
             raise ValueError(f"Unknown method: {method}")
-    
+
     def _optimize_particle_swarm(self, connection_names, n_particles=32, max_iterations=50,
                                  n_workers=None, n_threads_per_worker=1,
-                                 diagnostic_frequency=5):
-        """Particle swarm optimization with automatic strategy"""
+                                 diagnostic_frequency=5, pso_config=None):
+        """Particle swarm optimization using Adaptive PSO."""
+        import numpy as np
+        from adaptive_pso import AdaptivePSO, PSOConfig
+
+        # Select evaluation strategy
         strategy = self._select_strategy('particle_swarm',
                                          n_workers=n_workers,
                                          n_threads_per_worker=n_threads_per_worker)
-        
-        n_dimensions = len(connection_names)
+
+        # Setup bounds
         bounds = [self.targets.connection_bounds.get(name, (0.1, 5.0))
-                 for name in connection_names]
-        
-        print(f"Starting Particle Swarm Optimization...")
-        print(f"Particles: {n_particles}")
-        print(f"Iterations: {max_iterations}")
-        print(f"Trials per evaluation: {self.config.n_trials}")
-        
-        # Initialize
-        lower_bounds = np.array([b[0] for b in bounds])
-        upper_bounds = np.array([b[1] for b in bounds])
-        
-        positions = np.random.uniform(lower_bounds, upper_bounds, (n_particles, n_dimensions))
-        velocities = np.random.randn(n_particles, n_dimensions) * 0.1
-        
-        personal_best_positions = positions.copy()
-        personal_best_scores = np.full(n_particles, float('inf'))
-        global_best_position = None
-        global_best_score = float('inf')
-        
-        # PSO parameters
-        w_max, w_min, w = 0.9, 0.2, 0.9
-        
-        n_new_bests = 0
-        previous_best = float('inf')
-        no_improvement = 0
-        
-        for iteration in range(max_iterations):
-            print(f"\nPSO Iteration {iteration+1}/{max_iterations}")
-            c1, c2 = np.random.uniform(1.5, 2.5), np.random.uniform(1.5, 2.5)
-            
-            # Convert positions to parameter dicts
-            parameter_sets = []
-            for i in range(n_particles):
-                param_dict = dict(zip(connection_names, positions[i]))
-                parameter_sets.append(param_dict)
-            
-            # Evaluate all particles
+                  for name in connection_names]
+
+        # Create objective function wrapper
+        def objective_function(positions: np.ndarray) -> np.ndarray:
+            """Evaluate batch of parameter configurations."""
+            parameter_sets = [dict(zip(connection_names, pos)) for pos in positions]
             mec_drive = self.config.mec_drive_levels[0]
-            losses, _ = strategy.evaluate_batch(
-                parameter_sets, mec_drive, self.config.n_trials
-            )
-            losses = np.array(losses)
-            
-            # Update personal bests
-            improved = losses < personal_best_scores
-            personal_best_scores[improved] = losses[improved]
-            personal_best_positions[improved] = positions[improved]
-            
-            # Update global best
-            min_idx = np.argmin(losses)
-            if losses[min_idx] < global_best_score:
-                global_best_score = losses[min_idx]
-                global_best_position = positions[min_idx].copy()
-                self.best_params = dict(zip(connection_names, global_best_position))
-                print(f"\n  New best: {global_best_score:.6f}")
-                
-                if n_new_bests % diagnostic_frequency == 0:
-                    self._print_diagnostics(global_best_position, global_best_score, connection_names)
-                
-                n_new_bests += 1
-            
-            # Adapt inertia
-            improvement = previous_best - global_best_score
-            if improvement > 0.1:
-                w = min(w + 0.05, w_max)
-                no_improvement = 0
-            else:
-                w = max(w - 0.2 * w, w_min)
-                no_improvement += 1
-            
-            previous_best = global_best_score
-            
-            if no_improvement > 3:
-                w = w_max
-                no_improvement = 0
-            
-            # Update particles
-            for i in range(n_particles):
-                r1, r2 = np.random.random(n_dimensions), np.random.random(n_dimensions)
-                cognitive = c1 * r1 * (personal_best_positions[i] - positions[i])
-                social = c2 * r2 * (global_best_position - positions[i])
-                velocities[i] = w * velocities[i] + cognitive + social
-                positions[i] = np.clip(positions[i] + velocities[i], lower_bounds, upper_bounds)
-            
-            self.history['loss'].append(global_best_score)
-            self.history['parameters'].append(self.best_params.copy())
-        
-        print("\nFinal diagnostics:")
-        self._print_diagnostics(global_best_position, global_best_score, connection_names)
-        
-        self.best_loss = global_best_score
-        
+            losses, _ = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials)
+            return np.array(losses)
+
+        # Configure PSO
+        pso_params = {
+            'n_particles': n_particles,
+            'max_iterations': max_iterations,
+            'diagnostic_frequency': diagnostic_frequency,
+            'verbose': True
+        }
+        if pso_config is not None:
+            pso_params.update(pso_config)
+
+        config = PSOConfig(**pso_params)
+
+        # Print header
+        print(f"\n{'='*80}")
+        print(f"Circuit Optimization using Adaptive PSO")
+        print(f"{'='*80}")
+        print(f"Strategy: {strategy.get_strategy_info()['name']}")
+        print(f"Device: {self.device}, Seed: {self.base_seed}")
+        print(f"Particles: {config.n_particles}, Iterations: {config.max_iterations}")
+        print(f"OBL: {config.use_obl_initialization}, Adaptive: {config.use_adaptive_parameters}")
+        print(f"Multi-Swarm: {config.use_multi_swarm}")
+        if config.use_multi_swarm:
+            print(f"  Sub-swarms: {config.n_sub_swarms}, Regrouping: {config.regrouping_period}")
+        print(f"{'='*80}\n")
+
+        # Run PSO
+        pso = AdaptivePSO(objective_function, bounds, config, random_seed=self.base_seed)
+        result = pso.optimize()
+
+        # Convert results
+        self.best_params = dict(zip(connection_names, result.best_position))
+        self.best_loss = result.best_score
+        self.history['loss'] = result.history['best_scores']
+        self.history['parameters'] = [
+            dict(zip(connection_names, result.best_position))
+            for _ in range(len(result.history['best_scores']))
+        ]
+
+        # Print final diagnostics
+        print(f"\n{'='*80}")
+        print("Circuit optimization results")
+        print(f"{'='*80}")
+        self._print_diagnostics(result.best_position, result.best_loss, connection_names)
+        print(f"\nPSO Statistics:")
+        print(f"  Total evaluations: {result.n_evaluations}")
+        print(f"  New bests found: {result.n_new_bests}")
+        print(f"  Final diversity: {result.final_diversity:.6f}")
+        if result.convergence_iteration is not None:
+            print(f"  Converged at iteration: {result.convergence_iteration}")
+        print(f"{'='*80}\n")
+
         return {
             'optimized_connection_modulation': self.best_params,
             'best_loss': self.best_loss,
-            'method': 'particle_swarm',
+            'method': 'enhanced_particle_swarm',
             'n_particles': n_particles,
+            'n_iterations': max_iterations,
             'device': str(self.device),
             'strategy': strategy.get_strategy_info()['name'],
             'base_seed': self.base_seed,
+            'pso_config': config,
+            'pso_result': result,
             'history': self.history,
             'targets': self.targets
         }
