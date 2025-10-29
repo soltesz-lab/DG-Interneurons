@@ -9,6 +9,7 @@ from typing import Dict, Tuple, Optional, NamedTuple, List
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist
+from pathlib import Path
 import tqdm
 
 from dendritic_somatic_transfer import (
@@ -406,7 +407,7 @@ class OptogeneticExperiment:
         if vis:
             fig, _ = vis.plot_activity_patterns(
                 activity_trace_cpu,
-                save_path=f"DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
+                save_path=f"protocol/DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
                 
@@ -1422,6 +1423,10 @@ if __name__ == "__main__":
     print(f"Number of trials: {args.n_trials}")
     print(f"Base seed: {args.base_seed}")
 
+    output_dir = "protocol"
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+
     # Run comparative experiment with multi-trial averaging
     results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
         optimization_json_file=args.optimization_file,
@@ -1465,4 +1470,4 @@ if __name__ == "__main__":
                     print(f"    Change: {mean_change:.3f} +/- {mean_change_std:.3f} Hz")
 
     # Plot results with multi-trial statistics
-    plot_comparative_experiment_results(results, connectivity_analysis, save_path="figures")
+    plot_comparative_experiment_results(results, connectivity_analysis, save_path="protocol")
