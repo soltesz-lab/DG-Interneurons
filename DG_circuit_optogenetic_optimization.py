@@ -303,11 +303,11 @@ class BatchOptogeneticEvaluator:
                         
                         # Zero rate penalty
                         zero_mask = torch.isclose(pop_firing_rates, 
-                                                 torch.tensor(0.0, device=self.device),
-                                                 atol=1e-2, rtol=1e-2)
+                                                  torch.tensor(0.0, device=self.device),
+                                                  atol=1e-2, rtol=1e-2)
                         rate_losses = torch.where(zero_mask, 
-                                                 torch.tensor(1e2, device=self.device),
-                                                 rate_losses)
+                                                  torch.tensor(1e2, device=self.device),
+                                                  rate_losses)
                         
                         trial_losses += rate_losses
                     
@@ -445,10 +445,11 @@ class BatchOptogeneticEvaluator:
         batch_size = len(parameter_batch)
         
         # Stimulation protocol parameters
-        stim_start = 550
-        duration = 1850
+        stim_start = 1000
+        stim_duration = 2000
         warmup = 250
         opsin_current = 200.0
+        duration = stim_start + stim_duration
         
         # Create new batch circuit with current random seed
         # Note: seed was already set by caller, this ensures fresh connectivity
@@ -493,7 +494,7 @@ class BatchOptogeneticEvaluator:
             # Create per-population optogenetic drives
             direct_activation = {}
             
-            if t >= stim_start:
+            if (t >= stim_start) and (t < (stim_start + stim_duration)):
                 # Apply optogenetic stimulation only to target population
                 for pop, n_neurons in [('gc', self.circuit_params.n_gc),
                                        ('mc', self.circuit_params.n_mc),
@@ -533,7 +534,7 @@ class BatchOptogeneticEvaluator:
         
         # Calculate statistics
         baseline_mask = time_tensor < stim_start
-        stim_mask = time_tensor >= stim_start
+        stim_mask = (time_tensor >= stim_start) & (time_tensor < (stim_start + stim_duration))
         
         results = {}
         for pop in activities_time_series:

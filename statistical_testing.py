@@ -101,7 +101,7 @@ def _worker_run_single_trial(trial_args: Tuple) -> Tuple[int, str, Optional[Dict
     """
     (trial_idx, target_population, light_intensity, condition_name,
      condition_params, trial_seed, mec_current, opsin_current,
-     duration, stim_start, circuit_params_dict, synaptic_params_dict, 
+     stim_duration, stim_start, circuit_params_dict, synaptic_params_dict, 
      opsin_params_dict, optimization_json_file) = trial_args
     
     try:
@@ -197,7 +197,7 @@ def _worker_run_single_trial(trial_args: Tuple) -> Tuple[int, str, Optional[Dict
         result = experiment.simulate_stimulation(
             target_population,
             light_intensity,
-            duration=duration,
+            stim_duration=stim_duration,
             stim_start=stim_start,
             mec_current=mec_current,
             opsin_current=opsin_current,
@@ -409,8 +409,8 @@ class DisinhibitionHypothesisTester:
                         trial_seed: int,
                         mec_current: float = 100.0,
                         opsin_current: float = 100.0,
-                        duration: float = 1550.0,
-                        stim_start: float = 550.0) -> Dict:
+                        stim_duration: float = 2000.0,
+                        stim_start: float = 1000.0) -> Dict:
         """
         Run a single simulation trial with specified parameters
         
@@ -450,7 +450,7 @@ class DisinhibitionHypothesisTester:
         result = experiment.simulate_stimulation(
             target_population,
             light_intensity,
-            duration=duration,
+            stim_duration=stim_duration,
             stim_start=stim_start,
             mec_current=mec_current,
             opsin_current=opsin_current,
@@ -458,7 +458,7 @@ class DisinhibitionHypothesisTester:
         )
         
         # Analyze trial results
-        trial_metrics = self._analyze_single_trial(result, target_population, stim_start, duration)
+        trial_metrics = self._analyze_single_trial(result, target_population, stim_start, stim_duration)
         
         return trial_metrics
 
@@ -470,8 +470,8 @@ class DisinhibitionHypothesisTester:
                             starting_seed: int,
                             mec_current: float = 100.0,
                             opsin_current: float = 100.0,
-                            duration: float = 1550.0,
-                            stim_start: float = 550.0,
+                            stim_duration: float = 2000.0,
+                            stim_start: float = 1000.0,
                             device: Optional[torch.device] = None) -> List[Dict]:
         """
         Run multiple trials on GPU (processed sequentially due to connectivity differences)
@@ -492,7 +492,7 @@ class DisinhibitionHypothesisTester:
             starting_seed: Starting seed for this batch
             mec_current: MEC drive current (pA)
             opsin_current: Direct opsin activation current (pA)
-            duration: Total simulation duration (ms)
+            stim_duration: Total stimulation duration (ms)
             stim_start: When to start stimulation (ms)
             device: Device to use (default: auto-detect)
             
@@ -565,12 +565,14 @@ class DisinhibitionHypothesisTester:
             # Run simulation
             circuit.reset_state()
             mec_input = torch.ones(1, self.circuit_params.n_mec, device=device) * mec_current
+
+            duration = stim_start + stim_duration
             
             for t in range(int(duration)):
                 # Create per-population optogenetic drives
                 direct_activation = {}
                 
-                if t >= stim_start:
+                if (t >= stim_start) and (t < (stim_start + stim_duration)):
                     # Apply optogenetic stimulation
                     for pop, n_neurons in [('gc', self.circuit_params.n_gc),
                                            ('mc', self.circuit_params.n_mc),
@@ -613,7 +615,7 @@ class DisinhibitionHypothesisTester:
             }
             
             # Analyze this trial
-            trial_metrics = self._analyze_single_trial(result, target_population, stim_start, duration)
+            trial_metrics = self._analyze_single_trial(result, target_population, stim_start, stim_duration)
             batch_trial_metrics.append(trial_metrics)
             
             # Clean up
@@ -627,16 +629,17 @@ class DisinhibitionHypothesisTester:
                              simulation_result: Dict,
                              target_population: str,
                              stim_start: float,
-                             duration: float) -> Dict:
+                             stim_duration: float) -> Dict:
         """Analyze results from a single simulation trial"""
-        
+
+        duration = stim_start + stim_duration
         time = simulation_result['time']
         activity = simulation_result['activity_trace']
         opsin_expression = simulation_result['opsin_expression']
         
         # Define time windows
         baseline_mask = (time >= 150) & (time < stim_start)
-        stim_mask = time >= stim_start
+        stim_mask = (time >= stim_start) & (time < (stim_start + stim_duration))
         
         trial_metrics = {
             'opsin_expression_mean': torch.mean(opsin_expression).item(),
@@ -898,8 +901,8 @@ class DisinhibitionHypothesisTester:
                             starting_seed,
                             mec_current=mec_current,
                             opsin_current=opsin_current,
-                            duration=1550.0,
-                            stim_start=550.0,
+                            stim_duration=2000.0,
+                            stim_start=1000.0,
                             device=device
                         )
                         
@@ -944,8 +947,8 @@ class DisinhibitionHypothesisTester:
                         trial_seed,
                         mec_current,
                         opsin_current,
-                        1550.0,  # duration
-                        550.0,   # stim_start
+                        2000.0,  # stim_duration
+                        1000.0,  # stim_start
                         circuit_params_dict,
                         synaptic_params_dict,
                         opsin_params_dict,

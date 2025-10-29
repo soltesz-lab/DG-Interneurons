@@ -555,7 +555,6 @@ class DGCircuitVisualization:
 
             # Add shaded region for standard deviation
             std_activity = np.round(np.std(activity_data, axis=0), 2)
-            print(f"population {pop}: mean_activity = {mean_activity} std_activity = {std_activity}")
             ax.fill_between(time_axis, 
                            mean_activity - std_activity, 
                            mean_activity + std_activity,

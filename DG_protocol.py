@@ -241,9 +241,11 @@ class OptogeneticExperiment:
     def simulate_stimulation(self, 
                              target_population: str,
                              light_intensity: float,
-                             duration: float = 1850.0,
-                             stim_start: float = 550.0,
+                             stim_duration: float = 1500.0,
+                             stim_start: float = 500.0,
+                             post_duration: float = 250.0,
                              mec_current: float = 100.0,
+                             mec_current_std: float = 1.0,
                              opsin_current: float = 100.0,
                              include_dentate_spikes: bool = False,
                              ds_times: Optional[List[float]] = None,
@@ -257,8 +259,9 @@ class OptogeneticExperiment:
         Args:
             target_population: Population to stimulate ('pv', 'sst', etc.)
             light_intensity: Light intensity for stimulation
-            duration: Total simulation duration (ms)
             stim_start: When to start stimulation (ms)
+            stim_duration: Stimulation duration (ms)
+            post_duration: Period after stimulation (ms)
             mec_current: MEC drive current (pA)
             opsin_current: Optogenetic current (pA)
             include_dentate_spikes: Whether to include dentate spikes
@@ -295,9 +298,10 @@ class OptogeneticExperiment:
             trial_result = self._simulate_single_trial(
                 target_population=target_population,
                 light_intensity=light_intensity,
-                duration=duration,
+                stim_duration=stim_duration,
                 stim_start=stim_start,
-                mec_current=mec_current,
+                post_duration=post_duration,
+                mec_current=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
                 opsin_current=opsin_current,
                 include_dentate_spikes=include_dentate_spikes,
                 ds_times=ds_times,
@@ -322,8 +326,9 @@ class OptogeneticExperiment:
     def _simulate_single_trial(self,
                               target_population: str,
                               light_intensity: float,
-                              duration: float,
                               stim_start: float,
+                              stim_duration: float,
+                              post_duration: float,
                               mec_current: float,
                               opsin_current: float,
                               include_dentate_spikes: bool,
@@ -348,8 +353,10 @@ class OptogeneticExperiment:
         
         # Simulation parameters
         dt = self.circuit_params.dt
+        duration = stim_start + stim_duration + post_duration
         n_steps = int(duration / dt)
         stim_start_step = int(stim_start / dt)
+        stim_end_step = int((stim_start + stim_duration) / dt)
         
         # Storage for results (on device initially)
         time = torch.arange(n_steps, device=self.device) * dt
@@ -373,7 +380,7 @@ class OptogeneticExperiment:
             current_time = t * dt
 
             direct_activation = {}
-            if t >= stim_start_step:
+            if (t >= stim_start_step) and (t < stim_end_step):
                 # Convert to strong current injection
                 direct_activation[target_population] = activation_prob * opsin_current
                 
@@ -635,7 +642,8 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                intensities: List[float] = [0.5, 1.0, 2.0],
                                mec_current: float = 100.0,
                                opsin_current: float = 100.0,
-                               stim_start: float = 550,
+                               stim_start: float = 1000.0,
+                               stim_duration: float = 2000.0,
                                plot_activity: bool = True,
                                device: Optional[torch.device] = None,
                                n_trials: int = 1,
@@ -718,7 +726,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             result = experiment.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
-                duration=stim_start + 1000.0,
+                stim_duration=stim_duration,
                 plot_activity=plot_activity,
                 mec_current=mec_current,
                 opsin_current=opsin_current,
@@ -732,7 +740,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             opsin_expression_mean = result['opsin_expression_mean']
             
             baseline_mask = (time >= 150) & (time < stim_start)
-            stim_mask = time >= stim_start
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
             
             analysis = {}
             analysis['opsin_expression_mean'] = opsin_expression_mean
@@ -1050,6 +1058,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax = plt.subplot(3, 4, 9 + i * 2)
         
         opsin_expression = results[target][stimulation_level]['opsin_expression_mean']
+        print(f"opsin_expression {target} {stimulation_level}: {opsin_expression}")
         
         if has_multitrial:
             stim_rates = results[target][stimulation_level][f'{target}_stim_rates_mean'][opsin_expression <= 0.2]
@@ -1064,6 +1073,8 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         # Add correlation line
         from scipy import stats
         slope, intercept, r_value, p_value, std_err = stats.linregress(baseline_rates, stim_rates)
+        print(f"baseline_rates = {baseline_rates}")
+        print(f"intercept = {intercept}")
         line = slope * baseline_rates + intercept
         ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, 
                label=f'Fit (R={r_value:.2f})')
@@ -1131,10 +1142,6 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     
     plt.show()
 
-
-# Additional analysis functions remain the same but omitted for brevity
-# ... (include analyze_mec_asymmetry_effects, analyze_disinhibition_effects, 
-#      test_disinhibition_hypothesis with n_trials support)
 
 def analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
     """Analyze how MEC -> PV (but not SST) asymmetry affects circuit dynamics"""
@@ -1256,6 +1263,8 @@ def analyze_mec_asymmetry_effects(experiment: OptogeneticExperiment) -> Dict:
 def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
                                   target_population: str, 
                                   light_intensity: float,
+                                  stim_start = 500.0,
+                                  stim_duration = 1000.0,
                                   mec_current: float = 40.0,
                                   opsin_current: float = 100.0) -> Dict:
     """Analyze disinhibition mechanisms with fixed connectivity access"""
@@ -1295,12 +1304,14 @@ def analyze_disinhibition_effects(experiment: OptogeneticExperiment,
     result_no_inhibition = experiment_no_inh.simulate_stimulation(
         target_population, light_intensity,
         mec_current=mec_current,
+        stim_start=stim_start,
+        stim_duration=stim_duration,
         opsin_current=opsin_current
     )
     
     time = result_full['time']
-    baseline_mask = time < 100
-    stim_mask = time >= 100
+    baseline_mask = time < stim_start
+    stim_mask = (time >= stim_start) & (time < (stim_start + stim_duration)) 
     
     analysis = {}
     
@@ -1403,7 +1414,7 @@ if __name__ == "__main__":
     parser.add_argument('--base-seed', type=int, default=42,
                        help='Base random seed (default: 42)')
     parser.add_argument('--mec-current', type=float, default=40.0,
-                       help='MEC drive current in pA (default: 40.0)')
+                        help='MEC drive current in pA (default: 40.0)')
     parser.add_argument('--opsin-current', type=float, default=200.0,
                        help='Optogenetic current in pA (default: 200.0)')
     
