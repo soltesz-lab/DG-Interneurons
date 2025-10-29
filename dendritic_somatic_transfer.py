@@ -147,9 +147,9 @@ def dendritic_somatic_transfer(ampa_conductance: torch.Tensor,
         g_leak = torch.ones_like(total_conductance, device=device)  # nS
         
         numerator = (ampa_conductance * params.e_exc + 
-                    gaba_conductance * params.e_inh +
-                    effective_nmda_conductance * params.e_exc + 
-                    g_leak * params.v_rest)
+                     gaba_conductance * params.e_inh +
+                     effective_nmda_conductance * params.e_exc + 
+                     g_leak * params.v_rest)
         
         denominator = total_conductance + g_leak
         
