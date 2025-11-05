@@ -243,7 +243,7 @@ class OptogeneticExperiment:
                              light_intensity: float,
                              stim_duration: float = 1500.0,
                              stim_start: float = 500.0,
-                             post_duration: float = 250.0,
+                             post_duration: float = 500.0,
                              mec_current: float = 100.0,
                              mec_current_std: float = 1.0,
                              opsin_current: float = 100.0,
@@ -348,6 +348,8 @@ class OptogeneticExperiment:
         opsin = self.create_opsin_expression(target_population)
         target_positions = self.circuit.layout.positions[target_population]
 
+        print(f"opsin_expression {target_population}: {opsin.expression_levels}")
+
         # Calculate direct optogenetic activation
         activation_prob = opsin.calculate_activation(target_positions, light_intensity)
         
@@ -412,9 +414,13 @@ class OptogeneticExperiment:
         activity_trace_cpu = {pop: activity.cpu() for pop, activity in activity_trace.items()}
 
         if vis:
-            fig, _ = vis.plot_activity_patterns(
+            #fig, _ = vis.plot_activity_patterns(
+            #    activity_trace_cpu,
+            #    save_path=f"protocol/DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
+            #)
+            fig, _ = vis.plot_activity_raster(
                 activity_trace_cpu,
-                save_path=f"protocol/DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
+                save_path=f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
                 
@@ -1058,7 +1064,6 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax = plt.subplot(3, 4, 9 + i * 2)
         
         opsin_expression = results[target][stimulation_level]['opsin_expression_mean']
-        print(f"opsin_expression {target} {stimulation_level}: {opsin_expression}")
         
         if has_multitrial:
             stim_rates = results[target][stimulation_level][f'{target}_stim_rates_mean'][opsin_expression <= 0.2]
