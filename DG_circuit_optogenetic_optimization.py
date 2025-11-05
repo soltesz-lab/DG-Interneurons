@@ -613,7 +613,7 @@ class BatchOptogeneticEvaluator:
                     actual_fraction = opto_results[affected_pop]['activated_fraction']
                     
                     # Squared error
-                    errors = (actual_fraction - target_fraction) ** 2
+                    errors = (torch.clip(actual_fraction - target_fraction, max=0)) ** 2
                     
                     # Zero activation penalty
                     if abs(target_fraction) > 0:
@@ -623,8 +623,8 @@ class BatchOptogeneticEvaluator:
                             atol=1e-2, rtol=1e-2
                         )
                         errors = torch.where(zero_mask,
-                                           torch.tensor(1e2, device=self.device),
-                                           errors)
+                                             torch.tensor(1e2, device=self.device),
+                                             errors)
                     
                     losses += errors
         
@@ -633,7 +633,7 @@ class BatchOptogeneticEvaluator:
             for affected_pop, target_gini_change in opto_targets.target_gini_increase[target_pop].items():
                 if affected_pop in opto_results and affected_pop != target_pop:
                     actual_gini_change = opto_results[affected_pop]['gini_change']
-                    errors = (actual_gini_change - target_gini_change) ** 2
+                    errors = (torch.clip(actual_gini_change - target_gini_change, max=0)) ** 2
                     losses += errors
         
         return losses
