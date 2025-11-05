@@ -121,7 +121,7 @@ class OptimizationTargets:
     
     # Connection strength bounds (multipliers)
     connection_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
-        'mec_gc': (0.5, 5.0),    # Perforant path can vary widely
+        'mec_gc': (0.5, 4.0),    # Perforant path can vary widely
         'mec_pv': (0.1, 5.0),    # Perforant path can vary widely
         'gc_mc': (0.1, 5.0),     # Mossy fiber strength
         'mc_gc': (0.1, 5.0),     # Associational pathway  
@@ -1279,7 +1279,7 @@ def create_default_global_opt_config(device: Optional[torch.device] = None) -> O
         learning_rate=0.1,
         max_iterations=20,
         mec_drive_levels=[40.0],
-        n_trials=3,  # Reduce for faster iteration
+        n_trials=4,  # Reduce for faster iteration
         simulation_duration=1000,
         warmup_duration=200,
         device=device

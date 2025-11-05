@@ -1051,7 +1051,7 @@ class OptogeneticCircuitOptimizer:
         print(f"\n{'='*80}")
         print("Circuit optimization results")
         print(f"{'='*80}")
-        self._print_diagnostics(result.best_position, result.best_loss, connection_names)
+        self._print_diagnostics(result.best_position, result.best_score, connection_names)
         print(f"\nPSO Statistics:")
         print(f"  Total evaluations: {result.n_evaluations}")
         print(f"  New bests found: {result.n_new_bests}")
@@ -1283,7 +1283,8 @@ def run_global_optimization(optimization_config,
                            n_particles=20,
                            max_iterations=50,
                            diagnostic_frequency=5,
-                           base_seed=42):
+                            base_seed=42,
+                            output_file="DG_optogenetic_optimization_results.json"):
     """
     Run global optimization with optogenetic objectives using batch GPU interface
     
@@ -1326,7 +1327,7 @@ def run_global_optimization(optimization_config,
         rate_ordering_constraints=base_targets.rate_ordering_constraints,
         optogenetic_targets=OptogeneticTargets(),
         baseline_weight=1.0,
-        optogenetic_weight=1.0
+        optogenetic_weight=4.0
     )
     
     # Create optimizer
@@ -1346,7 +1347,7 @@ def run_global_optimization(optimization_config,
     )
     
     # Save results
-    optimizer.save_results('DG_optogenetic_optimization_results.json')
+    optimizer.save_results(output_file)
     
     return results, optimizer
 
@@ -1363,6 +1364,8 @@ if __name__ == "__main__":
     parser.add_argument('--n-particles', type=int, default=20)
     parser.add_argument('--max-iterations', type=int, default=6)
     parser.add_argument('--base-seed', type=int, default=42, help='Base random seed for reproducibility')
+    parser.add_argument('--output-file', type=str, default='DG_optogenetic_optimization_results.json',
+                       help='Output file (default: DG_optogenetic_optimization_results.json)')
     
     args = parser.parse_args()
     
@@ -1376,10 +1379,12 @@ if __name__ == "__main__":
         method=args.method,
         n_particles=args.n_particles,
         max_iterations=args.max_iterations,
-        base_seed=args.base_seed
+        base_seed=args.base_seed,
+        output_file=args.output_file
     )
     
     print(f"\nOptimization Complete!")
     print(f"Best loss: {results['best_loss']:.6f}")
     print(f"Device: {results['device']}")
     print(f"Base seed: {results['base_seed']}")
+    print(f"Output file: {args.output_file}")
