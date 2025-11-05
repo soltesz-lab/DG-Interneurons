@@ -71,10 +71,10 @@ class OptimizationTargets:
     
     # Target firing rates (Hz) for each population
     target_rates: Dict[str, float] = field(default_factory=lambda: {
-        'gc': 0.2,   # Sparse granule cell activity
-        'mc': 1.1,   # Moderate mossy cell activity  
-        'pv': 6.0,  # Fast-spiking PV interneurons
-        'sst': 4.0, # Slower SST interneurons
+        'gc': 0.1,   # Sparse granule cell activity
+        'mc': 3.0,   # Moderate mossy cell activity  
+        'sst': 5.0, # Slower SST interneurons
+        'pv': 10.0,  # Fast-spiking PV interneurons
     })
     
     # Acceptable variance around targets (Hz)
