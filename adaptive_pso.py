@@ -6,11 +6,16 @@ This module provides a PSO implementation with:
 - Diversity-adaptive parameter control
 - Dynamic Multi-Swarm (DMS-PSO) with regrouping
 - Intelligent restart mechanisms
+- Optional metadata tracking from objective function
 
+The objective function can return either:
+- np.ndarray: scores only
+- Tuple[np.ndarray, List[Dict]]: (scores, metadata) for each evaluation
 """
 
+import pprint
 import numpy as np
-from typing import Callable, Dict, List, Tuple, Optional, Any
+from typing import Callable, Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -47,6 +52,7 @@ class PSOConfig:
         restart_std_factor: Std of Gaussian noise for restart (relative to bounds)
         diagnostic_frequency: Print diagnostics every N new bests
         verbose: Enable detailed output
+        track_metadata: Whether to track and store metadata from objective function
     """
     
     # Basic PSO parameters
@@ -82,6 +88,9 @@ class PSOConfig:
     diagnostic_frequency: int = 5
     verbose: bool = True
     
+    # Metadata tracking
+    track_metadata: bool = True
+    
     def __post_init__(self):
         """Validate configuration parameters."""
         assert self.n_particles > 0, "n_particles must be positive"
@@ -102,7 +111,9 @@ class PSOResult:
     Attributes:
         best_position: Best position found
         best_score: Best score achieved
+        best_metadata: Metadata for best configuration (if available)
         history: Optimization history with scores, diversity, parameters
+        metadata_history: Metadata for all new best solutions (if tracking enabled)
         n_iterations: Number of iterations performed
         n_evaluations: Total function evaluations
         n_new_bests: Number of times global best was updated
@@ -113,12 +124,14 @@ class PSOResult:
     
     best_position: np.ndarray
     best_score: float
+    best_metadata: Optional[Dict[str, Any]] = None
     history: Dict[str, List] = field(default_factory=lambda: {
         'best_scores': [],
         'mean_scores': [],
         'diversity': [],
         'parameters': []
     })
+    metadata_history: List[Dict[str, Any]] = field(default_factory=list)
     n_iterations: int = 0
     n_evaluations: int = 0
     n_new_bests: int = 0
@@ -129,9 +142,12 @@ class PSOResult:
 
 class AdaptivePSO:
     """
-    Adaptive Particle Swarm Optimization
+    Adaptive Particle Swarm Optimization with metadata tracking
     
-    The objective function should accept a batch of positions and return their scores.
+    The objective function can return either:
+    1. np.ndarray of scores
+    2. Tuple[np.ndarray, List[Dict]] with (scores, metadata for each evaluation)
+    
     Lower scores are better (minimization).
     
     Features:
@@ -140,35 +156,41 @@ class AdaptivePSO:
         - Dynamic Multi-Swarm (DMS-PSO) with periodic regrouping
         - Intelligent restart mechanism preserving elites
         - Comprehensive tracking and diagnostics
+        - Optional metadata tracking for troubleshooting**
     
-    Example:
-        >>> def objective(positions: np.ndarray) -> np.ndarray:
-        ...     # Sphere function: sum of squares
-        ...     return np.sum(positions**2, axis=1)
+    Example with metadata:
+        >>> def objective(positions: np.ndarray) -> Tuple[np.ndarray, List[Dict]]:
+        ...     scores = np.sum(positions**2, axis=1)
+        ...     metadata = [{'position_norm': np.linalg.norm(p)} for p in positions]
+        ...     return scores, metadata
         >>> 
-        >>> bounds = [(-5.0, 5.0)] * 10  # 10-dimensional problem
-        >>> pso = AdaptivePSO(objective, bounds)
+        >>> bounds = [(-5.0, 5.0)] * 10
+        >>> config = PSOConfig(track_metadata=True)
+        >>> pso = AdaptivePSO(objective, bounds, config)
         >>> result = pso.optimize()
         >>> print(f"Best score: {result.best_score:.6f}")
-        Best score: 0.000123
+        >>> print(f"Best metadata: {result.best_metadata}")
     """
     
     def __init__(self, 
-                 objective_function: Callable[[np.ndarray], np.ndarray],
+                 objective_function: Callable[[np.ndarray], Union[np.ndarray, Tuple[np.ndarray, List[Dict]]]],
                  bounds: List[Tuple[float, float]],
                  config: Optional[PSOConfig] = None,
-                 random_seed: Optional[int] = None):
+                 random_seed: Optional[int] = None,
+                 print_metadata: Optional[Callable[[np.ndarray, float, Optional[Dict]], None]] = None):
         """
         Initialize Adaptive PSO optimizer.
         
         Args:
             objective_function: Function that evaluates a batch of positions.
-                                Takes np.ndarray of shape (n_particles, n_dimensions)
-                                Returns np.ndarray of shape (n_particles,) with scores.
+                                Can return either:
+                                - np.ndarray of shape (n_particles,) with scores
+                                - Tuple[np.ndarray, List[Dict]] with (scores, metadata)
                                 Lower scores are better.
             bounds: List of (lower, upper) tuples for each dimension
             config: PSO configuration (uses defaults if None)
             random_seed: Random seed for reproducibility
+            print_metadata: Optional custom metadata printer, to be invoked during diagnostics
         """
         self.objective_function = objective_function
         self.bounds = bounds
@@ -191,8 +213,10 @@ class AdaptivePSO:
         self.velocities = None
         self.personal_best_positions = None
         self.personal_best_scores = None
+        self.personal_best_metadata = None  # Track metadata for personal bests
         self.global_best_position = None
         self.global_best_score = float('inf')
+        self.global_best_metadata = None  # Track metadata for global best
         
         # Multi-swarm state
         self.sub_swarms = None
@@ -207,15 +231,18 @@ class AdaptivePSO:
             'parameters': [],
             'diversity_states': []
         }
+        self.metadata_history = []  # Store metadata for each new best
         self.n_evaluations = 0
         self.initial_diversity = None
-    
+        self.supports_metadata = None  # Auto-detect on first evaluation
+        self.print_metadata = print_metadata
+        
     def optimize(self) -> PSOResult:
         """
         Run the optimization process.
         
         Returns:
-            PSOResult with best position, score, and optimization history
+            PSOResult with best position, score, metadata, and optimization history
         """
         self._print_header()
         
@@ -250,10 +277,12 @@ class AdaptivePSO:
             self._update_velocities_and_positions(w, c1, c2)
             
             # Evaluate
-            scores = self._evaluate_population()
+            scores, metadata_list = self._evaluate_population()
             
             # Update personal and global bests
-            improved, new_best_found = self._update_bests(scores)
+            improved, new_best_found, new_best_metadata = self._update_bests(
+                scores, metadata_list
+            )
             
             if self.config.verbose:
                 print(f"Particles improved: {np.sum(improved)}/{self.config.n_particles}")
@@ -265,8 +294,17 @@ class AdaptivePSO:
                 improvement = self.history['best_scores'][-1] - self.global_best_score \
                              if self.history['best_scores'] else 0
                 if self.config.verbose:
-                    print(f"\n New best: {self.global_best_score:.6f} "
+                    print(f"\n★ New best: {self.global_best_score:.6f} "
                           f"(improvement: {improvement:.6f})")
+                
+                # Store metadata for this new best
+                if self.config.track_metadata and new_best_metadata is not None:
+                    self.metadata_history.append({
+                        'iteration': iteration,
+                        'score': self.global_best_score,
+                        'position': self.global_best_position.copy(),
+                        'metadata': new_best_metadata
+                    })
                 
                 if n_new_bests % self.config.diagnostic_frequency == 0:
                     self._print_diagnostics()
@@ -289,7 +327,7 @@ class AdaptivePSO:
                 # Check for regrouping
                 if (iteration + 1) % self.config.regrouping_period == 0:
                     if self.config.verbose:
-                        print(f"\n Regrouping sub-swarms...")
+                        print(f"\n↻ Regrouping sub-swarms...")
                     self._regroup_sub_swarms()
             
             # Handle stagnation
@@ -297,14 +335,14 @@ class AdaptivePSO:
                self.config.obl_escape_enabled:
                 # Try OBL escape first
                 if self.config.verbose:
-                    print(f"\n Stagnation detected ({no_improvement_count} iterations)")
+                    print(f"\n⚠ Stagnation detected ({no_improvement_count} iterations)")
                 self._obl_escape()
                 no_improvement_count = 0  # Reset after escape
                 
             elif no_improvement_count >= self.config.restart_threshold:
                 # If still stagnating, do intelligent restart
                 if self.config.verbose:
-                    print(f"\n Restarting...")
+                    print(f"\n🔄 Restarting...")
                 self._intelligent_restart()
                 no_improvement_count = 0  # Reset after restart
             
@@ -328,7 +366,9 @@ class AdaptivePSO:
         return PSOResult(
             best_position=self.global_best_position.copy(),
             best_score=self.global_best_score,
+            best_metadata=self.global_best_metadata,
             history=self.history,
+            metadata_history=self.metadata_history if self.config.track_metadata else [],
             n_iterations=self.config.max_iterations,
             n_evaluations=self.n_evaluations,
             n_new_bests=n_new_bests,
@@ -358,7 +398,10 @@ class AdaptivePSO:
         
         if self.config.verbose:
             print(f"Initial best score: {self.global_best_score:.6f}")
-            print(f"Initial diversity: {self.initial_diversity:.6f}\n")
+            print(f"Initial diversity: {self.initial_diversity:.6f}")
+            if self.supports_metadata:
+                print(f"Metadata tracking: ENABLED")
+            print()
     
     def _initialize_random(self):
         """Standard random initialization."""
@@ -368,16 +411,20 @@ class AdaptivePSO:
         )
         
         # Evaluate initial population
-        scores = self._evaluate_population()
+        scores, metadata_list = self._evaluate_population()
         
         # Set personal bests
         self.personal_best_positions = self.positions.copy()
         self.personal_best_scores = scores
+        if self.supports_metadata:
+            self.personal_best_metadata = metadata_list
         
         # Set global best
         best_idx = np.argmin(scores)
         self.global_best_position = self.positions[best_idx].copy()
         self.global_best_score = scores[best_idx]
+        if self.supports_metadata:
+            self.global_best_metadata = metadata_list[best_idx]
     
     def _initialize_with_obl(self):
         """Initialize with Opposition-Based Learning."""
@@ -395,7 +442,17 @@ class AdaptivePSO:
         
         # Combine and evaluate
         all_positions = np.vstack([random_positions, opposite_positions])
-        all_scores = self.objective_function(all_positions)
+        result = self.objective_function(all_positions)
+        
+        # Handle both return types
+        if isinstance(result, tuple):
+            all_scores, all_metadata = result
+            self.supports_metadata = True
+        else:
+            all_scores = result
+            all_metadata = [None] * len(all_scores)
+            self.supports_metadata = False
+        
         self.n_evaluations += len(all_scores)
         
         # Select best n_particles
@@ -406,10 +463,14 @@ class AdaptivePSO:
         # Set personal bests
         self.personal_best_positions = self.positions.copy()
         self.personal_best_scores = scores
+        if self.supports_metadata:
+            self.personal_best_metadata = [all_metadata[i] for i in best_indices]
         
         # Set global best
         self.global_best_position = self.positions[0].copy()
         self.global_best_score = scores[0]
+        if self.supports_metadata:
+            self.global_best_metadata = all_metadata[best_indices[0]]
         
         if self.config.verbose:
             print(f"  OBL: Best = {scores[0]:.6f}, Worst = {scores[-1]:.6f}")
@@ -482,34 +543,66 @@ class AdaptivePSO:
                     self.positions[i], self.lower_bounds, self.upper_bounds
                 )
     
-    def _evaluate_population(self) -> np.ndarray:
-        """Evaluate all particles and return scores."""
-        scores = self.objective_function(self.positions)
-        self.n_evaluations += len(scores)
-        return scores
+    def _evaluate_population(self) -> Tuple[np.ndarray, List[Optional[Dict]]]:
+        """
+        Evaluate all particles and return scores and metadata.
+        
+        Returns:
+            scores: np.ndarray of shape (n_particles,)
+            metadata_list: List of metadata dicts (or None if not supported)
+        """
+        result = self.objective_function(self.positions)
+        self.n_evaluations += self.config.n_particles
+        
+        # Handle both return types
+        if isinstance(result, tuple):
+            scores, metadata_list = result
+            if self.supports_metadata is None:
+                self.supports_metadata = True
+        else:
+            scores = result
+            metadata_list = [None] * len(scores)
+            if self.supports_metadata is None:
+                self.supports_metadata = False
+        
+        return scores, metadata_list
     
-    def _update_bests(self, scores: np.ndarray) -> Tuple[np.ndarray, bool]:
+    def _update_bests(self, scores: np.ndarray, 
+                     metadata_list: List[Optional[Dict]]) -> Tuple[np.ndarray, bool, Optional[Dict]]:
         """
         Update personal and global bests.
         
         Returns:
             improved: Boolean array indicating which particles improved
             new_best_found: Whether a new global best was found
+            new_best_metadata: Metadata for new global best (if found)
         """
         # Update personal bests
         improved = scores < self.personal_best_scores
         self.personal_best_scores[improved] = scores[improved]
         self.personal_best_positions[improved] = self.positions[improved]
         
+        # Update personal best metadata
+        if self.supports_metadata and self.personal_best_metadata is not None:
+            for i, (is_improved, metadata) in enumerate(zip(improved, metadata_list)):
+                if is_improved:
+                    self.personal_best_metadata[i] = metadata
+        
         # Update global best
         min_idx = np.argmin(scores)
         new_best_found = False
+        new_best_metadata = None
+        
         if scores[min_idx] < self.global_best_score:
             self.global_best_score = scores[min_idx]
             self.global_best_position = self.positions[min_idx].copy()
             new_best_found = True
+            
+            if self.supports_metadata:
+                self.global_best_metadata = metadata_list[min_idx]
+                new_best_metadata = metadata_list[min_idx]
         
-        return improved, new_best_found
+        return improved, new_best_found, new_best_metadata
     
     # ========================================================================
     # Diversity and Adaptive Parameters
@@ -705,6 +798,7 @@ class AdaptivePSO:
         if self.config.use_multi_swarm:
             print(f"    Sub-swarms: {self.config.n_sub_swarms}")
             print(f"    Regrouping: Every {self.config.regrouping_period} iterations")
+        print(f"  Metadata Tracking: {self.config.track_metadata}")
         print("="*80 + "\n")
     
     def _print_iteration_header(self, iteration: int):
@@ -729,6 +823,14 @@ class AdaptivePSO:
             print(f"  Dim {i}: {val:.6f}")
         if self.n_dimensions > 10:
             print(f"  ... and {self.n_dimensions - 10} more dimensions")
+        
+        if self.supports_metadata and self.global_best_metadata is not None:
+            print(f"\nMetadata available for this configuration:")
+            if self.print_metadata is None:
+                pprint.pprint(self.global_best_metadata)
+            else:
+                self.print_metadata(self.global_best_metadata)
+            
         print(f"{'#'*80}")
     
     def _print_footer(self):
@@ -743,6 +845,8 @@ class AdaptivePSO:
         print(f"Total evaluations: {self.n_evaluations}")
         print(f"Function evals per iteration: "
               f"{self.n_evaluations / self.config.max_iterations:.1f}")
+        if self.config.track_metadata:
+            print(f"Metadata snapshots stored: {len(self.metadata_history)}")
         print("="*80)
 
 

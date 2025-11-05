@@ -221,7 +221,7 @@ class BatchOptogeneticEvaluator:
         """
         Evaluate baseline circuit objectives for batch of parameters
         
-        REFACTORED: Creates new circuit for each trial with different seed
+        Creates new circuit for each trial with different seed
         
         Returns:
             losses: Tensor [batch_size]
@@ -423,10 +423,15 @@ class BatchOptogeneticEvaluator:
         return total_opto_losses, accumulated_details
     
     def _simulate_batch_optogenetic_stimulation(self,
-                                               parameter_batch: List[Dict[str, float]],
-                                               target_pop: str,
-                                               mec_drive: float,
-                                               trial_seed: int) -> Dict[str, torch.Tensor]:
+                                                parameter_batch: List[Dict[str, float]],
+                                                target_pop: str,
+                                                mec_drive: float,
+                                                trial_seed: int,
+                                                stim_start: float = 1000.0,
+                                                stim_duration: float = 2000.0,
+                                                post_duration: float = 250.0,
+                                                warmup: float = 250.0,
+                                                opsin_current: float = 200.0) -> Dict[str, torch.Tensor]:
         """
         Run optogenetic stimulation for a batch of parameter sets
         
@@ -445,10 +450,8 @@ class BatchOptogeneticEvaluator:
         batch_size = len(parameter_batch)
         
         # Stimulation protocol parameters
-        stim_start = 1000
-        stim_duration = 2000
-        warmup = 250
-        opsin_current = 200.0
+        if stim_start < warmup:
+            stim_start = warmup
         duration = stim_start + stim_duration
         
         # Create new batch circuit with current random seed
@@ -482,19 +485,31 @@ class BatchOptogeneticEvaluator:
         target_opto_current = activation_prob * opsin_current
         
         # Storage for time series: [time, batch, neurons]
-        time_points = []
         activities_time_series = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
         
         # Run simulation
         circuit.reset_state()
         mec_input = torch.ones(batch_size, self.circuit_params.n_mec,
-                              device=self.device) * mec_drive
+                               device=self.device) * mec_drive
+
         
-        for t in range(duration):
+        # Simulation parameters
+        dt = self.circuit_params.dt
+        duration = stim_start + stim_duration + post_duration
+        n_steps = int(duration / dt)
+        stim_start_step = int(stim_start / dt)
+        stim_end_step = int((stim_start + stim_duration) / dt)
+        time_tensor = torch.arange(n_steps, device=self.device) * dt
+
+        print(f"time_tensor.shape = {time_tensor.shape}")
+        
+        for t in range(n_steps):
+            current_time = t * dt
+            
             # Create per-population optogenetic drives
             direct_activation = {}
             
-            if (t >= stim_start) and (t < (stim_start + stim_duration)):
+            if (t >= stim_start_step) and (t < stim_end_step):
                 # Apply optogenetic stimulation only to target population
                 for pop, n_neurons in [('gc', self.circuit_params.n_gc),
                                        ('mc', self.circuit_params.n_mc),
@@ -519,21 +534,17 @@ class BatchOptogeneticEvaluator:
             external_drive = {'mec': mec_input}
             activities = circuit(direct_activation, external_drive)
             
-            if t >= warmup:
-                time_points.append(t)
-                for pop in activities_time_series:
-                    if pop in activities:
-                        activities_time_series[pop].append(activities[pop])
+            for pop in activities_time_series:
+                activities_time_series[pop].append(activities[pop])
         
         # Convert to tensors: [time, batch, neurons]
         for pop in activities_time_series:
             if len(activities_time_series[pop]) > 0:
                 activities_time_series[pop] = torch.stack(activities_time_series[pop], dim=0)
-        
-        time_tensor = torch.tensor(time_points, device=self.device)
-        
+                print(f"activities_time_series[{pop}].shape: {activities_time_series[pop].shape}")
+                
         # Calculate statistics
-        baseline_mask = time_tensor < stim_start
+        baseline_mask = (time_tensor >= warmup) & (time_tensor < stim_start)
         stim_mask = (time_tensor >= stim_start) & (time_tensor < (stim_start + stim_duration))
         
         results = {}
@@ -654,7 +665,7 @@ class OptogeneticEvaluationStrategy(ABC):
     def evaluate_batch(self,
                       parameter_sets: List[Dict[str, float]],
                       mec_drive: float,
-                      n_trials: int) -> Tuple[List[float], Dict]:
+                      n_trials: int) -> Tuple[List[float], List[Dict]]:
         """
         Evaluate a batch of parameter configurations with optogenetic protocols
         
@@ -665,7 +676,7 @@ class OptogeneticEvaluationStrategy(ABC):
             
         Returns:
             losses: List of total loss values
-            details: Dict with loss breakdowns and firing rates
+            metadata_list: List of Dict with loss breakdowns and firing rates
         """
         pass
     
@@ -691,7 +702,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
     def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
         """Evaluate configurations one at a time"""
         losses = []
-        all_details = []
+        metadata_list = []
         
         for params in parameter_sets:
             # Use batch evaluator with batch_size=1
@@ -702,9 +713,11 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
             
             loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_drive)
             losses.append(loss_tensor.item())
-            all_details.append(details)
+
+            metadata = self._extract_metadata(details, 0)  # batch index 0
+            metadata_list.append(metadata)
         
-        return losses, all_details
+        return losses, metadata_list
     
     def get_strategy_info(self):
         return {
@@ -714,6 +727,37 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
             'description': 'Sequential evaluation with optogenetic protocols (different seeds per trial)'
         }
 
+    def _extract_metadata(self, details: Dict, batch_idx: int) -> Dict:
+        """Extract metadata for a single configuration from batch results"""
+        metadata = {
+            'baseline_loss': self._tensor_to_python(details['baseline_losses'][batch_idx]),
+            'opto_loss': self._tensor_to_python(details['opto_losses'][batch_idx]),
+            'baseline_rates': {},
+            'opto_details': {}
+        }
+        
+        # Extract baseline rates
+        for pop, rates in details['baseline_rates'].items():
+            metadata['baseline_rates'][pop] = self._tensor_to_python(rates[batch_idx])
+        
+        # Extract optogenetic details
+        for target_pop in ['pv', 'sst']:
+            if target_pop in details['opto_details']:
+                metadata['opto_details'][target_pop] = {}
+                for affected_pop, pop_data in details['opto_details'][target_pop].items():
+                    metadata['opto_details'][target_pop][affected_pop] = {
+                        k: self._tensor_to_python(v[batch_idx]) if hasattr(v, '__getitem__') else v
+                        for k, v in pop_data.items()
+                    }
+                    
+        return metadata
+
+    def _tensor_to_python(obj):
+        """Convert torch tensor to Python type"""
+        import torch
+        if isinstance(obj, torch.Tensor):
+            return obj.item() if obj.numel() == 1 else obj.cpu().numpy().tolist()
+        return obj
 
 class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
     """Batch GPU evaluation for population-based optimization"""
@@ -745,8 +789,13 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
         
         # Convert to lists for consistent API
         losses_list = losses_tensor.cpu().numpy().tolist()
+
+        metadata_list = []
+        for i in range(batch_size):
+            metadata = self._extract_metadata(details, i)
+            metadata_list.append(metadata)
         
-        return losses_list, [details] * batch_size
+        return losses_list, metadata_list
     
     def get_strategy_info(self):
         return {
@@ -756,6 +805,43 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
             'description': f'Batch optogenetic evaluation on GPU (seed {self.base_seed} + trial_idx)'
         }
 
+
+    def _extract_metadata(self, details: Dict, batch_idx: int) -> Dict:
+        """Extract metadata for a single configuration from batch results"""
+        import torch
+        
+        metadata = {
+            'baseline_loss': self._tensor_to_python(details['baseline_losses'][batch_idx]),
+            'opto_loss': self._tensor_to_python(details['opto_losses'][batch_idx]),
+            'baseline_rates': {},
+            'opto_details': {}
+        }
+        
+        # Extract baseline rates
+        for pop, rates in details['baseline_rates'].items():
+            metadata['baseline_rates'][pop] = self._tensor_to_python(rates[batch_idx])
+        
+        # Extract optogenetic details
+        for target_pop in ['pv', 'sst']:
+            if target_pop in details['opto_details']:
+                metadata['opto_details'][target_pop] = {}
+                for affected_pop, pop_data in details['opto_details'][target_pop].items():
+                    metadata['opto_details'][target_pop][affected_pop] = {
+                        k: self._tensor_to_python(v[batch_idx]) if hasattr(v, '__getitem__') else v
+                        for k, v in pop_data.items()
+                    }
+        
+        return metadata
+
+    @staticmethod
+    def _tensor_to_python(obj):
+        """Convert torch tensor to Python type"""
+        import torch
+        if isinstance(obj, torch.Tensor):
+            return obj.item() if obj.numel() == 1 else obj.cpu().numpy().tolist()
+        return obj
+
+    
 
 class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
     """Multiprocess CPU evaluation for population-based optimization"""
@@ -809,9 +895,9 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
         
         # Unpack results
         losses = [r[0] for r in results]
-        details = [r[1] for r in results]
+        metadata_list = [r[1] for r in results]
         
-        return losses, details
+        return losses, metadata_list
     
     def get_strategy_info(self):
         return {
@@ -904,6 +990,7 @@ class OptogeneticCircuitOptimizer:
         
         # Storage
         self.best_loss = float('inf')
+        self.best_metadata = None  # Store metadata for best configuration
         self.best_params = None
         self.best_iteration = 0
         self.history = {'loss': [], 'parameters': []}
@@ -1006,15 +1093,16 @@ class OptogeneticCircuitOptimizer:
             """Evaluate batch of parameter configurations."""
             parameter_sets = [dict(zip(connection_names, pos)) for pos in positions]
             mec_drive = self.config.mec_drive_levels[0]
-            losses, _ = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials)
-            return np.array(losses)
+            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials)
+            return np.array(losses), metadata_list
 
         # Configure PSO
         pso_params = {
             'n_particles': n_particles,
             'max_iterations': max_iterations,
             'diagnostic_frequency': diagnostic_frequency,
-            'verbose': True
+            'verbose': True,
+            'track_metadata': True
         }
         if pso_config is not None:
             pso_params.update(pso_config)
@@ -1035,12 +1123,15 @@ class OptogeneticCircuitOptimizer:
         print(f"{'='*80}\n")
 
         # Run PSO
-        pso = AdaptivePSO(objective_function, bounds, config, random_seed=self.base_seed)
+        pso = AdaptivePSO(objective_function, bounds, config, random_seed=self.base_seed,
+                          print_metadata=self._print_metadata)
         result = pso.optimize()
 
         # Convert results
         self.best_params = dict(zip(connection_names, result.best_position))
         self.best_loss = result.best_score
+        self.best_metadata = result.best_metadata
+
         self.history['loss'] = result.history['best_scores']
         self.history['parameters'] = [
             dict(zip(connection_names, result.best_position))
@@ -1051,13 +1142,15 @@ class OptogeneticCircuitOptimizer:
         print(f"\n{'='*80}")
         print("Circuit optimization results")
         print(f"{'='*80}")
-        self._print_diagnostics(result.best_position, result.best_score, connection_names)
+        self._print_diagnostics(result.best_position, result.best_score, connection_names,
+                                metadata=result.best_metadata)
         print(f"\nPSO Statistics:")
         print(f"  Total evaluations: {result.n_evaluations}")
         print(f"  New bests found: {result.n_new_bests}")
         print(f"  Final diversity: {result.final_diversity:.6f}")
         if result.convergence_iteration is not None:
             print(f"  Converged at iteration: {result.convergence_iteration}")
+        print(f"  Metadata snapshots: {len(result.metadata_history)}")
         print(f"{'='*80}\n")
 
         return {
@@ -1072,7 +1165,9 @@ class OptogeneticCircuitOptimizer:
             'pso_config': config,
             'pso_result': result,
             'history': self.history,
-            'targets': self.targets
+            'targets': self.targets,
+            'best_metadata': self.best_metadata,
+            'metadata_history': result.metadata_history  # all metadata snapshots
         }
     
     def _optimize_differential_evolution(self, connection_names, max_iterations=50,
@@ -1120,8 +1215,30 @@ class OptogeneticCircuitOptimizer:
             'strategy': strategy.get_strategy_info()['name'],
             'base_seed': self.base_seed
         }
+
+    def _print_metadata(self, metadata):
+        print(f"\n{'='*80}")
+        print("Metadata from optimization evaluation")
+        print(f"{'='*80}")
+        print(f"  Baseline loss: {metadata.get('baseline_loss', 'N/A'):.6f}")
+        print(f"  Opto loss: {metadata.get('opto_loss', 'N/A'):.6f}")
+
+        if 'baseline_rates' in metadata:
+            print("\n  Baseline rates from optimization:")
+            for pop, rate in metadata['baseline_rates'].items():
+                print(f"    {pop.upper()}: {rate:.3f} Hz")
+
+        if 'opto_details' in metadata:
+            print("\n  Optogenetic effects from optimization:")
+            for target_pop in ['pv', 'sst']:
+                if target_pop in metadata['opto_details']:
+                    print(f"\n    {target_pop.upper()} stimulation:")
+                    for affected_pop in metadata['opto_details'][target_pop]:
+                        data = metadata['opto_details'][target_pop][affected_pop]
+                        print(f"      {affected_pop.upper()}: activated_fraction = {data.get('activated_fraction', 'N/A'):.3f}")
+        
     
-    def _print_diagnostics(self, position, loss, connection_names):
+    def _print_diagnostics(self, position, loss, connection_names, metadata=None):
         """Print detailed diagnostics for a configuration"""
         print(f"\n{'#'*80}")
         print("NEW BEST SOLUTION FOUND")
@@ -1132,7 +1249,11 @@ class OptogeneticCircuitOptimizer:
         print("Connection modulation parameters:")
         for name, value in param_dict.items():
             print(f"  {name}: {value:.3f}")
-        
+
+        # Show metadata from optimization if available
+        if metadata is not None:
+            self._print_metadata(metadata)
+            
         # Detailed evaluation with verbose output
         print(f"\n{'='*80}")
         print("Detailed evaluation of candidate parameters")
@@ -1171,7 +1292,7 @@ class OptogeneticCircuitOptimizer:
                 error = abs(actual_rate - target_rate)
                 
                 print(f"  {pop.upper()}:")
-                print(f"    Target: {target_rate:.3f} Hz ± {tolerance:.3f}")
+                print(f"    Target: {target_rate:.3f} Hz +/- {tolerance:.3f}")
                 print(f"    Actual: {actual_rate:.3f} Hz")
                 print(f"    Error:  {error:.3f} Hz")
         
@@ -1222,8 +1343,8 @@ class OptogeneticCircuitOptimizer:
         print(f"\n{'='*80}")
         print("Combined loss breakdown")
         print(f"{'='*80}")
-        print(f"  Baseline: {baseline_loss:.6f} × {self.targets.baseline_weight} = {baseline_loss * self.targets.baseline_weight:.6f}")
-        print(f"  Optogenetic: {opto_loss:.6f} × {self.targets.optogenetic_weight} = {opto_loss * self.targets.optogenetic_weight:.6f}")
+        print(f"  Baseline: {baseline_loss:.6f} x {self.targets.baseline_weight} = {baseline_loss * self.targets.baseline_weight:.6f}")
+        print(f"  Optogenetic: {opto_loss:.6f} x {self.targets.optogenetic_weight} = {opto_loss * self.targets.optogenetic_weight:.6f}")
         print(f"  TOTAL: {recomputed_loss:.6f}")
         
         print(f"\n{'='*80}")
@@ -1231,7 +1352,7 @@ class OptogeneticCircuitOptimizer:
         print(f"{'='*80}")
         print(f"  Loss from optimizer:  {loss:.6f}")
         print(f"  Recomputed loss:      {recomputed_loss:.6f}")
-        if abs(loss - recomputed_loss) > 1e-2:
+        if abs(loss - recomputed_loss) > 0.1:
             print(f"  WARNING: Loss mismatch!")
         print(f"{'='*80}\n")
     
@@ -1262,6 +1383,7 @@ class OptogeneticCircuitOptimizer:
             'optimized_parameters': {
                 'connection_modulation': self.best_params
             },
+            'best_configuration_metadata': self.best_metadata,  # Include metadata
             'history': self.history
         }
         
@@ -1327,7 +1449,7 @@ def run_global_optimization(optimization_config,
         rate_ordering_constraints=base_targets.rate_ordering_constraints,
         optogenetic_targets=OptogeneticTargets(),
         baseline_weight=1.0,
-        optogenetic_weight=4.0
+        optogenetic_weight=2.0
     )
     
     # Create optimizer

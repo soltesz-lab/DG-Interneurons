@@ -650,6 +650,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                opsin_current: float = 100.0,
                                stim_start: float = 1000.0,
                                stim_duration: float = 2000.0,
+                               warmup: float = 250.0,
                                plot_activity: bool = True,
                                device: Optional[torch.device] = None,
                                n_trials: int = 1,
@@ -720,6 +721,9 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     
     # Test different stimulation intensities
     results = {}
+
+    if stim_start < warmup:
+        stim_start = warmup
     
     for target in ['pv', 'sst']:
         results[target] = {}
@@ -745,7 +749,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             activity_std = result['activity_trace_std']
             opsin_expression_mean = result['opsin_expression_mean']
             
-            baseline_mask = (time >= 150) & (time < stim_start)
+            baseline_mask = (time >= warmup) & (time < stim_start)
             stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
             
             analysis = {}
