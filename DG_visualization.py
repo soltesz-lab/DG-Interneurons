@@ -580,6 +580,125 @@ class DGCircuitVisualization:
             plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
 
         return fig, activity_history
+
+    def plot_activity_raster(self, activity_trace, vmin=0, vmax=None, 
+                             mean_linewidth=2.5, cmap='coolwarm', save_path=None):
+        """
+        Plot circuit activity as raster plots with neurons sorted by mean firing rate
+
+        Each neuron's activity is shown as a row in a heatmap, with color indicating
+        firing rate. Neurons are ordered by mean firing rate (highest at top).
+        Population mean firing rate is superimposed as a line trace.
+
+        Args:
+            activity_trace: Dictionary with population keys, each containing array of shape (n_cells, timesteps)
+            vmin: Minimum value for colormap (default: 0 Hz)
+            vmax: Maximum value for colormap (default: auto-computed per population)
+            mean_linewidth: Line width for population mean trace overlay
+            cmap: Colormap name (default: 'coolwarm')
+            save_path: Path to save figure
+        """
+        # Determine number of timesteps
+        timesteps = None
+        for pop in activity_trace.keys():
+            timesteps = activity_trace[pop].shape[1]
+            break
+
+        # Create time axis
+        time_axis = np.arange(timesteps) * self.circuit.circuit_params.dt
+
+        # Create figure with subplots
+        n_populations = len(activity_trace)
+        fig, axes = plt.subplots(2, 3, figsize=self.config.figsize_large, dpi=self.config.dpi)
+        axes = axes.flatten()
+
+        # Storage for mean activity
+        activity_history = {pop: [] for pop in self.pop_sizes.keys()}
+
+        for idx, (pop, activity) in enumerate(activity_trace.items()):
+            if idx >= len(axes):
+                break
+
+            ax = axes[idx]
+
+            # Get activity data (convert from torch tensor if needed)
+            if hasattr(activity, 'cpu'):
+                activity_data = activity.cpu().numpy()
+            else:
+                activity_data = np.array(activity)
+
+            n_cells = activity_data.shape[0]
+
+            # Calculate mean activity per neuron across time
+            mean_activity_per_neuron = np.mean(activity_data, axis=1)
+
+            # Sort neurons by mean firing rate (descending - highest at top)
+            sorted_indices = np.argsort(mean_activity_per_neuron)[::-1]
+            sorted_activity = activity_data[sorted_indices, :]
+
+            # Determine colormap range
+            vmax_pop = vmax if vmax is not None else np.percentile(sorted_activity, 99)
+
+            # Plot raster as heatmap
+            im = ax.imshow(sorted_activity, 
+                           aspect='auto',
+                           cmap=cmap,
+                           vmin=vmin,
+                           vmax=vmax_pop,
+                           interpolation='nearest',
+                           extent=[time_axis[0], time_axis[-1], n_cells, 0],
+                           zorder=1)
+
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('Firing Rate (Hz)', rotation=270, labelpad=15)
+
+            # Compute population mean activity
+            mean_activity = np.mean(activity_data, axis=0)
+            activity_history[pop] = mean_activity.tolist()
+
+            # Create twin axis for mean firing rate overlay
+            ax2 = ax.twinx()
+
+            # Normalize mean activity to neuron index range for overlay
+            # Map mean activity to span the neuron index range
+            mean_normalized = (mean_activity / vmax_pop) * n_cells
+
+            # Plot mean firing rate as overlay
+            ax2.plot(time_axis, mean_normalized, 
+                    color='black',
+                    linewidth=mean_linewidth,
+                    linestyle='-',
+                    alpha=0.8,
+                    label=f'Mean={np.mean(mean_activity):.1f} Hz',
+                    zorder=2)
+
+            # Configure primary axis (raster)
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('Neuron Index\n(sorted by activity)')
+            ax.set_title(f'{pop.upper()} Activity Raster\n({n_cells} cells)')
+
+            # Configure secondary axis (mean trace)
+            ax2.set_ylabel('Normalized Mean Activity', rotation=270, labelpad=20)
+            ax2.set_ylim([0, n_cells])
+            ax2.legend(loc='upper right', framealpha=0.7)
+
+            # Add grid on primary axis
+            ax.grid(False)
+
+        # Remove unused subplots
+        for idx in range(len(activity_trace), len(axes)):
+            fig.delaxes(axes[idx])
+
+        plt.suptitle('DG Circuit Activity Rasters: Neurons Sorted by Mean Firing Rate', 
+                    fontsize=16, fontweight='bold')
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+
+        return fig, activity_history
+
     
     def plot_network_graph(self, connection_types=None, layout_type='spring',
                           node_size_scale=1.0, save_path=None):
