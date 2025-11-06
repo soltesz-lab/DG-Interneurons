@@ -13,6 +13,7 @@ The objective function can return either:
 - Tuple[np.ndarray, List[Dict]]: (scores, metadata) for each evaluation
 """
 
+import logging
 import pprint
 import numpy as np
 from typing import Callable, Dict, List, Tuple, Optional, Any, Union
@@ -236,6 +237,12 @@ class AdaptivePSO:
         self.initial_diversity = None
         self.supports_metadata = None  # Auto-detect on first evaluation
         self.print_metadata = print_metadata
+        self.logger = logging.getLogger(__name__)
+        if self.config.verbose:
+            self.logger.setLevel(logging.INFO)
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            self.logger.addHandler(ch)
         
     def optimize(self) -> PSOResult:
         """
@@ -268,10 +275,9 @@ class AdaptivePSO:
                 diversity_normalized, iteration
             )
             
-            if self.config.verbose:
-                print(f"Diversity: {diversity:.6f} (normalized: {diversity_normalized:.3f}, "
-                      f"state: {diversity_state.value})")
-                print(f"PSO parameters: w={w:.3f}, c1={c1:.3f}, c2={c2:.3f}")
+            self.logger.info(f"Diversity: {diversity:.6f} (normalized: {diversity_normalized:.3f}, "
+                             f"state: {diversity_state.value})")
+            self.logger.info(f"PSO parameters: w={w:.3f}, c1={c1:.3f}, c2={c2:.3f}")
             
             # Update swarm
             self._update_velocities_and_positions(w, c1, c2)
@@ -284,18 +290,16 @@ class AdaptivePSO:
                 scores, metadata_list
             )
             
-            if self.config.verbose:
-                print(f"Particles improved: {np.sum(improved)}/{self.config.n_particles}")
-                print(f"Score range: [{np.min(scores):.6f}, {np.max(scores):.6f}], "
-                      f"mean: {np.mean(scores):.6f}")
+            self.logger.info(f"Particles improved: {np.sum(improved)}/{self.config.n_particles}")
+            self.logger.info(f"Score range: [{np.min(scores):.6f}, {np.max(scores):.6f}], "
+                             f"mean: {np.mean(scores):.6f}")
             
             # Handle new best
             if new_best_found:
                 improvement = self.history['best_scores'][-1] - self.global_best_score \
                              if self.history['best_scores'] else 0
-                if self.config.verbose:
-                    print(f"\n★ New best: {self.global_best_score:.6f} "
-                          f"(improvement: {improvement:.6f})")
+                self.logger.info(f"\nNew best: {self.global_best_score:.6f} "
+                                 f"(improvement: {improvement:.6f})")
                 
                 # Store metadata for this new best
                 if self.config.track_metadata and new_best_metadata is not None:
@@ -317,8 +321,7 @@ class AdaptivePSO:
                     convergence_iteration = iteration
             else:
                 no_improvement_count += 1
-                if self.config.verbose:
-                    print(f"No improvement (count: {no_improvement_count})")
+                self.logger.info(f"No improvement (count: {no_improvement_count})")
             
             # Update multi-swarm
             if self.config.use_multi_swarm:
@@ -326,23 +329,20 @@ class AdaptivePSO:
                 
                 # Check for regrouping
                 if (iteration + 1) % self.config.regrouping_period == 0:
-                    if self.config.verbose:
-                        print(f"\n↻ Regrouping sub-swarms...")
+                    self.logger.info(f"\nRegrouping sub-swarms...")
                     self._regroup_sub_swarms()
             
             # Handle stagnation
             if no_improvement_count >= self.config.obl_escape_threshold and \
                self.config.obl_escape_enabled:
                 # Try OBL escape first
-                if self.config.verbose:
-                    print(f"\n⚠ Stagnation detected ({no_improvement_count} iterations)")
+                self.logger.info(f"\nStagnation detected ({no_improvement_count} iterations)")
                 self._obl_escape()
                 no_improvement_count = 0  # Reset after escape
                 
             elif no_improvement_count >= self.config.restart_threshold:
                 # If still stagnating, do intelligent restart
-                if self.config.verbose:
-                    print(f"\n🔄 Restarting...")
+                self.logger.info(f"\nRestarting...")
                 self._intelligent_restart()
                 no_improvement_count = 0  # Reset after restart
             
@@ -357,8 +357,7 @@ class AdaptivePSO:
                 'diversity_state': diversity_state.value
             })
             
-            if self.config.verbose:
-                print(f"\nBest score so far: {self.global_best_score:.6f}")
+            self.logger.info(f"\nBest score so far: {self.global_best_score:.6f}")
         
         # Finalize
         self._print_footer()
@@ -396,12 +395,10 @@ class AdaptivePSO:
         # Compute initial diversity
         self.initial_diversity, _ = self._compute_diversity()
         
-        if self.config.verbose:
-            print(f"Initial best score: {self.global_best_score:.6f}")
-            print(f"Initial diversity: {self.initial_diversity:.6f}")
-            if self.supports_metadata:
-                print(f"Metadata tracking: ENABLED")
-            print()
+        self.logger.info(f"Initial best score: {self.global_best_score:.6f}")
+        self.logger.info(f"Initial diversity: {self.initial_diversity:.6f}")
+        if self.supports_metadata:
+            self.logger.info(f"Metadata tracking enabled")
     
     def _initialize_random(self):
         """Standard random initialization."""
@@ -428,8 +425,7 @@ class AdaptivePSO:
     
     def _initialize_with_obl(self):
         """Initialize with Opposition-Based Learning."""
-        if self.config.verbose:
-            print("Initializing with Opposition-Based Learning...")
+        self.logger.info("Initializing with Opposition-Based Learning...")
         
         # Generate random positions
         random_positions = np.random.uniform(
@@ -472,8 +468,7 @@ class AdaptivePSO:
         if self.supports_metadata:
             self.global_best_metadata = all_metadata[best_indices[0]]
         
-        if self.config.verbose:
-            print(f"  OBL: Best = {scores[0]:.6f}, Worst = {scores[-1]:.6f}")
+        self.logger.info(f"  OBL: Best = {scores[0]:.6f}, Worst = {scores[-1]:.6f}")
     
     def _initialize_multi_swarm(self):
         """Initialize sub-swarms for DMS-PSO."""
@@ -492,12 +487,11 @@ class AdaptivePSO:
         
         self._update_sub_swarm_bests()
         
-        if self.config.verbose:
-            print(f"Initialized {self.config.n_sub_swarms} sub-swarms")
-            for i, swarm in enumerate(self.sub_swarms):
-                print(f"  Sub-swarm {i}: {len(swarm)} particles, "
-                      f"best score = {self.local_best_scores[i]:.6f}")
-            print()
+        self.logger.info(f"Initialized {self.config.n_sub_swarms} sub-swarms")
+        for i, swarm in enumerate(self.sub_swarms):
+            self.logger.info(f"  Sub-swarm {i}: {len(swarm)} particles, "
+                             f"best score = {self.local_best_scores[i]:.6f}")
+
     
     # ========================================================================
     # Core PSO Update Methods
@@ -722,8 +716,7 @@ class AdaptivePSO:
                             self.config.obl_escape_fraction))
         worst_indices = np.argsort(self.personal_best_scores)[-n_worst:]
         
-        if self.config.verbose:
-            print(f"  OBL escape: Replacing {n_worst} worst particles")
+        self.logger.info(f"  OBL escape: Replacing {n_worst} worst particles")
         
         for idx in worst_indices:
             opposite = self._calculate_opposites(
@@ -740,9 +733,8 @@ class AdaptivePSO:
                             self.config.elite_fraction))
         elite_indices = np.argsort(self.personal_best_scores)[:n_elite]
         
-        if self.config.verbose:
-            print(f"  Keeping {n_elite} elites, reinitializing "
-                  f"{self.config.n_particles - n_elite} particles")
+        self.logger.info(f"  Keeping {n_elite} elites, reinitializing "
+                         f"{self.config.n_particles - n_elite} particles")
         
         for i in range(self.config.n_particles):
             if i not in elite_indices:
@@ -784,70 +776,74 @@ class AdaptivePSO:
         """Print optimization header."""
         if not self.config.verbose:
             return
-        
-        print("\n" + "="*80)
-        print("Adaptive Particle Swarm Optimization")
-        print("="*80)
-        print(f"Configuration:")
-        print(f"  Particles: {self.config.n_particles}")
-        print(f"  Iterations: {self.config.max_iterations}")
-        print(f"  Dimensions: {self.n_dimensions}")
-        print(f"  OBL Initialization: {self.config.use_obl_initialization}")
-        print(f"  Adaptive Parameters: {self.config.use_adaptive_parameters}")
-        print(f"  Multi-Swarm: {self.config.use_multi_swarm}")
+
+        subswarm_info = ""
         if self.config.use_multi_swarm:
-            print(f"    Sub-swarms: {self.config.n_sub_swarms}")
-            print(f"    Regrouping: Every {self.config.regrouping_period} iterations")
-        print(f"  Metadata Tracking: {self.config.track_metadata}")
-        print("="*80 + "\n")
+            subswarm_info = f"    Sub-swarms: {self.config.n_sub_swarms}\n" \
+                f"    Regrouping: Every {self.config.regrouping_period} iterations"
+            
+        info = ("\n" + "="*80,
+                "Adaptive Particle Swarm Optimization",
+                "="*80,
+                f"Configuration:",
+                f"  Particles: {self.config.n_particles}",
+                f"  Iterations: {self.config.max_iterations}",
+                f"  Dimensions: {self.n_dimensions}",
+                f"  OBL Initialization: {self.config.use_obl_initialization}",
+                f"  Adaptive Parameters: {self.config.use_adaptive_parameters}",
+                f"  Multi-Swarm: {self.config.use_multi_swarm}",
+                subswarm_info,
+                f"  Metadata Tracking: {self.config.track_metadata}",
+                "="*80 + "\n")
+        
+        for item in info:
+            self.logger.info(item)
     
     def _print_iteration_header(self, iteration: int):
         """Print iteration header."""
-        if not self.config.verbose:
-            return
-        print(f"\n{'='*80}")
-        print(f"Iteration {iteration+1}/{self.config.max_iterations}")
-        print(f"{'='*80}")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"Iteration {iteration+1}/{self.config.max_iterations}")
+        self.logger.info(f"{'='*80}")
     
     def _print_diagnostics(self):
         """Print detailed diagnostics."""
         if not self.config.verbose:
             return
         
-        print(f"\n{'#'*80}")
-        print("Best solution diagnostics")
-        print(f"{'#'*80}")
-        print(f"Score: {self.global_best_score:.6f}")
-        print(f"Position (first 10 dims):")
+        self.logger.info(f"\n{'#'*80}")
+        self.logger.info("Best solution diagnostics")
+        self.logger.info(f"{'#'*80}")
+        self.logger.info(f"Score: {self.global_best_score:.6f}")
+        self.logger.info(f"Position (first 10 dims):")
         for i, val in enumerate(self.global_best_position[:10]):
-            print(f"  Dim {i}: {val:.6f}")
+            self.logger.info(f"  Dim {i}: {val:.6f}")
         if self.n_dimensions > 10:
-            print(f"  ... and {self.n_dimensions - 10} more dimensions")
+            self.logger.info(f"  ... and {self.n_dimensions - 10} more dimensions")
         
         if self.supports_metadata and self.global_best_metadata is not None:
-            print(f"\nMetadata available for this configuration:")
+            self.logger.info(f"\nMetadata available for this configuration:")
             if self.print_metadata is None:
-                pprint.pprint(self.global_best_metadata)
+                self.logger.info(pprint.pformat(self.global_best_metadata))
             else:
-                self.print_metadata(self.global_best_metadata)
+                self.print_metadata(self.global_best_metadata, logger=self.logger)
             
-        print(f"{'#'*80}")
+        self.logger.info(f"{'#'*80}")
     
     def _print_footer(self):
         """Print optimization completion."""
         if not self.config.verbose:
             return
         
-        print("\n" + "="*80)
-        print("Optimization complete")
-        print("="*80)
-        print(f"Best score: {self.global_best_score:.6f}")
-        print(f"Total evaluations: {self.n_evaluations}")
-        print(f"Function evals per iteration: "
+        self.logger.info("\n" + "="*80)
+        self.logger.info("Optimization complete")
+        self.logger.info("="*80)
+        self.logger.info(f"Best score: {self.global_best_score:.6f}")
+        self.logger.info(f"Total evaluations: {self.n_evaluations}")
+        self.logger.info(f"Function evals per iteration: "
               f"{self.n_evaluations / self.config.max_iterations:.1f}")
         if self.config.track_metadata:
-            print(f"Metadata snapshots stored: {len(self.metadata_history)}")
-        print("="*80)
+            self.logger.info(f"Metadata snapshots stored: {len(self.metadata_history)}")
+        self.logger.info("="*80)
 
 
 # ============================================================================

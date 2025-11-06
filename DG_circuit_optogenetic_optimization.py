@@ -8,7 +8,9 @@ Optimization framework including optogenetic stimulation effects
 
 EvaluationStrategy pattern for automatic device-appropriate strategy selection.
 """
+
 import sys
+import logging
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -152,7 +154,8 @@ class BatchOptogeneticEvaluator:
                  targets: CombinedOptimizationTargets,
                  config: OptimizationConfig,
                  device: Optional[torch.device] = None,
-                 base_seed: int = 42):
+                 base_seed: int = 42,
+                 verbose: bool = False):
         """
         Initialize batch optogenetic evaluator
         
@@ -172,9 +175,14 @@ class BatchOptogeneticEvaluator:
         self.config = config
         self.device = device if device is not None else get_default_device()
         self.base_seed = base_seed
-        
-        print(f"BatchOptogeneticEvaluator initialized on device: {self.device}")
-        print(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
+        self.logger = logging.getLogger("DG_eval")
+        if verbose:
+            self.logger.setLevel(logging.INFO)
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            self.logger.addHandler(ch)
+        self.logger.info(f"BatchOptogeneticEvaluator initialized on device: {self.device}")
+        self.logger.info(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
     
     def evaluate_parameter_batch(self,
                                  parameter_batch: List[Dict[str, float]],
@@ -239,7 +247,7 @@ class BatchOptogeneticEvaluator:
             set_random_seed(trial_seed, self.device)
             
             if trial == 0:
-                print(f"  Trial {trial + 1}/{self.config.n_trials}: Creating circuit with seed {trial_seed}...")
+                self.logger.info(f"  Trial {trial + 1}/{self.config.n_trials}: Creating circuit with seed {trial_seed}...")
             
             # Create circuit for this trial with fresh connectivity
             circuit = BatchDentateCircuit(
@@ -262,12 +270,17 @@ class BatchOptogeneticEvaluator:
             
             # Collect activities over time
             activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+
+            dt = self.circuit_params.dt
+            duration = self.config.warmup_duration + self.config.simulation_duration
+            n_steps = int(duration / dt)
+            warmup_steps = int(self.config.warmup_duration / dt)
             
-            for t in range(self.config.simulation_duration):
+            for t in range(n_steps):
                 external_drive = {'mec': mec_input}
                 activities = circuit({}, external_drive)
                 
-                if t >= self.config.warmup_duration:
+                if t >= warmup_steps:
                     for pop in activities_over_time:
                         if pop in activities:
                             activities_over_time[pop].append(activities[pop])
@@ -501,8 +514,6 @@ class BatchOptogeneticEvaluator:
         stim_end_step = int((stim_start + stim_duration) / dt)
         time_tensor = torch.arange(n_steps, device=self.device) * dt
 
-        print(f"time_tensor.shape = {time_tensor.shape}")
-        
         for t in range(n_steps):
             current_time = t * dt
             
@@ -541,7 +552,6 @@ class BatchOptogeneticEvaluator:
         for pop in activities_time_series:
             if len(activities_time_series[pop]) > 0:
                 activities_time_series[pop] = torch.stack(activities_time_series[pop], dim=0)
-                print(f"activities_time_series[{pop}].shape: {activities_time_series[pop].shape}")
                 
         # Calculate statistics
         baseline_mask = (time_tensor >= warmup) & (time_tensor < stim_start)
@@ -663,9 +673,9 @@ class OptogeneticEvaluationStrategy(ABC):
     
     @abstractmethod
     def evaluate_batch(self,
-                      parameter_sets: List[Dict[str, float]],
-                      mec_drive: float,
-                      n_trials: int) -> Tuple[List[float], List[Dict]]:
+                       parameter_sets: List[Dict[str, float]],
+                       mec_drive: float,
+                       n_trials: int) -> Tuple[List[float], List[Dict]]:
         """
         Evaluate a batch of parameter configurations with optogenetic protocols
         
@@ -690,7 +700,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
     """Sequential evaluation for gradient-based or single evaluations"""
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
-                 targets, config, device, base_seed=42):
+                 targets, config, device, base_seed=42, verbose=False):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
@@ -698,6 +708,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
         self.config = config
         self.device = device
         self.base_seed = base_seed
+        self.verbose = verbose
     
     def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
         """Evaluate configurations one at a time"""
@@ -708,7 +719,8 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
             # Use batch evaluator with batch_size=1
             evaluator = BatchOptogeneticEvaluator(
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
-                self.targets, self.config, device=self.device, base_seed=self.base_seed
+                self.targets, self.config, device=self.device, base_seed=self.base_seed,
+                verbose=self.verbose
             )
             
             loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_drive)
@@ -763,7 +775,7 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
     """Batch GPU evaluation for population-based optimization"""
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
-                 targets, config, device, base_seed=42):
+                 targets, config, device, base_seed=42, verbose=False):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
@@ -771,11 +783,13 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
         self.config = config
         self.device = device
         self.base_seed = base_seed
+        self.verbose = verbose
         
         # Create evaluator
         self.evaluator = BatchOptogeneticEvaluator(
             circuit_params, base_synaptic_params, opsin_params,
-            targets, config, device=device, base_seed=base_seed
+            targets, config, device=device, base_seed=base_seed,
+            verbose=self.verbose
         )
     
     def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
@@ -848,7 +862,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
                  targets, config, device, n_workers=None, n_threads_per_worker=1,
-                 base_seed=42):
+                 base_seed=42, verbose=False):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
@@ -856,6 +870,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
         self.config = config
         self.device = device
         self.base_seed = base_seed
+        self.verbose = verbose
         
         # Configure workers
         n_cores = mp.cpu_count()
@@ -878,11 +893,11 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
             opsin_params
         )
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_drive, n_trials, verbose=False):
         """Evaluate configurations using multiprocessing"""
         # Prepare arguments for workers
         eval_args = [
-            (params, mec_drive, self.worker_data, self.targets, self.config, self.base_seed)
+            (params, mec_drive, self.worker_data, self.targets, self.config, self.base_seed, self.verbose)
             for params in parameter_sets
         ]
         
@@ -910,7 +925,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
 
 def _optogenetic_worker_evaluate(args):
     """Worker function for multiprocess optogenetic evaluation"""
-    (connection_modulation, mec_drive, worker_data, targets, config, base_seed) = args
+    (connection_modulation, mec_drive, worker_data, targets, config, base_seed, verbose) = args
     
     device = torch.device('cpu')
     circuit_params, base_synaptic_params_dict, opsin_params = worker_data
@@ -928,7 +943,8 @@ def _optogenetic_worker_evaluate(args):
     # Create evaluator with base seed
     evaluator = BatchOptogeneticEvaluator(
         circuit_params, synaptic_params, opsin_params,
-        targets, config, device=device, base_seed=base_seed
+        targets, config, device=device, base_seed=base_seed,
+        verbose=verbose
     )
     
     # Evaluate single parameter set
@@ -994,11 +1010,14 @@ class OptogeneticCircuitOptimizer:
         self.best_params = None
         self.best_iteration = 0
         self.history = {'loss': [], 'parameters': []}
-        
-        print(f"OptogeneticCircuitOptimizer initialized on device: {self.device}")
-        print(f"  Base seed: {base_seed}")
-        print(f"  Baseline weight: {targets.baseline_weight}")
-        print(f"  Optogenetic weight: {targets.optogenetic_weight}")
+
+        self.logger = logging.getLogger("DG_opto_optim")
+        self.logger.setLevel(logging.INFO)
+
+        self.logger.info(f"OptogeneticCircuitOptimizer initialized on device: {self.device}")
+        self.logger.info(f"  Base seed: {base_seed}")
+        self.logger.info(f"  Baseline weight: {targets.baseline_weight}")
+        self.logger.info(f"  Optogenetic weight: {targets.optogenetic_weight}")
     
     def _select_strategy(self, method: str, **kwargs) -> OptogeneticEvaluationStrategy:
         """Select optimal evaluation strategy based on method and device"""
@@ -1006,14 +1025,16 @@ class OptogeneticCircuitOptimizer:
         if method == 'gradient':
             strategy = OptogeneticSequentialStrategy(
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
-                self.targets, self.config, self.device, base_seed=self.base_seed
+                self.targets, self.config, self.device, base_seed=self.base_seed,
+                verbose=True
             )
         
         elif method in ['particle_swarm', 'genetic_algorithm']:
             if self.device.type == 'cuda':
                 strategy = OptogeneticBatchGPUStrategy(
                     self.circuit_params, self.base_synaptic_params, self.opsin_params,
-                    self.targets, self.config, self.device, base_seed=self.base_seed
+                    self.targets, self.config, self.device, base_seed=self.base_seed,
+                    verbose=True
                 )
             else:
                 strategy = OptogeneticMultiprocessCPUStrategy(
@@ -1021,7 +1042,8 @@ class OptogeneticCircuitOptimizer:
                     self.targets, self.config, self.device,
                     n_workers=kwargs.get('n_workers', None),
                     n_threads_per_worker=kwargs.get('n_threads_per_worker', 1),
-                    base_seed=self.base_seed
+                    base_seed=self.base_seed,
+                    verbose=True
                 )
         
         elif method == 'differential_evolution':
@@ -1035,7 +1057,8 @@ class OptogeneticCircuitOptimizer:
                 self.targets, self.config, self.device,
                 n_workers=kwargs.get('n_workers', None),
                 n_threads_per_worker=kwargs.get('n_threads_per_worker', 1),
-                base_seed=self.base_seed
+                base_seed=self.base_seed,
+                verbose=True
             )
         
         else:
@@ -1043,10 +1066,10 @@ class OptogeneticCircuitOptimizer:
         
         # Print strategy info
         info = strategy.get_strategy_info()
-        print(f"\nEvaluation Strategy: {info['name']}")
-        print(f"  Device: {info['device']}")
-        print(f"  Parallelism: {info['parallelism']}")
-        print(f"  Description: {info['description']}\n")
+        self.logger.info(f"\nEvaluation Strategy: {info['name']}")
+        self.logger.info(f"  Device: {info['device']}")
+        self.logger.info(f"  Parallelism: {info['parallelism']}")
+        self.logger.info(f"  Description: {info['description']}\n")
         
         return strategy
     
@@ -1093,7 +1116,8 @@ class OptogeneticCircuitOptimizer:
             """Evaluate batch of parameter configurations."""
             parameter_sets = [dict(zip(connection_names, pos)) for pos in positions]
             mec_drive = self.config.mec_drive_levels[0]
-            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials)
+            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials,
+                                                            verbose=True)
             return np.array(losses), metadata_list
 
         # Configure PSO
@@ -1110,17 +1134,17 @@ class OptogeneticCircuitOptimizer:
         config = PSOConfig(**pso_params)
 
         # Print header
-        print(f"\n{'='*80}")
-        print(f"Circuit Optimization using Adaptive PSO")
-        print(f"{'='*80}")
-        print(f"Strategy: {strategy.get_strategy_info()['name']}")
-        print(f"Device: {self.device}, Seed: {self.base_seed}")
-        print(f"Particles: {config.n_particles}, Iterations: {config.max_iterations}")
-        print(f"OBL: {config.use_obl_initialization}, Adaptive: {config.use_adaptive_parameters}")
-        print(f"Multi-Swarm: {config.use_multi_swarm}")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info(f"Circuit Optimization using Adaptive PSO")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"Strategy: {strategy.get_strategy_info()['name']}")
+        self.logger.info(f"Device: {self.device}, Seed: {self.base_seed}")
+        self.logger.info(f"Particles: {config.n_particles}, Iterations: {config.max_iterations}")
+        self.logger.info(f"OBL: {config.use_obl_initialization}, Adaptive: {config.use_adaptive_parameters}")
+        self.logger.info(f"Multi-Swarm: {config.use_multi_swarm}")
         if config.use_multi_swarm:
-            print(f"  Sub-swarms: {config.n_sub_swarms}, Regrouping: {config.regrouping_period}")
-        print(f"{'='*80}\n")
+            self.logger.info(f"  Sub-swarms: {config.n_sub_swarms}, Regrouping: {config.regrouping_period}")
+        self.logger.info(f"{'='*80}\n")
 
         # Run PSO
         pso = AdaptivePSO(objective_function, bounds, config, random_seed=self.base_seed,
@@ -1139,19 +1163,19 @@ class OptogeneticCircuitOptimizer:
         ]
 
         # Print final diagnostics
-        print(f"\n{'='*80}")
-        print("Circuit optimization results")
-        print(f"{'='*80}")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Circuit optimization results")
+        self.logger.info(f"{'='*80}")
         self._print_diagnostics(result.best_position, result.best_score, connection_names,
                                 metadata=result.best_metadata)
-        print(f"\nPSO Statistics:")
-        print(f"  Total evaluations: {result.n_evaluations}")
-        print(f"  New bests found: {result.n_new_bests}")
-        print(f"  Final diversity: {result.final_diversity:.6f}")
+        self.logger.info(f"\nPSO Statistics:")
+        self.logger.info(f"  Total evaluations: {result.n_evaluations}")
+        self.logger.info(f"  New bests found: {result.n_new_bests}")
+        self.logger.info(f"  Final diversity: {result.final_diversity:.6f}")
         if result.convergence_iteration is not None:
-            print(f"  Converged at iteration: {result.convergence_iteration}")
-        print(f"  Metadata snapshots: {len(result.metadata_history)}")
-        print(f"{'='*80}\n")
+            self.logger.info(f"  Converged at iteration: {result.convergence_iteration}")
+        self.logger.info(f"  Metadata snapshots: {len(result.metadata_history)}")
+        self.logger.info(f"{'='*80}\n")
 
         return {
             'optimized_connection_modulation': self.best_params,
@@ -1182,15 +1206,15 @@ class OptogeneticCircuitOptimizer:
         bounds = [self.targets.connection_bounds.get(name, (0.1, 5.0))
                  for name in connection_names]
         
-        print(f"Starting Differential Evolution...")
-        print(f"Iterations: {max_iterations}")
-        print(f"Trials per evaluation: {self.config.n_trials}")
+        self.logger.info(f"Starting Differential Evolution...")
+        self.logger.info(f"Iterations: {max_iterations}")
+        self.logger.info(f"Trials per evaluation: {self.config.n_trials}")
         
         def objective(param_array):
             param_dict = dict(zip(connection_names, param_array))
             mec_drive = self.config.mec_drive_levels[0]
             losses, _ = strategy.evaluate_batch(
-                [param_dict], mec_drive, self.config.n_trials
+                [param_dict], mec_drive, self.config.n_trials, verbose=True
             )
             return losses[0]
         
@@ -1216,55 +1240,59 @@ class OptogeneticCircuitOptimizer:
             'base_seed': self.base_seed
         }
 
-    def _print_metadata(self, metadata):
-        print(f"\n{'='*80}")
-        print("Metadata from optimization evaluation")
-        print(f"{'='*80}")
-        print(f"  Baseline loss: {metadata.get('baseline_loss', 'N/A'):.6f}")
-        print(f"  Opto loss: {metadata.get('opto_loss', 'N/A'):.6f}")
+    def _print_metadata(self, metadata, logger=None):
+        if logger is None:
+            logger = self.logger
+            
+        logger.info(f"\n{'='*80}")
+        logger.info("Metadata from optimization evaluation")
+        logger.info(f"{'='*80}")
+        logger.info(f"  Baseline loss: {metadata.get('baseline_loss', 'N/A'):.6f}")
+        logger.info(f"  Opto loss: {metadata.get('opto_loss', 'N/A'):.6f}")
 
         if 'baseline_rates' in metadata:
-            print("\n  Baseline rates from optimization:")
+            logger.info("\n  Baseline rates from optimization:")
             for pop, rate in metadata['baseline_rates'].items():
-                print(f"    {pop.upper()}: {rate:.3f} Hz")
+                logger.info(f"    {pop.upper()}: {rate:.3f} Hz")
 
         if 'opto_details' in metadata:
-            print("\n  Optogenetic effects from optimization:")
+            logger.info("\n  Optogenetic effects from optimization:")
             for target_pop in ['pv', 'sst']:
                 if target_pop in metadata['opto_details']:
-                    print(f"\n    {target_pop.upper()} stimulation:")
+                    logger.info(f"\n    {target_pop.upper()} stimulation:")
                     for affected_pop in metadata['opto_details'][target_pop]:
                         data = metadata['opto_details'][target_pop][affected_pop]
-                        print(f"      {affected_pop.upper()}: activated_fraction = {data.get('activated_fraction', 'N/A'):.3f}")
+                        logger.info(f"      {affected_pop.upper()}: activated_fraction = {data.get('activated_fraction', 'N/A'):.3f}")
         
     
     def _print_diagnostics(self, position, loss, connection_names, metadata=None):
         """Print detailed diagnostics for a configuration"""
-        print(f"\n{'#'*80}")
-        print("NEW BEST SOLUTION FOUND")
-        print(f"{'#'*80}")
-        print(f"Loss: {loss:.6f}\n")
+        self.logger.info(f"\n{'#'*80}")
+        self.logger.info("NEW BEST SOLUTION FOUND")
+        self.logger.info(f"{'#'*80}")
+        self.logger.info(f"Loss: {loss:.6f}\n")
         
         param_dict = dict(zip(connection_names, position))
-        print("Connection modulation parameters:")
+        self.logger.info("Connection modulation parameters:")
         for name, value in param_dict.items():
-            print(f"  {name}: {value:.3f}")
+            self.logger.info(f"  {name}: {value:.3f}")
 
         # Show metadata from optimization if available
         if metadata is not None:
             self._print_metadata(metadata)
             
         # Detailed evaluation with verbose output
-        print(f"\n{'='*80}")
-        print("Detailed evaluation of candidate parameters")
-        print(f"{'='*80}")
-        print(f"Device: {self.device}")
-        print(f"Base seed: {self.base_seed} (trials use base_seed + trial_idx)")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Detailed evaluation of candidate parameters")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"Device: {self.device}")
+        self.logger.info(f"Base seed: {self.base_seed} (trials use base_seed + trial_idx)")
         
         # Create evaluator for detailed diagnostics
         evaluator = BatchOptogeneticEvaluator(
             self.circuit_params, self.base_synaptic_params, self.opsin_params,
-            self.targets, self.config, device=self.device, base_seed=self.base_seed
+            self.targets, self.config, device=self.device, base_seed=self.base_seed,
+            verbose=True
         )
         
         # Evaluate configuration
@@ -1279,10 +1307,10 @@ class OptogeneticCircuitOptimizer:
         opto_loss = details['opto_losses'].item()
         baseline_rates = details['baseline_rates']
         
-        print(f"\n{'='*80}")
-        print("Baseline circuit evaluation")
-        print(f"{'='*80}")
-        print(f"  MEC drive: {mec_drive} pA\n")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Baseline circuit evaluation")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"  MEC drive: {mec_drive} pA\n")
         
         for pop in ['gc', 'mc', 'pv', 'sst']:
             if pop in baseline_rates:
@@ -1291,22 +1319,22 @@ class OptogeneticCircuitOptimizer:
                 tolerance = self.targets.rate_tolerance.get(pop, 0.0)
                 error = abs(actual_rate - target_rate)
                 
-                print(f"  {pop.upper()}:")
-                print(f"    Target: {target_rate:.3f} Hz +/- {tolerance:.3f}")
-                print(f"    Actual: {actual_rate:.3f} Hz")
-                print(f"    Error:  {error:.3f} Hz")
+                self.logger.info(f"  {pop.upper()}:")
+                self.logger.info(f"    Target: {target_rate:.3f} Hz +/- {tolerance:.3f}")
+                self.logger.info(f"    Actual: {actual_rate:.3f} Hz")
+                self.logger.info(f"    Error:  {error:.3f} Hz")
         
-        print(f"\n  Baseline loss: {baseline_loss:.6f}")
+        self.logger.info(f"\n  Baseline loss: {baseline_loss:.6f}")
         
-        print(f"\n{'='*80}")
-        print("Optogenetic stimulation evaluation")
-        print(f"{'='*80}")
-        print(f"  Note: Averaged over {self.config.n_trials} trials with different connectivity")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Optogenetic stimulation evaluation")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"  Note: Averaged over {self.config.n_trials} trials with different connectivity")
         
         opto_details = details['opto_details']
         for target_pop in ['pv', 'sst']:
             if target_pop in opto_details:
-                print(f"\n--- {target_pop.upper()} Stimulation ---")
+                self.logger.info(f"\n--- {target_pop.upper()} Stimulation ---")
                 pop_results = opto_details[target_pop]
                 
                 for affected_pop in ['gc', 'mc', 'pv', 'sst']:
@@ -1319,47 +1347,47 @@ class OptogeneticCircuitOptimizer:
                         activated_fraction = result['activated_fraction'].item()
                         gini_change = result['gini_change'].item()
                         
-                        print(f"\n  {affected_pop.upper()}:")
-                        print(f"    Baseline rate: {baseline_mean:.3f} Hz")
-                        print(f"    Stim rate: {stim_mean:.3f} Hz")
-                        print(f"    Mean change: {mean_change:+.3f} Hz")
-                        print(f"    Activated fraction: {activated_fraction:.3f}")
+                        self.logger.info(f"\n  {affected_pop.upper()}:")
+                        self.logger.info(f"    Baseline rate: {baseline_mean:.3f} Hz")
+                        self.logger.info(f"    Stim rate: {stim_mean:.3f} Hz")
+                        self.logger.info(f"    Mean change: {mean_change:+.3f} Hz")
+                        self.logger.info(f"    Activated fraction: {activated_fraction:.3f}")
                         
                         # Show target if available
                         opto_targets = self.targets.optogenetic_targets
                         if (target_pop in opto_targets.target_rate_increases and 
                             affected_pop in opto_targets.target_rate_increases[target_pop]):
                             target_frac = opto_targets.target_rate_increases[target_pop][affected_pop]
-                            print(f"      (target: {target_frac:.3f})")
+                            self.logger.info(f"      (target: {target_frac:.3f})")
                         
-                        print(f"    Gini change: {gini_change:+.4f}")
+                        self.logger.info(f"    Gini change: {gini_change:+.4f}")
                         if (target_pop in opto_targets.target_gini_increase and
                             affected_pop in opto_targets.target_gini_increase[target_pop]):
                             target_gini = opto_targets.target_gini_increase[target_pop][affected_pop]
-                            print(f"      (target: {target_gini:+.4f})")
+                            self.logger.info(f"      (target: {target_gini:+.4f})")
         
-        print(f"\n  Total optogenetic loss: {opto_loss:.6f}")
+        self.logger.info(f"\n  Total optogenetic loss: {opto_loss:.6f}")
         
-        print(f"\n{'='*80}")
-        print("Combined loss breakdown")
-        print(f"{'='*80}")
-        print(f"  Baseline: {baseline_loss:.6f} x {self.targets.baseline_weight} = {baseline_loss * self.targets.baseline_weight:.6f}")
-        print(f"  Optogenetic: {opto_loss:.6f} x {self.targets.optogenetic_weight} = {opto_loss * self.targets.optogenetic_weight:.6f}")
-        print(f"  TOTAL: {recomputed_loss:.6f}")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Combined loss breakdown")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"  Baseline: {baseline_loss:.6f} x {self.targets.baseline_weight} = {baseline_loss * self.targets.baseline_weight:.6f}")
+        self.logger.info(f"  Optogenetic: {opto_loss:.6f} x {self.targets.optogenetic_weight} = {opto_loss * self.targets.optogenetic_weight:.6f}")
+        self.logger.info(f"  TOTAL: {recomputed_loss:.6f}")
         
-        print(f"\n{'='*80}")
-        print("Loss verification")
-        print(f"{'='*80}")
-        print(f"  Loss from optimizer:  {loss:.6f}")
-        print(f"  Recomputed loss:      {recomputed_loss:.6f}")
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Loss verification")
+        self.logger.info(f"{'='*80}")
+        self.logger.info(f"  Loss from optimizer:  {loss:.6f}")
+        self.logger.info(f"  Recomputed loss:      {recomputed_loss:.6f}")
         if abs(loss - recomputed_loss) > 0.1:
-            print(f"  WARNING: Loss mismatch!")
-        print(f"{'='*80}\n")
+            self.logger.info(f"  WARNING: Loss mismatch!")
+        self.logger.info(f"{'='*80}\n")
     
     def save_results(self, filename: str):
         """Save optimization results to JSON"""
         if self.best_params is None:
-            print("No results to save")
+            self.logger.info("No results to save")
             return
         
         results = {
@@ -1390,7 +1418,7 @@ class OptogeneticCircuitOptimizer:
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2)
         
-        print(f"\nResults saved to {filename}")
+        self.logger.info(f"\nResults saved to {filename}")
 
 
 # ============================================================================
@@ -1398,13 +1426,13 @@ class OptogeneticCircuitOptimizer:
 # ============================================================================
 
 def run_global_optimization(optimization_config,
-                           device: Optional[torch.device] = None,
-                           n_workers=1,
-                           n_threads_per_worker=1,
-                           method='particle_swarm',
-                           n_particles=20,
-                           max_iterations=50,
-                           diagnostic_frequency=5,
+                            device: Optional[torch.device] = None,
+                            n_workers=1,
+                            n_threads_per_worker=1,
+                            method='particle_swarm',
+                            n_particles=20,
+                            max_iterations=50,
+                            diagnostic_frequency=5,
                             base_seed=42,
                             output_file="DG_optogenetic_optimization_results.json"):
     """
@@ -1434,7 +1462,8 @@ def run_global_optimization(optimization_config,
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
         print(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
-    
+    sys.stdout.flush()
+        
     # Setup
     circuit_params = CircuitParams()
     base_synaptic_params = PerConnectionSynapticParams()
