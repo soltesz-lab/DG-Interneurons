@@ -546,7 +546,9 @@ class DentateCircuit(nn.Module):
                  circuit_params: CircuitParams,
                  synaptic_params: PerConnectionSynapticParams,
                  opsin_params: OpsinParams,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 inference_mode: bool = True,
+                 compile_circuit: bool = True):
         super().__init__()
         
         # Set device (use provided or auto-detect)
@@ -597,7 +599,32 @@ class DentateCircuit(nn.Module):
         self.register_buffer('sst_v_soma', torch.zeros(circuit_params.n_sst, device=self.device))
 
         self.add_synaptic_state_manager()
+        
+        self._inference_mode = inference_mode
+        self.set_inference_mode(inference_mode)
 
+        if compile_circuit:
+            self._dendritic_somatic_transfer = torch.compile(
+                    self._dendritic_somatic_transfer,
+                    mode='reduce-overhead'
+                )
+
+    def set_inference_mode(self, enabled: bool = True):
+        # Disable or enable gradients for all parameters and buffers
+        for param in self.parameters():
+            param.requires_grad_(not enabled)
+    
+        for buf in self.buffers():
+            buf.requires_grad_(not enabled)
+
+        # Set eval/train mode
+        if enabled:
+            self.eval()
+        else:
+            self.train()
+    
+        self._inference_mode = enabled
+        
     def add_synaptic_state_manager(self):
         """Add synaptic state manager to the circuit"""
         if not hasattr(self, 'synaptic_state_manager'):

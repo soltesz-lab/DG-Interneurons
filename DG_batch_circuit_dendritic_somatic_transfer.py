@@ -192,7 +192,9 @@ class BatchDentateCircuit(nn.Module):
                  circuit_params: CircuitParams,
                  synaptic_params: PerConnectionSynapticParams,
                  opsin_params: OpsinParams,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 inference_mode: bool = True,
+                 compile_circuit: bool = True):
         super().__init__()
         
         self.batch_size = batch_size
@@ -257,7 +259,43 @@ class BatchDentateCircuit(nn.Module):
         # Storage for per-batch connection modulation
         # Dict mapping conn_name -> tensor of shape [batch_size]
         self.connection_modulation_batch = None
+
+        self._inference_mode = inference_mode
+        self.set_inference_mode(inference_mode)
+
+        if compile_circuit:
             
+            # Compile batch dendritic-somatic transfer
+            self._batch_dendritic_somatic_transfer = torch.compile(
+                self._batch_dendritic_somatic_transfer,
+                mode='reduce-overhead',
+            #    fullgraph=True  # This method is pure tensor operations
+            )
+            
+            # Optionally compile synaptic state manager
+            if hasattr(self, 'synaptic_state_manager'):
+                self.synaptic_state_manager.update_synaptic_states = torch.compile(
+                    self.synaptic_state_manager.update_synaptic_states,
+                    mode='reduce-overhead'
+                )
+
+    def set_inference_mode(self, enabled: bool = True):
+        # Disable or enable gradients for all parameters and buffers
+        for param in self.parameters():
+            param.requires_grad_(not enabled)
+    
+        for buf in self.buffers():
+            buf.requires_grad_(not enabled)
+
+        # Set eval/train mode
+        if enabled:
+            self.eval()
+        else:
+            self.train()
+    
+        self._inference_mode = enabled
+        
+                
     def set_connection_modulation_batch(self, modulation_list: List[Dict[str, float]]):
         """
         Set connection modulation parameters for each batch element
