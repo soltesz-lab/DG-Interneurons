@@ -893,7 +893,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
             opsin_params
         )
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials, verbose=False):
+    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
         """Evaluate configurations using multiprocessing"""
         # Prepare arguments for workers
         eval_args = [
@@ -1116,8 +1116,7 @@ class OptogeneticCircuitOptimizer:
             """Evaluate batch of parameter configurations."""
             parameter_sets = [dict(zip(connection_names, pos)) for pos in positions]
             mec_drive = self.config.mec_drive_levels[0]
-            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials,
-                                                            verbose=True)
+            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials)
             return np.array(losses), metadata_list
 
         # Configure PSO
@@ -1214,7 +1213,7 @@ class OptogeneticCircuitOptimizer:
             param_dict = dict(zip(connection_names, param_array))
             mec_drive = self.config.mec_drive_levels[0]
             losses, _ = strategy.evaluate_batch(
-                [param_dict], mec_drive, self.config.n_trials, verbose=True
+                [param_dict], mec_drive, self.config.n_trials
             )
             return losses[0]
         
