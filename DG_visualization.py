@@ -647,6 +647,7 @@ class DGCircuitVisualization:
                            vmax=vmax_pop,
                            interpolation='nearest',
                            extent=[time_axis[0], time_axis[-1], n_cells, 0],
+                           alpha=0.6,
                            zorder=1)
 
             # Add colorbar
@@ -666,12 +667,12 @@ class DGCircuitVisualization:
 
             # Plot mean firing rate as overlay
             ax2.plot(time_axis, mean_normalized, 
-                    color='black',
-                    linewidth=mean_linewidth,
-                    linestyle='-',
-                    alpha=0.8,
-                    label=f'Mean={np.mean(mean_activity):.1f} Hz',
-                    zorder=2)
+                     color='black',
+                     linewidth=mean_linewidth,
+                     linestyle='-',
+                     alpha=0.8,
+                     label=f'Mean={np.mean(mean_activity):.1f} Hz',
+                     zorder=2)
 
             # Configure primary axis (raster)
             ax.set_xlabel('Time (ms)')
