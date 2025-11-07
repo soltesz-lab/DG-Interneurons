@@ -1248,9 +1248,9 @@ def create_default_targets() -> OptimizationTargets:
     return OptimizationTargets(
         target_rates={
             'gc': 0.5,  # Low granule cell activity for sparsity
-            'mc': 3.0,   # Moderate mossy cell activity  
+            'mc': 4.0,   # Moderate mossy cell activity  
             'pv': 10.0,   # Fast-spiking PV interneurons
-            'sst': 5.0,   # Slower SST interneurons
+            'sst': 6.0,   # Slower SST interneurons
         },
         sparsity_targets={
             'gc': 0.08,   # ~8% granule cells active (key constraint)
@@ -1279,7 +1279,7 @@ def create_default_global_opt_config(device: Optional[torch.device] = None) -> O
         learning_rate=0.1,
         max_iterations=20,
         mec_drive_levels=[28.0],
-        n_trials=4,  # Reduce for faster iteration
+        n_trials=3,  # Reduce for faster iteration
         simulation_duration=1000,
         warmup_duration=200,
         device=device
