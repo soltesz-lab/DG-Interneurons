@@ -115,20 +115,19 @@ class BatchSynapticStateManager:
             
             if synapse_type == 'excitatory':
                 # Update AMPA conductances
-                states['ampa_conductance'] = (
-                    ampa_decay * states['ampa_conductance'] + 
+                states['ampa_conductance'].copy_(ampa_decay * states['ampa_conductance'] + 
                     (1 - ampa_decay) * synaptic_input * (1 - self.synaptic_params.nmda_fraction)
                 )
                 
                 # Update NMDA conductances 
-                states['nmda_conductance'] = (
+                states['nmda_conductance'].copy_(
                     nmda_decay * states['nmda_conductance'] + 
                     (1 - nmda_decay) * synaptic_input * self.synaptic_params.nmda_fraction
                 )
                 
             elif synapse_type == 'inhibitory':
                 # Update GABA conductances
-                states['gaba_conductance'] = (
+                states['gaba_conductance'].copy_(
                     gaba_decay * states['gaba_conductance'] + 
                     (1 - gaba_decay) * synaptic_input
                 )
@@ -148,9 +147,9 @@ class BatchSynapticStateManager:
         
         # Sum over presynaptic neurons: [batch, n_pre, n_post] -> [batch, n_post]
         return {
-            'ampa': torch.sum(states['ampa_conductance'], dim=1),
-            'gaba': torch.sum(states['gaba_conductance'], dim=1), 
-            'nmda': torch.sum(states['nmda_conductance'], dim=1)
+            'ampa': torch.sum(states['ampa_conductance'], dim=1).clone(),
+            'gaba': torch.sum(states['gaba_conductance'], dim=1).clone(), 
+            'nmda': torch.sum(states['nmda_conductance'], dim=1).clone()
         }
     
     def reset_states(self):
@@ -276,7 +275,7 @@ class BatchDentateCircuit(nn.Module):
             if hasattr(self, 'synaptic_state_manager'):
                 self.synaptic_state_manager.update_synaptic_states = torch.compile(
                     self.synaptic_state_manager.update_synaptic_states,
-                    mode='reduce-overhead'
+                    options={'triton.cudagraphs': False}
                 )
 
     def set_inference_mode(self, enabled: bool = True):
@@ -515,6 +514,15 @@ class BatchDentateCircuit(nn.Module):
         Returns:
             Dict mapping pop_name -> activity [batch_size, n_neurons]
         """
+
+        # Tell CUDA graphs where computation boundaries are
+        if self.device.type == 'cuda':
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except AttributeError:
+                pass
+
+        
         self.update_activity_with_dendritic_somatic(direct_activation, external_drive)
         
         return {

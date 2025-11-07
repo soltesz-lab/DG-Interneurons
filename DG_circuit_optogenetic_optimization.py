@@ -246,8 +246,7 @@ class BatchOptogeneticEvaluator:
             trial_seed = self.base_seed + trial
             set_random_seed(trial_seed, self.device)
             
-            if trial == 0:
-                self.logger.info(f"  Trial {trial + 1}/{self.config.n_trials}: Creating circuit with seed {trial_seed}...")
+            self.logger.info(f"  Baseline trial {trial + 1}/{self.config.n_trials}: Creating circuit with seed {trial_seed}...")
             
             # Create circuit for this trial with fresh connectivity
             circuit = BatchDentateCircuit(
@@ -391,7 +390,9 @@ class BatchOptogeneticEvaluator:
             set_random_seed(trial_seed, self.device)
             
             trial_losses = torch.zeros(batch_size, device=self.device)
-            
+
+            self.logger.info(f"  Optogenetic trial {trial + 1}/{self.config.n_trials}: Creating circuit with seed {trial_seed}...")
+
             # Evaluate PV and SST stimulation
             for target_pop in ['pv', 'sst']:
                 # Run stimulation experiment for batch (creates new circuit inside)
@@ -1013,6 +1014,9 @@ class OptogeneticCircuitOptimizer:
 
         self.logger = logging.getLogger("DG_opto_optim")
         self.logger.setLevel(logging.INFO)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        self.logger.addHandler(ch)
 
         self.logger.info(f"OptogeneticCircuitOptimizer initialized on device: {self.device}")
         self.logger.info(f"  Base seed: {base_seed}")

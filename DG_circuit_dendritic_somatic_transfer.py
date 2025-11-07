@@ -808,6 +808,13 @@ class DentateCircuit(nn.Module):
     def forward(self, direct_activation: Dict[str, Tensor], 
                 external_drive: Dict[str, Tensor] = None) -> Dict[str, Tensor]:
         """Single time step forward pass with dendritic-somatic processing"""
+
+        # Tell CUDA graphs where computation boundaries are
+        if self.device.type == 'cuda':
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except AttributeError:
+                pass
         
         self.update_activity_with_dendritic_somatic(direct_activation, external_drive)
         
