@@ -186,7 +186,8 @@ class BatchOptogeneticEvaluator:
     
     def evaluate_parameter_batch(self,
                                  parameter_batch: List[Dict[str, float]],
-                                 mec_drive: float) -> Tuple[torch.Tensor, Dict[str, Any]]:
+                                 mec_current: float,
+                                 mec_current_std: float = 1.0) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Evaluate a batch of parameter configurations with full optogenetic protocol
         
@@ -194,7 +195,7 @@ class BatchOptogeneticEvaluator:
         
         Args:
             parameter_batch: List of connection_modulation dicts, length = batch_size
-            mec_drive: MEC drive level (pA)
+            mec_current: MEC drive level (pA)
             
         Returns:
             losses: Tensor of shape [batch_size] with total loss for each configuration
@@ -204,12 +205,12 @@ class BatchOptogeneticEvaluator:
         
         # === BASELINE EVALUATION ===
         baseline_losses, baseline_rates = self._evaluate_baseline_batch(
-            parameter_batch, mec_drive
+            parameter_batch, mec_current, mec_current_std
         )
         
         # === OPTOGENETIC EVALUATION ===
         opto_losses, opto_details = self._evaluate_optogenetic_batch(
-            parameter_batch, mec_drive
+            parameter_batch, mec_current, mec_current_std
         )
         
         # === COMBINE LOSSES ===
@@ -225,7 +226,8 @@ class BatchOptogeneticEvaluator:
     
     def _evaluate_baseline_batch(self,
                                  parameter_batch: List[Dict[str, float]],
-                                 mec_drive: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                                 mec_current: float,
+                                 mec_current_std: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Evaluate baseline circuit objectives for batch of parameters
         
@@ -264,8 +266,11 @@ class BatchOptogeneticEvaluator:
             circuit.reset_state()
             
             # MEC input: [batch_size, n_mec]
-            mec_input = torch.ones(batch_size, self.circuit_params.n_mec,
-                                  device=self.device) * mec_drive
+            mec_input = mec_current + torch.randn(
+                batch_size, 
+                self.circuit_params.n_mec,
+                device=self.device
+            ) * mec_current_std
             
             # Collect activities over time
             activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
@@ -364,7 +369,8 @@ class BatchOptogeneticEvaluator:
     
     def _evaluate_optogenetic_batch(self,
                                     parameter_batch: List[Dict[str, float]],
-                                    mec_drive: float) -> Tuple[torch.Tensor, Dict]:
+                                    mec_current: float,
+                                    mec_current_std: float = 1.0) -> Tuple[torch.Tensor, Dict]:
         """
         Evaluate optogenetic objectives for batch of parameters
         
@@ -397,7 +403,7 @@ class BatchOptogeneticEvaluator:
             for target_pop in ['pv', 'sst']:
                 # Run stimulation experiment for batch (creates new circuit inside)
                 stim_results = self._simulate_batch_optogenetic_stimulation(
-                    parameter_batch, target_pop, mec_drive, trial_seed
+                    parameter_batch, target_pop, mec_current, mec_current_std, trial_seed
                 )
                 
                 # Calculate losses
@@ -439,7 +445,8 @@ class BatchOptogeneticEvaluator:
     def _simulate_batch_optogenetic_stimulation(self,
                                                 parameter_batch: List[Dict[str, float]],
                                                 target_pop: str,
-                                                mec_drive: float,
+                                                mec_current: float,
+                                                mec_current_std: float,
                                                 trial_seed: int,
                                                 stim_start: float = 1000.0,
                                                 stim_duration: float = 2000.0,
@@ -454,7 +461,8 @@ class BatchOptogeneticEvaluator:
         Args:
             parameter_batch: List of connection modulation dicts
             target_pop: Population to stimulate ('pv' or 'sst')
-            mec_drive: MEC drive level
+            mec_current: MEC drive level
+            mec_current_std: MEC drive level stdev
             trial_seed: Random seed for this trial (already set externally)
         
         Returns dict with baseline and stimulation statistics for each population
@@ -503,9 +511,11 @@ class BatchOptogeneticEvaluator:
         
         # Run simulation
         circuit.reset_state()
-        mec_input = torch.ones(batch_size, self.circuit_params.n_mec,
-                               device=self.device) * mec_drive
-
+        mec_input = mec_current + torch.randn(
+            batch_size, 
+            self.circuit_params.n_mec,
+            device=self.device
+        ) * mec_current_std
         
         # Simulation parameters
         dt = self.circuit_params.dt
@@ -675,14 +685,16 @@ class OptogeneticEvaluationStrategy(ABC):
     @abstractmethod
     def evaluate_batch(self,
                        parameter_sets: List[Dict[str, float]],
-                       mec_drive: float,
+                       mec_current: float,
+                       mec_current_std: float,
                        n_trials: int) -> Tuple[List[float], List[Dict]]:
         """
         Evaluate a batch of parameter configurations with optogenetic protocols
         
         Args:
             parameter_sets: List of connection_modulation dicts
-            mec_drive: MEC drive level
+            mec_current: MEC drive level
+            mec_current_std: MEC drive level std
             n_trials: Number of trials to average
             
         Returns:
@@ -711,7 +723,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
         self.base_seed = base_seed
         self.verbose = verbose
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate configurations one at a time"""
         losses = []
         metadata_list = []
@@ -724,7 +736,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
                 verbose=self.verbose
             )
             
-            loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_drive)
+            loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_current, mec_current_std)
             losses.append(loss_tensor.item())
 
             metadata = self._extract_metadata(details, 0)  # batch index 0
@@ -793,13 +805,13 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
             verbose=self.verbose
         )
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_Current_std, n_trials):
         """Evaluate all configurations in parallel on GPU"""
         batch_size = len(parameter_sets)
         
         # Note: n_trials is handled internally by evaluator
         losses_tensor, details = self.evaluator.evaluate_parameter_batch(
-            parameter_sets, mec_drive
+            parameter_sets, mec_current, mec_current_std
         )
         
         # Convert to lists for consistent API
@@ -894,11 +906,11 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
             opsin_params
         )
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate configurations using multiprocessing"""
         # Prepare arguments for workers
         eval_args = [
-            (params, mec_drive, self.worker_data, self.targets, self.config, self.base_seed, self.verbose)
+            (params, mec_current, mec_current_std, self.worker_data, self.targets, self.config, self.base_seed, self.verbose)
             for params in parameter_sets
         ]
         
@@ -926,7 +938,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
 
 def _optogenetic_worker_evaluate(args):
     """Worker function for multiprocess optogenetic evaluation"""
-    (connection_modulation, mec_drive, worker_data, targets, config, base_seed, verbose) = args
+    (connection_modulation, mec_current, mec_current_std, worker_data, targets, config, base_seed, verbose) = args
     
     device = torch.device('cpu')
     circuit_params, base_synaptic_params_dict, opsin_params = worker_data
@@ -950,7 +962,7 @@ def _optogenetic_worker_evaluate(args):
     
     # Evaluate single parameter set
     loss_tensor, details = evaluator.evaluate_parameter_batch(
-        [connection_modulation], mec_drive
+        [connection_modulation], mec_current, mec_current_std
     )
     
     # Convert all tensors in details to Python types for safe multiprocessing
@@ -1119,8 +1131,9 @@ class OptogeneticCircuitOptimizer:
         def objective_function(positions: np.ndarray) -> np.ndarray:
             """Evaluate batch of parameter configurations."""
             parameter_sets = [dict(zip(connection_names, pos)) for pos in positions]
-            mec_drive = self.config.mec_drive_levels[0]
-            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_drive, self.config.n_trials)
+            mec_current = self.config.mec_drive_levels[0]
+            mec_current_std = self.config.mec_drive_std
+            losses, metadata_list = strategy.evaluate_batch(parameter_sets, mec_current, mec_current_std, self.config.n_trials)
             return np.array(losses), metadata_list
 
         # Configure PSO
@@ -1215,9 +1228,10 @@ class OptogeneticCircuitOptimizer:
         
         def objective(param_array):
             param_dict = dict(zip(connection_names, param_array))
-            mec_drive = self.config.mec_drive_levels[0]
+            mec_current = self.config.mec_drive_levels[0]
+            mec_current_std = self.config.mec_drive_std
             losses, _ = strategy.evaluate_batch(
-                [param_dict], mec_drive, self.config.n_trials
+                [param_dict], mec_current, mec_current_std, self.config.n_trials
             )
             return losses[0]
         
@@ -1299,9 +1313,10 @@ class OptogeneticCircuitOptimizer:
         )
         
         # Evaluate configuration
-        mec_drive = self.config.mec_drive_levels[0]
+        mec_current = self.config.mec_drive_levels[0]
+        mec_current_std = self.config.mec_drive_std
         total_loss_tensor, details = evaluator.evaluate_parameter_batch(
-            [param_dict], mec_drive
+            [param_dict], mec_current, mec_current_std
         )
         recomputed_loss = total_loss_tensor.item()
         
@@ -1313,7 +1328,7 @@ class OptogeneticCircuitOptimizer:
         self.logger.info(f"\n{'='*80}")
         self.logger.info("Baseline circuit evaluation")
         self.logger.info(f"{'='*80}")
-        self.logger.info(f"  MEC drive: {mec_drive} pA\n")
+        self.logger.info(f"  MEC drive: {mec_current} pA\n")
         
         for pop in ['gc', 'mc', 'pv', 'sst']:
             if pop in baseline_rates:

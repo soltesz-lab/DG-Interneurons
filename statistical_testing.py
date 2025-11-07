@@ -100,7 +100,7 @@ def _worker_run_single_trial(trial_args: Tuple) -> Tuple[int, str, Optional[Dict
         Tuple of (trial_idx, condition_name, trial_result or None)
     """
     (trial_idx, target_population, light_intensity, condition_name,
-     condition_params, trial_seed, mec_current, opsin_current,
+     condition_params, trial_seed, mec_current, mec_current_std, opsin_current,
      stim_duration, stim_start, circuit_params_dict, synaptic_params_dict, 
      opsin_params_dict, optimization_json_file) = trial_args
     
@@ -200,6 +200,7 @@ def _worker_run_single_trial(trial_args: Tuple) -> Tuple[int, str, Optional[Dict
             stim_duration=stim_duration,
             stim_start=stim_start,
             mec_current=mec_current,
+            mec_current_std=mec_current_std,
             opsin_current=opsin_current,
             plot_activity=False
         )
@@ -408,6 +409,7 @@ class DisinhibitionHypothesisTester:
                         condition_params: Dict,
                         trial_seed: int,
                         mec_current: float = 100.0,
+                        mec_current_std: float = 1.0,
                         opsin_current: float = 100.0,
                         stim_duration: float = 2000.0,
                         stim_start: float = 1000.0) -> Dict:
@@ -420,6 +422,7 @@ class DisinhibitionHypothesisTester:
             condition_params: Pharmacological condition parameters
             trial_seed: Random seed for this trial
             mec_current: MEC drive current (pA)
+            mec_current_std: MEC drive current stdev (pA)
             opsin_current: Direct opsin activation current (pA)
         
         Returns:
@@ -453,6 +456,7 @@ class DisinhibitionHypothesisTester:
             stim_duration=stim_duration,
             stim_start=stim_start,
             mec_current=mec_current,
+            mec_current_std=mec_current_std,
             opsin_current=opsin_current,
             plot_activity=False
         )
@@ -469,6 +473,7 @@ class DisinhibitionHypothesisTester:
                             batch_size: int,
                             starting_seed: int,
                             mec_current: float = 100.0,
+                            mec_current_std: float = 1.0,
                             opsin_current: float = 100.0,
                             stim_duration: float = 2000.0,
                             stim_start: float = 1000.0,
@@ -491,6 +496,7 @@ class DisinhibitionHypothesisTester:
             batch_size: Number of trials to process (processed sequentially, not batched)
             starting_seed: Starting seed for this batch
             mec_current: MEC drive current (pA)
+            mec_current_std: MEC drive current stdev (pA)
             opsin_current: Direct opsin activation current (pA)
             stim_duration: Total stimulation duration (ms)
             stim_start: When to start stimulation (ms)
@@ -564,7 +570,7 @@ class DisinhibitionHypothesisTester:
             
             # Run simulation
             circuit.reset_state()
-            mec_input = torch.ones(1, self.circuit_params.n_mec, device=device) * mec_current
+            mec_input = mec_current + torch.randn(self.circuit_params.n_mec, device=device) * mec_current_std
 
             duration = stim_start + stim_duration
             
@@ -732,6 +738,7 @@ class DisinhibitionHypothesisTester:
                              target_population: str,
                              light_intensity: float = 1.0,
                              mec_current: float = 100.0,
+                             mec_current_std: float = 1.0,
                              opsin_current: float = 100.0,
                              n_workers: Optional[int] = 1,
                              use_multiprocessing: bool = True,
@@ -762,6 +769,7 @@ class DisinhibitionHypothesisTester:
             target_population: 'pv' or 'sst'
             light_intensity: Optogenetic stimulation intensity
             mec_current: MEC drive current (pA)
+            mec_current_std: MEC drive current stdev (pA)
             opsin_current: Direct opsin activation current (pA)
             n_workers: Number of parallel processes (for CPU multiprocessing)
             use_multiprocessing: Whether to use parallel processing (CPU only)
@@ -900,6 +908,7 @@ class DisinhibitionHypothesisTester:
                             current_batch_size,
                             starting_seed,
                             mec_current=mec_current,
+                            mec_current_std=mec_current_std,
                             opsin_current=opsin_current,
                             stim_duration=2000.0,
                             stim_start=1000.0,
@@ -946,6 +955,7 @@ class DisinhibitionHypothesisTester:
                         params,
                         trial_seed,
                         mec_current,
+                        mec_current_std,
                         opsin_current,
                         2000.0,  # stim_duration
                         1000.0,  # stim_start
@@ -989,6 +999,7 @@ class DisinhibitionHypothesisTester:
                             params,
                             trial_seed,
                             mec_current=mec_current,
+                            mec_current_std=mec_current_std,
                             opsin_current=opsin_current
                         )
                         results[condition].append(trial_result)
@@ -4056,6 +4067,7 @@ def run_statistical_analysis(
     n_trials: int = 50,
     light_intensity: float = 1.0,
     mec_current: float = 100.0,
+    mec_current_std: float = 1.0,
     opsin_current: float = 200.0,
     n_workers: int = 1,
     device: Optional[str] = None,
@@ -4071,6 +4083,7 @@ def run_statistical_analysis(
         n_trials: Number of Monte Carlo trials per condition
         light_intensity: Optogenetic stimulation intensity
         mec_current: MEC drive current (pA)
+        mec_current_std: MEC drive current stdev (pA)
         opsin_current: Direct opsin activation current (pA)
         n_workers: Number of parallel workers (for CPU multiprocessing)
         device: Device to use ('cuda', 'cpu', or None for auto-detect)
@@ -4124,6 +4137,7 @@ def run_statistical_analysis(
             target,
             light_intensity=light_intensity,
             mec_current=mec_current,
+            mec_current_std=mec_current_std,
             opsin_current=opsin_current,
             n_workers=n_workers,
             use_multiprocessing=use_multiprocessing,
@@ -4216,6 +4230,8 @@ if __name__ == "__main__":
                        help='Optogenetic light intensity (default: 1.0)')
     parser.add_argument('--mec-current', type=float, default=40.0,
                        help='MEC drive current in pA (default: 40.0)')
+    parser.add_argument('--mec-current-std', type=float, default=1.0,
+                       help='MEC drive current stdev in pA (default: 1.0)')
     parser.add_argument('--opsin-current', type=float, default=200.0,
                        help='Opsin activation current in pA (default: 200.0)')
     parser.add_argument('--output-dir', type=str, default='./statistical_results',
@@ -4236,7 +4252,7 @@ if __name__ == "__main__":
     print(f"  GPU batch size: {args.gpu_batch_size}")
     print(f"  CPU workers: {args.n_workers}")
     print(f"  Light intensity: {args.light_intensity}")
-    print(f"  MEC current: {args.mec_current} pA")
+    print(f"  MEC current: {args.mec_current} +/- {args.mec_current_std} pA")
     print(f"  Opsin current: {args.opsin_current} pA")
     print(f"  Target populations: {args.targets}")
     print(f"  Show plots: {args.show_plots}")
@@ -4250,6 +4266,7 @@ if __name__ == "__main__":
         n_trials=args.n_trials,
         light_intensity=args.light_intensity,
         mec_current=args.mec_current,
+        mec_current_std=args.mec_current_std,
         opsin_current=args.opsin_current,
         n_workers=args.n_workers,
         device=args.device,

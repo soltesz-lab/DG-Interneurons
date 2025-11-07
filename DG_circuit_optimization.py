@@ -156,6 +156,7 @@ class OptimizationConfig:
     
     # MEC drive conditions to test
     mec_drive_levels: List[float] = field(default_factory=lambda: [80.0, 150.0, 200.0])  # pA
+    mec_drive_std: float = 1.0
     
     # Optimizer choice
     optimizer_type: str = 'sgd'  # 'adam', 'sgd', 'rmsprop'
@@ -373,14 +374,16 @@ class EvaluationStrategy(ABC):
     @abstractmethod
     def evaluate_batch(self,
                       parameter_sets: List[Dict[str, float]],
-                      mec_drive: float,
+                      mec_current: float,
+                      mec_current_std: float,
                       n_trials: int) -> Tuple[List[float], List[Dict[str, float]]]:
         """
         Evaluate a batch of parameter configurations
         
         Args:
             parameter_sets: List of connection_modulation dicts
-            mec_drive: MEC drive level
+            mec_current: MEC drive level
+            mec_current_std: MEC drive level
             n_trials: Number of trials to average
             
         Returns:
@@ -414,19 +417,19 @@ class SequentialStrategy(EvaluationStrategy):
         self.config = config
         self.device = device
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate configurations one at a time"""
         losses = []
         firing_rates_list = []
         
         for params in parameter_sets:
-            loss, firing_rates = self._evaluate_single(params, mec_drive, n_trials)
+            loss, firing_rates = self._evaluate_single(params, mec_current, mec_current_std, n_trials)
             losses.append(loss)
             firing_rates_list.append(firing_rates)
         
         return losses, firing_rates_list
     
-    def _evaluate_single(self, connection_modulation, mec_drive, n_trials):
+    def _evaluate_single(self, connection_modulation, mec_current, mec_current_std, n_trials):
         """Evaluate single parameter configuration"""
         # Create synaptic params with modulation
         synaptic_params = PerConnectionSynapticParams(
@@ -449,7 +452,8 @@ class SequentialStrategy(EvaluationStrategy):
         for trial in range(n_trials):
             circuit.reset_state()
             
-            mec_input = torch.ones(self.circuit_params.n_mec, device=self.device) * mec_drive
+            mec_input=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std
+
             activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
             
             for t in range(self.config.simulation_duration):
@@ -538,7 +542,7 @@ class BatchGPUStrategy(EvaluationStrategy):
             targets, config, device=device
         )
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate all configurations in parallel on GPU"""
         batch_size = len(parameter_sets)
         
@@ -547,7 +551,7 @@ class BatchGPUStrategy(EvaluationStrategy):
         
         for trial in range(n_trials):
             losses, firing_rates_batch = self.evaluator.evaluate_parameter_batch(
-                parameter_sets, mec_drive
+                parameter_sets, mec_current, mec_current_std
             )
             total_losses += losses
         
@@ -616,11 +620,11 @@ class MultiprocessCPUStrategy(EvaluationStrategy):
             opsin_params
         )
     
-    def evaluate_batch(self, parameter_sets, mec_drive, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate configurations using multiprocessing"""
         # Prepare arguments for workers
         eval_args = [
-            (params, mec_drive, n_trials, self.circuit_factory_data,
+            (params, mec_current, mec_current_std, n_trials, self.circuit_factory_data,
              self.targets, self.config)
             for params in parameter_sets
         ]
@@ -649,7 +653,7 @@ class MultiprocessCPUStrategy(EvaluationStrategy):
 
 def _worker_evaluate_single(args):
     """Worker function for multiprocess evaluation (module-level for pickling)"""
-    (connection_modulation, mec_drive, n_trials, circuit_factory_data,
+    (connection_modulation, mec_current, mec_current_std, n_trials, circuit_factory_data,
      targets, config) = args
     
     from DG_circuit_dendritic_somatic_transfer import DentateCircuit, PerConnectionSynapticParams
@@ -676,7 +680,8 @@ def _worker_evaluate_single(args):
     for trial in range(n_trials):
         circuit.reset_state()
         
-        mec_input = torch.ones(circuit.circuit_params.n_mec, device=device) * mec_drive
+        mec_input=mec_current + torch.randn(circuit.circuit_params.n_mec, device=device) * mec_current_std,
+        
         activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
         
         for t in range(config.simulation_duration):
@@ -896,9 +901,10 @@ class CircuitOptimizer:
             current_params = opt_params.get_connection_modulation()
             
             total_loss = 0.0
-            for mec_drive in self.config.mec_drive_levels:
+            mec_current_std = self.config_mec_drive_std
+            for mec_current in self.config.mec_drive_levels:
                 losses, _ = strategy.evaluate_batch(
-                    [current_params], mec_drive, self.config.n_trials
+                    [current_params], mec_current, mec_current_std, self.config.n_trials
                 )
                 total_loss += losses[0]
             
@@ -975,9 +981,10 @@ class CircuitOptimizer:
             
             # Evaluate all particles
             total_losses = np.zeros(n_particles)
-            for mec_drive in self.config.mec_drive_levels:
+            mec_current_std = self.config_mec_drive_std
+            for mec_current in self.config.mec_drive_levels:
                 losses, _ = strategy.evaluate_batch(
-                    parameter_sets, mec_drive, self.config.n_trials
+                    parameter_sets, mec_current, mec_current_std, self.config.n_trials
                 )
                 total_losses += np.array(losses)
             
@@ -1033,9 +1040,10 @@ class CircuitOptimizer:
             param_dict = dict(zip(connection_names, param_array))
             
             total_loss = 0.0
-            for mec_drive in self.config.mec_drive_levels:
+            mec_current_std = self.config_mec_drive_std
+            for mec_current in self.config.mec_drive_levels:
                 losses, _ = strategy.evaluate_batch(
-                    [param_dict], mec_drive, self.config.n_trials
+                    [param_dict], mec_current, mec_current_std, self.config.n_trials
                 )
                 total_loss += losses[0]
             
@@ -1062,7 +1070,7 @@ class CircuitOptimizer:
             'strategy': strategy.get_strategy_info()['name']
         }
     
-    def print_best_firing_rates(self, mec_drive=100.0):
+    def print_best_firing_rates(self, mec_drive=100.0, mec_drive_std=1.0):
         """Evaluate and print best parameters"""
         if self.best_params is None:
             print("No best parameters found. Run optimize() first.")
@@ -1079,7 +1087,7 @@ class CircuitOptimizer:
         )
         
         _, firing_rates_list = strategy.evaluate_batch(
-            [self.best_params], mec_drive, n_trials=1
+            [self.best_params], mec_drive, mec_drive_std, n_trials=1
         )
         firing_rates = firing_rates_list[0]
         
@@ -1094,12 +1102,13 @@ class CircuitOptimizer:
                 error = ((actual - target) / target * 100) if target > 0 else 0.0
                 print(f"{pop.upper():<12} {target:<10.2f} {actual:<10.2f} {error:+.1f}%")
 
-    def _get_firing_rates_for_drive(self, mec_drive: float) -> Dict[str, Dict[str, float]]:
+    def _get_firing_rates_for_drive(self, mec_drive: float, mec_drive_std: float = 1.0) -> Dict[str, Dict[str, float]]:
         """
         Helper method to get detailed firing rates for a specific MEC drive level
         
         Args:
             mec_drive: MEC drive level (pA)
+            mec_drive_std: MEC drive level stdev (pA)
             
         Returns:
             Dict mapping population name to metrics dict with keys:
@@ -1129,7 +1138,7 @@ class CircuitOptimizer:
         # Run simulation
         n_steps = 600
         warmup = 150
-        mec_input = torch.ones(self.circuit_params.n_mec, device=self.device) * mec_drive
+        mec_input=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
         
         activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
         
@@ -1166,7 +1175,7 @@ class CircuitOptimizer:
         
         return firing_data
     
-    def save_best_results_to_json(self, filename: str, mec_drive_levels: List[float] = None):
+    def save_best_results_to_json(self, filename: str, mec_drive_levels: List[float] = None, mec_drive_std: float = 1.0):
         """
         Save best optimization results and firing rates to JSON file
         
@@ -1187,7 +1196,7 @@ class CircuitOptimizer:
         # Collect firing rates and sparsity for each MEC drive level
         performance_data = {}
         for mec_drive in mec_drive_levels:
-            firing_data = self._get_firing_rates_for_drive(mec_drive)
+            firing_data = self._get_firing_rates_for_drive(mec_drive, mec_drive_std)
             performance_data[f'mec_{mec_drive}'] = firing_data
         
         # Prepare JSON data
@@ -1267,6 +1276,7 @@ def create_default_config(device: Optional[torch.device] = None) -> Optimization
         learning_rate=0.1,
         max_iterations=300,
         mec_drive_levels=[40.0],
+        mec_drive_std=1.0,
         n_trials=2,
         simulation_duration=600,
         warmup_duration=100,
@@ -1279,6 +1289,7 @@ def create_default_global_opt_config(device: Optional[torch.device] = None) -> O
         learning_rate=0.1,
         max_iterations=20,
         mec_drive_levels=[28.0],
+        mec_drive_std=1.0,
         n_trials=4,  # Reduce for faster iteration
         simulation_duration=1000,
         warmup_duration=200,
