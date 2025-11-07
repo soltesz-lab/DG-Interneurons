@@ -805,7 +805,7 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
             verbose=self.verbose
         )
     
-    def evaluate_batch(self, parameter_sets, mec_current, mec_Current_std, n_trials):
+    def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate all configurations in parallel on GPU"""
         batch_size = len(parameter_sets)
         
