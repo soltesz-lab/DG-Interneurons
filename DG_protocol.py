@@ -649,7 +649,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                mec_current: float = 100.0,
                                opsin_current: float = 100.0,
                                stim_start: float = 1000.0,
-                               stim_duration: float = 2000.0,
+                               stim_duration: float = 1000.0,
                                warmup: float = 250.0,
                                plot_activity: bool = True,
                                device: Optional[torch.device] = None,
@@ -657,8 +657,6 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                base_seed: int = 42):
     """
     Compare PV vs SST stimulation with anatomical connectivity
-    
-    UPDATED: Now supports multi-trial averaging
     
     Args:
         optimization_json_file: Path to optimization results (optional)
@@ -1426,6 +1424,10 @@ if __name__ == "__main__":
                         help='MEC drive current in pA (default: 40.0)')
     parser.add_argument('--opsin-current', type=float, default=200.0,
                        help='Optogenetic current in pA (default: 200.0)')
+    parser.add_argument('--stim-start', type=float, default=1000.0,
+                        help='Optogenetic stimulus start time [ms] (default: 1000.0)')
+    parser.add_argument('--stim-duration', type=float, default=1000.0,
+                        help='Optogenetic stimulus duration [ms] (default: 1000.0)')
     
     args = parser.parse_args()
     
@@ -1455,7 +1457,9 @@ if __name__ == "__main__":
         opsin_current=args.opsin_current,
         device=device,
         n_trials=args.n_trials,
-        base_seed=args.base_seed
+        base_seed=args.base_seed,
+        stim_start=args.stim_start,
+        stim_duration=args.stim_duration
     )
 
     # Print results with multi-trial statistics
