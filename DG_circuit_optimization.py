@@ -156,7 +156,7 @@ class OptimizationConfig:
     
     # MEC drive conditions to test
     mec_drive_levels: List[float] = field(default_factory=lambda: [80.0, 150.0, 200.0])  # pA
-    mec_drive_std: float = 1.0
+    mec_drive_std: float = 1.6
     
     # Optimizer choice
     optimizer_type: str = 'sgd'  # 'adam', 'sgd', 'rmsprop'
