@@ -28,6 +28,14 @@ from DG_visualization import (
     DGCircuitVisualization
 )
 
+from gradient_adaptive_stepper import (
+    GradientAdaptiveStepConfig,
+    GradientAdaptiveStepper,
+    AdaptiveSimulationState,
+    update_circuit_with_adaptive_dt,
+    interpolate_to_fixed_grid,
+    initialize_activity_storage
+)
 
 # ============================================================================
 # Random Seed Management (consistent with optimization module)
@@ -49,6 +57,51 @@ def set_random_seed(seed: int, device: Optional[torch.device] = None):
         torch.cuda.manual_seed_all(seed)
 
 
+def _interpolate_activity_to_grid(activity_current: Dict[str, torch.Tensor],
+                                  activity_prev: Dict[str, torch.Tensor],
+                                  time_prev: float,
+                                  time_current: float,
+                                  time_grid: torch.Tensor,
+                                  storage: Dict[str, torch.Tensor]) -> None:
+    """
+    Interpolate activity linearly between time points to fixed grid
+    
+    For each grid point between time_prev and time_current, linearly
+    interpolate the activity.
+    
+    Args:
+        activity_current: Current activities
+        activity_prev: Previous activities
+        time_prev: Previous time point (ms)
+        time_current: Current time point (ms)
+        time_grid: Fixed time grid
+        storage: Storage dict to update in-place
+    """
+    # Find grid indices in this interval
+    mask = (time_grid > time_prev) & (time_grid <= time_current)
+    grid_indices = torch.where(mask)[0]
+    
+    if len(grid_indices) == 0:
+        return
+    
+    dt_step = time_current - time_prev
+    
+    for grid_idx in grid_indices:
+        grid_time = time_grid[grid_idx].item()
+        
+        # Linear interpolation weight (0 at time_prev, 1 at time_current)
+        if dt_step > 1e-9:
+            alpha = (grid_time - time_prev) / dt_step
+        else:
+            alpha = 1.0
+        
+        # Linearly interpolate each population
+        for pop_name in activity_current.keys():
+            if pop_name in storage and pop_name in activity_prev:
+                interpolated = (1 - alpha) * activity_prev[pop_name] + alpha * activity_current[pop_name]
+                storage[pop_name][:, grid_idx] = interpolated
+
+                
 class OpsinExpression:
     """Handle heterogeneous opsin expression"""
     
@@ -109,7 +162,8 @@ class OptogeneticExperiment:
                  opsin_params: OpsinParams,
                  optimization_json_file: Optional[str] = None,
                  device: Optional[torch.device] = None,
-                 base_seed: int = 42):
+                 base_seed: int = 42,
+                 adaptive_config: Optional[GradientAdaptiveStepConfig] = None):
         """
         Initialize optogenetic experiment
         
@@ -126,6 +180,8 @@ class OptogeneticExperiment:
         self.synaptic_params = synaptic_params
         self.device = device if device is not None else get_default_device()
         self.base_seed = base_seed
+        # Store adaptive config
+        self.adaptive_config = adaptive_config
         
         if optimization_json_file is not None:
             success = self._load_optimization_results(optimization_json_file)
@@ -149,6 +205,10 @@ class OptogeneticExperiment:
             self.opsin_params,
             device=self.device
         )
+    
+    def set_adaptive_config(self, config: GradientAdaptiveStepConfig):
+        '''Update adaptive stepping configuration'''
+        self.adaptive_config = config
 
     def _load_optimization_results(self, json_filename):
         """Load and process optimization results from JSON file"""
@@ -250,7 +310,8 @@ class OptogeneticExperiment:
                              include_dentate_spikes: bool = False,
                              ds_times: Optional[List[float]] = None,
                              plot_activity: bool = False,
-                             n_trials: int = 1) -> Dict:
+                             n_trials: int = 1,
+                             adaptive_step: bool = True) -> Dict:
         """
         Simulate optogenetic stimulation experiment with MEC drive
         
@@ -295,19 +356,35 @@ class OptogeneticExperiment:
             self.circuit = self._create_circuit(trial_seed)
             
             # Run single trial
-            trial_result = self._simulate_single_trial(
-                target_population=target_population,
-                light_intensity=light_intensity,
-                stim_duration=stim_duration,
-                stim_start=stim_start,
-                post_duration=post_duration,
-                mec_current=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
-                opsin_current=opsin_current,
-                include_dentate_spikes=include_dentate_spikes,
-                ds_times=ds_times,
-                plot_activity=(plot_activity and trial == 0),  # Only plot first trial
-                trial_index=trial
-            )
+            if adaptive_step:
+                trial_result = self._simulate_single_trial_adaptive(
+                    target_population=target_population,
+                    light_intensity=light_intensity,
+                    stim_duration=stim_duration,
+                    stim_start=stim_start,
+                    post_duration=post_duration,
+                    mec_current=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
+                    opsin_current=opsin_current,
+                    include_dentate_spikes=include_dentate_spikes,
+                    ds_times=ds_times,
+                    plot_activity=(plot_activity and trial == 0),  # Only plot first trial
+                    trial_index=trial,
+                    adaptive_config=self.adaptive_config
+                )
+            else:
+                trial_result = self._simulate_single_trial(
+                    target_population=target_population,
+                    light_intensity=light_intensity,
+                    stim_duration=stim_duration,
+                    stim_start=stim_start,
+                    post_duration=post_duration,
+                    mec_current=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
+                    opsin_current=opsin_current,
+                    include_dentate_spikes=include_dentate_spikes,
+                    ds_times=ds_times,
+                    plot_activity=(plot_activity and trial == 0),  # Only plot first trial
+                    trial_index=trial
+                )
             
             all_trial_results.append(trial_result)
             
@@ -322,6 +399,181 @@ class OptogeneticExperiment:
         print(f"Completed {n_trials} trial(s) with different connectivity")
         
         return aggregated_results
+
+
+    def _simulate_single_trial_adaptive(self,
+                                        target_population: str,
+                                        light_intensity: float,
+                                        stim_start: float,
+                                        stim_duration: float,
+                                        post_duration: float,
+                                        mec_current: float,
+                                        opsin_current: float,
+                                        include_dentate_spikes: bool,
+                                        ds_times: Optional[List[float]],
+                                        plot_activity: bool,
+                                        trial_index: int,
+                                        adaptive_config: Optional[GradientAdaptiveStepConfig] = None
+                                        ) -> Dict:
+        """
+        Version of simulate_single_trial with adaptive stepping
+
+        Changes from original:
+        1. Added adaptive_config parameter
+        2. Uses GradientAdaptiveStepper for dt selection
+        3. Stores to fixed grid with interpolation
+        4. Returns adaptive statistics
+
+        All other logic remains the same.
+        """
+
+        # Create default adaptive config if not provided
+        if adaptive_config is None:
+            adaptive_config = GradientAdaptiveStepConfig(
+                dt_min=0.05,
+                dt_max=0.3,
+                gradient_low=0.5,
+                gradient_high=10.0,
+                gradient_alpha=0.3,
+                max_dt_change_factor=1.5
+            )
+
+        # Initialize adaptive stepping
+        stepper = GradientAdaptiveStepper(adaptive_config)
+        state = AdaptiveSimulationState(self.device)
+
+        # Visualization
+        vis = None
+        if plot_activity:
+            vis = DGCircuitVisualization(self.circuit)
+
+        # Reset circuit state
+        self.circuit.reset_state()
+
+        # Create opsin expression
+        opsin = self.create_opsin_expression(target_population)
+        target_positions = self.circuit.layout.positions[target_population]
+        activation_prob = opsin.calculate_activation(target_positions, light_intensity)
+
+        # Identify stimulated vs non-stimulated cells (unchanged)
+        expression_threshold = 0.2
+        stimulated_mask = opsin.expression_levels >= expression_threshold
+        stimulated_indices = torch.where(stimulated_mask)[0].cpu().numpy()
+        non_stimulated_indices = torch.where(~stimulated_mask)[0].cpu().numpy()
+
+        # Simulation parameters
+        duration = stim_start + stim_duration + post_duration
+        stim_start_step_time = stim_start  # Store as time, not step index
+        stim_end_time = stim_start + stim_duration
+
+        # Storage on fixed grid (circuit_params.dt resolution for compatibility)
+        storage_dt = self.circuit_params.dt
+        n_steps = int(duration / storage_dt)
+        time_grid = torch.linspace(0, duration, n_steps, device=self.device)
+        activity_storage = initialize_activity_storage(self.circuit, time_grid)
+
+        # Generate dentate spike times (unchanged)
+        if include_dentate_spikes:
+            if ds_times is None:
+                ds_times = self._generate_dentate_spike_times(duration, baseline_rate=0.5)
+        else:
+            ds_times = []
+
+        # Adaptive simulation loop
+        while state.current_time < duration:
+            # Compute dt for this step
+            if state.step_index > 0:
+                dt_adaptive = stepper.compute_dt(
+                    activity_current,
+                    state.activity_prev,
+                    state.dt_history[-1]
+                )
+            else:
+                dt_adaptive = adaptive_config.dt_max  # Start with coarse stepping
+
+            # Ensure we don't overshoot
+            if state.current_time + dt_adaptive > duration:
+                dt_adaptive = duration - state.current_time
+
+            # Setup inputs
+            direct_activation = {}
+            if (state.current_time >= stim_start_step_time) and (state.current_time < stim_end_time):
+                direct_activation[target_population] = activation_prob * opsin_current
+
+            # Calculate MEC external drive
+            external_drive = {}
+            mec_drive = torch.ones(self.circuit_params.n_mec, device=self.device) * mec_current
+
+            # Add dentate spike drive
+            for ds_time in ds_times:
+                if abs(state.current_time - ds_time) < 50:  # 50ms window
+                    ds_strength = 5.0 * torch.tensor(
+                        np.exp(-((state.current_time - ds_time) / 10.0) ** 2),
+                        device=self.device
+                    )
+                    mec_drive += ds_strength
+
+            external_drive['mec'] = mec_drive
+
+            # Update circuit with adaptive dt
+            activity_current = update_circuit_with_adaptive_dt(
+                self.circuit, direct_activation, external_drive, dt_adaptive
+            )
+
+            # Interpolate to fixed grid for storage
+            if state.step_index == 0:
+                # First step: just store directly at t=0
+                for pop in activity_storage:
+                    activity_storage[pop][:, 0] = activity_current[pop]
+            else:
+                # Interpolate between previous and current time
+                _interpolate_activity_to_grid(
+                    activity_current,
+                    state.activity_prev,
+                    state.current_time,
+                    state.current_time + dt_adaptive,
+                    time_grid,
+                    activity_storage
+                )
+
+            # Update state for next iteration
+            state.update(activity_current, dt_adaptive, stepper.grad_smooth)
+
+        # Move results to CPU
+        time_cpu = time_grid.cpu()
+        activity_trace_cpu = {pop: activity.cpu() for pop, activity in activity_storage.items()}
+
+        # Visualization
+        if vis:
+            split_populations = {
+                target_population: {
+                    'unit_ids_part1': stimulated_indices.tolist(),
+                    'unit_ids_part2': non_stimulated_indices.tolist(),
+                    'part1_label': f'Stimulated (n={len(stimulated_indices)})',
+                    'part2_label': f'Non-stimulated (n={len(non_stimulated_indices)})'
+                }
+            }
+            fig, _ = vis.plot_activity_raster(
+                activity_trace_cpu,
+                split_populations=split_populations,
+                save_path=f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}_trial{trial_index}.png"
+            )
+            plt.close(fig)
+
+        # Return results with adaptive statistics
+        return {
+            'time': time_cpu,
+            'activity_trace': activity_trace_cpu,
+            'opsin_expression': opsin.expression_levels.cpu(),
+            'target_positions': target_positions.cpu(),
+            'dentate_spike_times': ds_times,
+            'layout': self.circuit.layout,
+            'connectivity': self.circuit.connectivity,
+            'stimulated_indices': stimulated_indices,
+            'non_stimulated_indices': non_stimulated_indices,
+            'adaptive_stats': state.get_statistics()
+        }
+
     
     def _simulate_single_trial(self,
                               target_population: str,
@@ -352,6 +604,14 @@ class OptogeneticExperiment:
 
         # Calculate direct optogenetic activation
         activation_prob = opsin.calculate_activation(target_positions, light_intensity)
+
+        # Identify stimulated vs non-stimulated cells
+        # Identify stimulated vs non-stimulated cells
+        # (cells with opsin expression above threshold)
+        expression_threshold = 0.2
+        stimulated_mask = opsin.expression_levels >= expression_threshold
+        stimulated_indices = torch.where(stimulated_mask)[0].cpu().numpy()
+        non_stimulated_indices = torch.where(~stimulated_mask)[0].cpu().numpy()
         
         # Simulation parameters
         dt = self.circuit_params.dt
@@ -418,8 +678,18 @@ class OptogeneticExperiment:
             #    activity_trace_cpu,
             #    save_path=f"protocol/DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
             #)
+
+            split_populations = {
+                target_population: {
+                    'unit_ids_part1': stimulated_indices.tolist(),
+                    'unit_ids_part2': non_stimulated_indices.tolist(),
+                    'part1_label': f'Stimulated (n={len(stimulated_indices)})',
+                    'part2_label': f'Non-stimulated (n={len(non_stimulated_indices)})'
+                }
+            }
             fig, _ = vis.plot_activity_raster(
                 activity_trace_cpu,
+                split_populations=split_populations,
                 save_path=f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
@@ -431,7 +701,9 @@ class OptogeneticExperiment:
             'target_positions': target_positions.cpu(),
             'dentate_spike_times': ds_times,
             'layout': self.circuit.layout,
-            'connectivity': self.circuit.connectivity
+            'connectivity': self.circuit.connectivity,
+            'stimulated_indices': stimulated_indices,
+            'non_stimulated_indices': non_stimulated_indices
         }
     
     def _aggregate_trial_results(self, trial_results: List[Dict], n_trials: int) -> Dict:
@@ -463,8 +735,13 @@ class OptogeneticExperiment:
         opsin_expression_stacked = torch.stack(opsin_expressions_all, dim=0)
         opsin_expression_mean = torch.mean(opsin_expression_stacked, dim=0)
         opsin_expression_std = torch.std(opsin_expression_stacked, dim=0)
-        
-        return {
+
+        # Aggregate adaptive stats if present
+        adaptive_stats_aggregated = None
+        if 'adaptive_stats' in trial_results[0]:
+            adaptive_stats_aggregated = self._aggregate_adaptive_stats(trial_results)
+
+        aggregated = {
             'time': time,
             'activity_trace_mean': activity_trace_mean,
             'activity_trace_std': activity_trace_std,
@@ -476,6 +753,63 @@ class OptogeneticExperiment:
             'layout': trial_results[-1]['layout'],
             'connectivity': trial_results[-1]['connectivity']
         }
+
+        # Add adaptive stats if they were computed
+        if adaptive_stats_aggregated is not None:
+            aggregated['adaptive_stats'] = adaptive_stats_aggregated
+        
+        return aggregated
+
+    def _aggregate_adaptive_stats(self, trial_results: List[Dict]) -> Dict:
+        """
+        Aggregate adaptive stepping statistics across trials
+
+        Args:
+            trial_results: List of trial result dicts, each containing 'adaptive_stats'
+
+        Returns:
+            Aggregated statistics with mean, std, min, max across trials
+        """
+        # Extract adaptive stats from each trial
+        all_stats = [result['adaptive_stats'] for result in trial_results]
+
+        # Aggregate scalar statistics
+        n_steps_all = [stats['n_steps'] for stats in all_stats]
+        avg_dt_all = [stats['avg_dt'] for stats in all_stats]
+        min_dt_all = [stats['min_dt'] for stats in all_stats]
+        max_dt_all = [stats['max_dt'] for stats in all_stats]
+
+        aggregated = {
+            # Summary statistics across trials
+            'n_steps_mean': np.mean(n_steps_all),
+            'n_steps_std': np.std(n_steps_all),
+            'n_steps_min': np.min(n_steps_all),
+            'n_steps_max': np.max(n_steps_all),
+
+            'avg_dt_mean': np.mean(avg_dt_all),
+            'avg_dt_std': np.std(avg_dt_all),
+            'avg_dt_min': np.min(avg_dt_all),
+            'avg_dt_max': np.max(avg_dt_all),
+
+            'min_dt_mean': np.mean(min_dt_all),
+            'min_dt_min': np.min(min_dt_all),
+
+            'max_dt_mean': np.mean(max_dt_all),
+            'max_dt_max': np.max(max_dt_all),
+
+            # Keep individual trial statistics for detailed analysis
+            'trial_n_steps': n_steps_all,
+            'trial_avg_dt': avg_dt_all,
+            'trial_min_dt': min_dt_all,
+            'trial_max_dt': max_dt_all,
+
+            # Optional: Store first trial's detailed history for visualization
+            'dt_history_sample': all_stats[0]['dt_history'],
+            'time_history_sample': all_stats[0]['time_history'],
+            'gradient_history_sample': all_stats[0]['gradient_history'],
+        }
+
+        return aggregated
     
     def _generate_dentate_spike_times(self, duration: float, baseline_rate: float = 0.5) -> List[float]:
         """Generate random dentate spike times (Poisson process)"""
@@ -643,7 +977,6 @@ def analyze_conductance_patterns(experiment: OptogeneticExperiment) -> Dict:
     
     return analysis
 
-
 def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                intensities: List[float] = [0.5, 1.0, 2.0],
                                mec_current: float = 100.0,
@@ -654,7 +987,13 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                plot_activity: bool = True,
                                device: Optional[torch.device] = None,
                                n_trials: int = 1,
-                               base_seed: int = 42):
+                               base_seed: int = 42,
+                               load_results_file: Optional[str] = None,
+                               save_results_file: Optional[str] = None,
+                               auto_save: bool = True,
+                               save_full_activity: bool = False,
+                               adaptive_step: bool = True,
+                               adaptive_config: Optional[GradientAdaptiveStepConfig] = None):
     """
     Compare PV vs SST stimulation with anatomical connectivity
     
@@ -664,17 +1003,48 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
         mec_current: MEC drive current (pA)
         opsin_current: Optogenetic current (pA)
         stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
         plot_activity: Whether to plot activity traces
         device: Device to run on (None for auto-detect)
         n_trials: Number of trials to average (default: 1)
         base_seed: Base random seed for reproducibility (default: 42)
-        
+        load_results_file: If provided, load results from this file instead of running
+        save_results_file: If provided, save results to this file
+        auto_save: If True, automatically save results with default filename (default: True)
+        save_full_activity: If True, save complete activity traces (larger files, default: False)
+
     Returns:
         results: Dict with averaged results
         connectivity_analysis: Connectivity pattern analysis
         conductance_analysis: Conductance pattern analysis
     """
+
+    # Create adaptive config if using adaptive stepping
+    if adaptive_step and adaptive_config is None:
+        adaptive_config = GradientAdaptiveStepConfig(
+            dt_min=0.05,
+            dt_max=0.3,
+            gradient_low=0.5,
+            gradient_high=10.0,
+        )
     
+    # Check if we should load from file
+    if load_results_file is not None:
+        print(f"\nLoading experiment results from file: {load_results_file}")
+        results, conn_analysis, conductance_analysis, metadata = load_experiment_results(load_results_file)
+        
+        # Print loaded configuration
+        print("\nLoaded experiment configuration:")
+        print(f"  Light intensities: {metadata.get('intensities', 'Unknown')}")
+        print(f"  MEC current: {metadata.get('mec_current', 'Unknown')} pA")
+        print(f"  Opsin current: {metadata.get('opsin_current', 'Unknown')} pA")
+        print(f"  Stimulation: {metadata.get('stim_start', 'Unknown')} ms start, "
+              f"{metadata.get('stim_duration', 'Unknown')} ms duration")
+        
+        return results, conn_analysis, conductance_analysis
+    
+    # Otherwise, run the experiment
     if device is None:
         device = get_default_device()
     
@@ -686,7 +1056,8 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
         circuit_params, synaptic_params, opsin_params, 
         optimization_json_file=optimization_json_file,
         device=device,
-        base_seed=base_seed
+        base_seed=base_seed,
+        adaptive_config=adaptive_config
     )
     
     print(f"\nRunning comparative experiment with {n_trials} trial(s) per condition")
@@ -738,9 +1109,25 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                 plot_activity=plot_activity,
                 mec_current=mec_current,
                 opsin_current=opsin_current,
-                n_trials=n_trials
+                n_trials=n_trials,
+                adaptive_step=adaptive_step
             )
-            
+            if adaptive_step and 'adaptive_stats' in result:
+                adaptive_stats = result['adaptive_stats']
+    
+                # For multi-trial: show mean +/- std
+                if n_trials > 1:
+                    print(f"  Steps: {adaptive_stats['n_steps_mean']:.0f} +/- {adaptive_stats['n_steps_std']:.0f} "
+                          f"(range: {adaptive_stats['n_steps_min']}-{adaptive_stats['n_steps_max']})")
+                    print(f"  Avg dt: {adaptive_stats['avg_dt_mean']:.3f} +/- {adaptive_stats['avg_dt_std']:.3f} ms")
+                    print(f"  dt range: [{adaptive_stats['min_dt_mean']:.3f}, {adaptive_stats['max_dt_mean']:.3f}] ms")
+                # For single trial: show direct values
+                else:
+                    print(f"  Steps: {adaptive_stats['n_steps_mean']:.0f} (avg dt: {adaptive_stats['avg_dt_mean']:.3f} ms)")
+                    print(f"  dt range: [{adaptive_stats['min_dt_min']:.3f}, {adaptive_stats['max_dt_max']:.3f}] ms")
+
+
+                
             # Analyze network effects (using mean across trials)
             time = result['time']
             activity_mean = result['activity_trace_mean']
@@ -753,14 +1140,20 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             analysis = {}
             analysis['opsin_expression_mean'] = opsin_expression_mean
             analysis['n_trials'] = n_trials
+
+            # Store adaptive stats if present
+            if 'adaptive_stats' in result:
+                analysis['adaptive_stats'] = result['adaptive_stats']
+            
+            if save_full_activity:
+                analysis['time'] = time
+                analysis['activity_trace_mean'] = activity_mean
+                analysis['activity_trace_std'] = activity_std
+                analysis['opsin_expression_std'] = result['opsin_expression_std']
             
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
                 stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
-                
-                # Also calculate std across time for each neuron
-                baseline_std_time = torch.std(activity_mean[pop][:, baseline_mask], dim=1)
-                stim_std_time = torch.std(activity_mean[pop][:, stim_mask], dim=1)
                 
                 if pop == target:
                     analysis[f'{pop}_stim_rates_mean'] = stim_rate.numpy()
@@ -812,7 +1205,184 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             
             results[target][intensity] = analysis
     
+    # Prepare metadata for saving
+    metadata = {
+        'optimization_file': optimization_json_file,
+        'intensities': intensities,
+        'mec_current': mec_current,
+        'opsin_current': opsin_current,
+        'stim_start': stim_start,
+        'stim_duration': stim_duration,
+        'warmup': warmup,
+        'n_trials': n_trials,
+        'base_seed': base_seed,
+        'device': str(device),
+        'circuit_params': {
+            'n_gc': circuit_params.n_gc,
+            'n_mc': circuit_params.n_mc,
+            'n_pv': circuit_params.n_pv,
+            'n_sst': circuit_params.n_sst,
+            'n_mec': circuit_params.n_mec,
+        }
+    }
+    
+    # Save results if requested
+    if save_results_file is not None:
+        save_experiment_results(results, conn_analysis, conductance_analysis, 
+                               save_results_file, metadata)
+    elif auto_save:
+        # Auto-save with default filename
+        default_filename = get_default_results_filename(optimization_json_file, 
+                                                        n_trials, base_seed)
+        save_path = Path("protocol") / default_filename
+        save_experiment_results(results, conn_analysis, conductance_analysis,
+                               str(save_path), metadata)
+    
     return results, conn_analysis, conductance_analysis
+
+
+def save_experiment_results(results: Dict, 
+                            connectivity_analysis: Dict,
+                            conductance_analysis: Dict,
+                            filepath: str,
+                            metadata: Optional[Dict] = None):
+    """
+    Save comparative experiment results to file
+    
+    Args:
+        results: Results dictionary from run_comparative_experiment
+        connectivity_analysis: Connectivity analysis dictionary
+        conductance_analysis: Conductance analysis dictionary
+        filepath: Path to save file (e.g., 'experiment_results.pkl')
+        metadata: Optional metadata dict (parameters, timestamp, etc.)
+    """
+    import pickle
+    from datetime import datetime
+    
+    # Prepare data for saving
+    save_data = {
+        'results': results,
+        'connectivity_analysis': connectivity_analysis,
+        'conductance_analysis': conductance_analysis,
+        'metadata': metadata or {},
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0'
+    }
+    
+    # Convert torch tensors to numpy for better compatibility
+    def convert_tensors_to_numpy(obj):
+        """Recursively convert torch tensors to numpy arrays"""
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy()
+        elif isinstance(obj, dict):
+            return {k: convert_tensors_to_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_tensors_to_numpy(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_tensors_to_numpy(item) for item in obj)
+        else:
+            return obj
+    
+    save_data = convert_tensors_to_numpy(save_data)
+    
+    # Save to file
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(filepath, 'wb') as f:
+        pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    print(f"\nExperiment results saved to: {filepath}")
+    print(f"  File size: {filepath.stat().st_size / 1024 / 1024:.2f} MB")
+    if metadata:
+        print(f"  Configuration: {metadata.get('n_trials', 'N/A')} trials, "
+              f"seed {metadata.get('base_seed', 'N/A')}")
+
+
+def load_experiment_results(filepath: str) -> Tuple[Dict, Dict, Dict, Dict]:
+    """
+    Load comparative experiment results from file
+    
+    Args:
+        filepath: Path to saved results file
+        
+    Returns:
+        Tuple of (results, connectivity_analysis, conductance_analysis, metadata)
+    """
+    import pickle
+    
+    filepath = Path(filepath)
+    
+    if not filepath.exists():
+        raise FileNotFoundError(f"Results file not found: {filepath}")
+    
+    with open(filepath, 'rb') as f:
+        save_data = pickle.load(f)
+    
+    # Extract components
+    results = save_data['results']
+    connectivity_analysis = save_data['connectivity_analysis']
+    conductance_analysis = save_data['conductance_analysis']
+    metadata = save_data.get('metadata', {})
+    
+    print(f"\nLoaded experiment results from: {filepath}")
+    print(f"  Saved: {save_data.get('timestamp', 'Unknown')}")
+    print(f"  Version: {save_data.get('version', 'Unknown')}")
+    if metadata:
+        print(f"  Configuration: {metadata.get('n_trials', 'N/A')} trials, "
+              f"seed {metadata.get('base_seed', 'N/A')}")
+        if 'optimization_file' in metadata and metadata['optimization_file']:
+            print(f"  Optimization: {metadata['optimization_file']}")
+    
+    # Convert numpy arrays back to torch tensors where needed
+    def convert_numpy_to_tensors(obj):
+        """Recursively convert numpy arrays to torch tensors for activity traces"""
+        if isinstance(obj, np.ndarray):
+            return torch.from_numpy(obj)
+        elif isinstance(obj, dict):
+            # Only convert specific keys that are expected to be tensors
+            tensor_keys = ['activity_trace_mean', 'activity_trace_std', 
+                          'opsin_expression_mean', 'opsin_expression_std', 'time']
+            if any(k in obj for k in tensor_keys):
+                return {k: convert_numpy_to_tensors(v) for k, v in obj.items()}
+            else:
+                return {k: convert_numpy_to_tensors(v) if isinstance(v, (dict, list, np.ndarray)) 
+                       else v for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy_to_tensors(item) for item in obj]
+        else:
+            return obj
+    
+    results = convert_numpy_to_tensors(results)
+    
+    return results, connectivity_analysis, conductance_analysis, metadata
+
+
+def get_default_results_filename(optimization_file: Optional[str] = None,
+                                 n_trials: int = 1,
+                                 base_seed: int = 42) -> str:
+    """
+    Generate default filename for experiment results
+    
+    Args:
+        optimization_file: Optimization file used (if any)
+        n_trials: Number of trials run
+        base_seed: Random seed used
+        
+    Returns:
+        Default filename string
+    """
+    from datetime import datetime
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if optimization_file:
+        opt_name = Path(optimization_file).stem
+        filename = f"DG_experiment_{opt_name}_n{n_trials}_seed{base_seed}_{timestamp}.pkl"
+    else:
+        filename = f"DG_experiment_default_n{n_trials}_seed{base_seed}_{timestamp}.pkl"
+    
+    return filename
 
 
 def calculate_gini_coefficient(values: np.ndarray) -> float:
@@ -841,11 +1411,112 @@ def lorenz_curve(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 def get_opsin_expression_mask(target_pop: str,
                               opsin_expression: np.ndarray, 
-                              expression_threshold: float = 0.1) -> Dict:
+                              expression_threshold: float = 0.2) -> Dict:
     """Extract mask for non-opsin and opsin expressing cells."""
     expressing_mask = opsin_expression >= expression_threshold
     return expressing_mask
 
+def plot_adaptive_stepping_analysis(adaptive_stats: Dict,
+                                    stim_start: float,
+                                    stim_duration: float,
+                                    save_path: Optional[str] = None) -> None:
+    """
+    Visualize adaptive stepping behavior
+    
+    Args:
+        adaptive_stats: Aggregated adaptive statistics from multi-trial run
+        stim_start: Stimulation start time (ms) for marking
+        stim_duration: Stimulation duration (ms) for marking
+        save_path: Optional path to save figure
+    """
+    import matplotlib.pyplot as plt
+    
+    # Use sample from first trial for detailed time series
+    time_history = adaptive_stats['time_history_sample']
+    dt_history = adaptive_stats['dt_history_sample']
+    gradient_history = adaptive_stats['gradient_history_sample']
+    
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    
+    # Panel 1: Time step over time
+    ax1 = axes[0]
+    ax1.plot(time_history[1:], dt_history, 'b-', linewidth=1.5, alpha=0.7)
+    
+    # Show mean and range across trials if multi-trial
+    if 'avg_dt_std' in adaptive_stats and adaptive_stats['avg_dt_std'] > 0:
+        n_trials = len(adaptive_stats['trial_avg_dt'])
+        ax1.axhline(adaptive_stats['avg_dt_mean'], color='red', linestyle='--', 
+                   label=f'Mean across {n_trials} trials', linewidth=2)
+        ax1.fill_between([time_history[0], time_history[-1]], 
+                        [adaptive_stats['min_dt_min']] * 2,
+                        [adaptive_stats['max_dt_max']] * 2,
+                        alpha=0.2, color='red', label='Range across trials')
+    
+    # Mark stimulation period
+    ax1.axvspan(stim_start, stim_start + stim_duration, 
+               alpha=0.1, color='orange', label='Stimulation')
+    
+    ax1.set_ylabel(r'Time Step $\Delta t$ (ms)', fontsize=11)
+    ax1.set_title('Adaptive Time Step Evolution (Sample Trial)', fontsize=12, fontweight='bold')
+    ax1.legend(loc='best', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    
+    # Panel 2: Gradient magnitude over time
+    ax2 = axes[1]
+    ax2.plot(time_history[1:], gradient_history, 'g-', linewidth=1.5, alpha=0.7)
+    ax2.axvspan(stim_start, stim_start + stim_duration, 
+               alpha=0.1, color='orange', label='Stimulation')
+    ax2.set_ylabel('Gradient Magnitude (Hz/ms)', fontsize=11)
+    ax2.set_title('Activity Gradient Over Time', fontsize=12, fontweight='bold')
+    ax2.set_yscale('log')
+    ax2.legend(loc='best', fontsize=9)
+    ax2.grid(True, alpha=0.3, which='both')
+    
+    # Panel 3: Cumulative time vs steps
+    ax3 = axes[2]
+    cumulative_time = np.cumsum(dt_history)
+    steps = np.arange(len(dt_history))
+    ax3.plot(cumulative_time, steps, 'purple', linewidth=2)
+    
+    # Add reference line for fixed dt
+    fixed_dt = 0.1  # Standard dt from circuit_params
+    max_time = time_history[-1]
+    fixed_steps = np.arange(0, max_time / fixed_dt)
+    fixed_time = fixed_steps * fixed_dt
+    ax3.plot(fixed_time, fixed_steps, 'k--', alpha=0.5, linewidth=1.5,
+            label=f'Fixed dt={fixed_dt} ms')
+    
+    # Calculate efficiency
+    n_steps_adaptive = len(dt_history)
+    n_steps_fixed = int(max_time / fixed_dt)
+    efficiency = (1 - n_steps_adaptive / n_steps_fixed) * 100
+    
+    ax3.set_xlabel('Time (ms)', fontsize=11)
+    ax3.set_ylabel('Cumulative Steps', fontsize=11)
+    ax3.set_title(f'Computational Efficiency: {efficiency:.1f}% Reduction '
+                 f'({n_steps_adaptive} vs {n_steps_fixed} steps)', 
+                 fontsize=12, fontweight='bold')
+    ax3.legend(loc='best', fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    
+    # Overall title with multi-trial info
+    if 'n_steps_std' in adaptive_stats and adaptive_stats['n_steps_std'] > 0:
+        n_trials = len(adaptive_stats['trial_avg_dt'])
+        fig.suptitle(f'Adaptive Stepping Analysis (Aggregated over {n_trials} trials)\n'
+                    f'Mean steps: {adaptive_stats["n_steps_mean"]:.0f} ± {adaptive_stats["n_steps_std"]:.0f}, '
+                    f'Mean dt: {adaptive_stats["avg_dt_mean"]:.3f} ± {adaptive_stats["avg_dt_std"]:.3f} ms',
+                    fontsize=14, fontweight='bold')
+    else:
+        fig.suptitle('Adaptive Stepping Analysis (Single Trial)', 
+                    fontsize=14, fontweight='bold')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved adaptive stepping analysis to: {save_path}")
+    
+    plt.show()
 
 def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                                         stimulation_level: float = 1.0,
@@ -853,7 +1524,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     """
     Create visualizations from comparative experiment results
     
-    UPDATED: Now handles multi-trial statistics with error bars
+    Now handles multi-trial statistics with error bars
     """
     
     # Check if we have multi-trial data
@@ -1073,7 +1744,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         else:
             stim_rates = results[target][stimulation_level][f'{target}_stim_rates'][opsin_expression <= 0.2]
             baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates'][opsin_expression <= 0.2]
-        
+
         ax.scatter(baseline_rates, stim_rates, c=colors[target], alpha=0.6, s=30, 
                   edgecolors='black', linewidth=0.5)
         
@@ -1081,11 +1752,13 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         from scipy import stats
         slope, intercept, r_value, p_value, std_err = stats.linregress(baseline_rates, stim_rates)
         print(f"baseline_rates = {baseline_rates}")
+        print(f"stim_rates = {stim_rates}")
         print(f"intercept = {intercept}")
         line = slope * baseline_rates + intercept
         ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, 
                label=f'Fit (R={r_value:.2f})')
-        
+
+
         # Identity line
         max_rate = max(np.max(baseline_rates), np.max(stim_rates))
         ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5, linewidth=1.5, 
@@ -1142,9 +1815,9 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     
     if save_path:
         trial_suffix = f'_n{n_trials}trials' if has_multitrial else '_single_trial'
-        plt.savefig(f"{save_path}/DG_comparative_experiment{trial_suffix}.pdf", 
+        plt.savefig(f"{save_path}/DG_comparative_experiment_stim_{stimulation_level}{trial_suffix}.pdf", 
                    dpi=300, bbox_inches='tight')
-        plt.savefig(f"{save_path}/DG_comparative_experiment{trial_suffix}.png", 
+        plt.savefig(f"{save_path}/DG_comparative_experiment_stim_{stimulation_level}{trial_suffix}.png", 
                    dpi=300, bbox_inches='tight')
     
     plt.show()
@@ -1428,15 +2101,46 @@ if __name__ == "__main__":
                         help='Optogenetic stimulus start time [ms] (default: 1000.0)')
     parser.add_argument('--stim-duration', type=float, default=1000.0,
                         help='Optogenetic stimulus duration [ms] (default: 1000.0)')
+    parser.add_argument('--load-results', type=str, default=None,
+                       help='Load results from file instead of running experiment')
+    parser.add_argument('--save-results', type=str, default=None,
+                       help='Save results to specific file')
+    parser.add_argument('--no-auto-save', action='store_true',
+                       help='Disable automatic saving of results')
+    parser.add_argument('--plot-only', action='store_true',
+                       help='Only plot results (requires --load-results)')
+    parser.add_argument('--adaptive-step', action='store_true',
+                        help='Use gradient-driven adaptive time stepping')
+    parser.add_argument('--adaptive-dt-min', type=float, default=0.05,
+                        help='Minimum time step for adaptive stepping (ms)')
+    parser.add_argument('--adaptive-dt-max', type=float, default=0.25,
+                        help='Maximum time step for adaptive stepping (ms)')
+    parser.add_argument('--adaptive-gradient-low', type=float, default=0.5,
+                        help='Low gradient threshold (Hz/ms)')
+    parser.add_argument('--adaptive-gradient-high', type=float, default=10.0,
+                        help='High gradient threshold (Hz/ms)')
     
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.plot_only and args.load_results is None:
+        parser.error("--plot-only requires --load-results")
     
     # Auto-detect device or use specified
     if args.device is None:
         device = get_default_device()
     else:
         device = torch.device(args.device)
-        
+
+    adaptive_config = None
+    if args.adaptive_step:
+        adaptive_config = GradientAdaptiveStepConfig(
+            dt_min=args.adaptive_dt_min,
+            dt_max=args.adaptive_dt_max,
+            gradient_low=args.adaptive_gradient_low,
+            gradient_high=args.adaptive_gradient_high,
+        )
+
     print(f"\nUsing device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
@@ -1459,39 +2163,57 @@ if __name__ == "__main__":
         n_trials=args.n_trials,
         base_seed=args.base_seed,
         stim_start=args.stim_start,
-        stim_duration=args.stim_duration
+        stim_duration=args.stim_duration,
+        load_results_file=args.load_results,
+        save_results_file=args.save_results,
+        auto_save=not args.no_auto_save,
+        adaptive_step=args.adaptive_step,
+        adaptive_config=adaptive_config
     )
 
     # Print results with multi-trial statistics
-    mec_conn = connectivity_analysis['mec_connectivity']
-    print(f"\nMEC -> PV connections: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
-    print(f"MEC -> GC connections: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
-    print(f"MEC -> MC connections: {mec_conn['mec_to_mc']}")
-    print(f"MEC -> SST connections: {mec_conn['mec_to_sst']}")
-    
-    for target in ['pv', 'sst']:
-        print(f"\n{target.upper()} Stimulation Results (Average of {args.n_trials} trials):")
-        print("-" * 50)
-        
-        for intensity in [0.5, 1.0, 2.0]:
-            analysis = results[target][intensity]
-            print(f"\nIntensity {intensity}:")
-            
-            for pop in ['gc', 'mc', 'pv', 'sst']:
-                if f'{pop}_excited' in analysis:
-                    excited = analysis[f'{pop}_excited']
-                    excited_std = analysis.get(f'{pop}_excited_std', 0.0)
-                    inhibited = analysis[f'{pop}_inhibited'] 
-                    mean_change = analysis[f'{pop}_mean_change']
-                    mean_change_std = analysis.get(f'{pop}_mean_change_std', 0.0)
-                    mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
-                    mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
-                    
-                    print(f"  {pop.upper()}:")
-                    print(f"    Excited: {excited:.2f} ± {excited_std:.2f}")
-                    print(f"    Inhibited: {inhibited:.2f}")
-                    print(f"    Rate: {mean_baseline_rate:.2f} -> {mean_stim_rate:.2f} Hz")
-                    print(f"    Change: {mean_change:.3f} +/- {mean_change_std:.3f} Hz")
+    if not args.plot_only:
+        mec_conn = connectivity_analysis['mec_connectivity']
+        print(f"\nMEC -> PV connections: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
+        print(f"MEC -> GC connections: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
+        print(f"MEC -> MC connections: {mec_conn['mec_to_mc']}")
+        print(f"MEC -> SST connections: {mec_conn['mec_to_sst']}")
+
+        for target in ['pv', 'sst']:
+            print(f"\n{target.upper()} Stimulation Results (Average of {args.n_trials} trials):")
+            print("-" * 50)
+
+            for intensity in [0.5, 1.0, 2.0]:
+                analysis = results[target][intensity]
+                print(f"\nIntensity {intensity}:")
+
+                for pop in ['gc', 'mc', 'pv', 'sst']:
+                    if f'{pop}_excited' in analysis:
+                        excited = analysis[f'{pop}_excited']
+                        excited_std = analysis.get(f'{pop}_excited_std', 0.0)
+                        inhibited = analysis[f'{pop}_inhibited'] 
+                        mean_change = analysis[f'{pop}_mean_change']
+                        mean_change_std = analysis.get(f'{pop}_mean_change_std', 0.0)
+                        mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
+                        mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
+
+                        print(f"  {pop.upper()}:")
+                        print(f"    Excited: {excited:.2f} +/- {excited_std:.2f}")
+                        print(f"    Inhibited: {inhibited:.2f}")
+                        print(f"    Rate: {mean_baseline_rate:.2f} -> {mean_stim_rate:.2f} Hz")
+                        print(f"    Change: {mean_change:.3f} +/- {mean_change_std:.3f} Hz")
+
+
+    # Plot adaptive stepping analysis if adaptive stepping was used
+    #if args.adaptive_step and 'adaptive_stats' in results['pv'][1.0]:
+    #    plot_adaptive_stepping_analysis(
+    #        results['pv'][1.0]['adaptive_stats'],
+    #        stim_start=args.stim_start,
+    #        stim_duration=args.stim_duration,
+    #        save_path="protocol/DG_adaptive_stepping_analysis.png"
+    #    )
 
     # Plot results with multi-trial statistics
-    plot_comparative_experiment_results(results, connectivity_analysis, save_path="protocol")
+    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=0.5, save_path="protocol")
+    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=1.0, save_path="protocol")
+    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=2.0, save_path="protocol")

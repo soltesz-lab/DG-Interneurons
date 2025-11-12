@@ -60,14 +60,16 @@ class SynapticStateManager:
                 'connectivity': cond_matrix.connectivity.to(self.device)
             }
     
-    def update_synaptic_states(self, activities: Dict[str, torch.Tensor]):
+    def update_synaptic_states(self, activities: Dict[str, torch.Tensor], dt: Optional[float] = None):
         """Update all synaptic state variables based on presynaptic firing rates"""
         
         # Calculate decay factors for each synapse type
-        tensor_dt = torch.tensor(self.dt, device=self.device)
-        ampa_decay = torch.exp(-tensor_dt / self.synaptic_params.tau_ampa)
-        gaba_decay = torch.exp(-tensor_dt / self.synaptic_params.tau_gaba) 
-        nmda_decay = torch.exp(-tensor_dt / self.synaptic_params.tau_nmda)
+        effective_dt = dt if dt is not None else self.dt
+
+        decay_factors = self._get_decay_factors(effective_dt)
+        ampa_decay = decay_factors['ampa']
+        gaba_decay = decay_factors['gaba']
+        nmda_decay = decay_factors['nmda']
         
         for conn_name, syn_data in self.synaptic_states.items():
             parts = conn_name.split('_')
@@ -125,6 +127,27 @@ class SynapticStateManager:
             for state_var in syn_data['states'].values():
                 state_var.zero_()
 
+    def _get_decay_factors(self, dt: float) -> Dict[str, float]:
+        """
+        Get or compute decay factors for given dt
+        
+        Uses caching for efficiency.
+        """
+        if not hasattr(self, '_decay_cache'):
+            self._decay_cache = {}
+    
+        if dt not in self._decay_cache:
+            tau_ampa = self.synaptic_params.tau_ampa
+            tau_nmda = self.synaptic_params.tau_nmda
+            tau_gaba = self.synaptic_params.tau_gaba
+            
+            self._decay_cache[dt] = {
+                'ampa': float(np.exp(-dt / tau_ampa)),
+                'nmda': float(np.exp(-dt / tau_nmda)),
+                'gaba': float(np.exp(-dt / tau_gaba))
+            }
+    
+        return self._decay_cache[dt]
 
 @dataclass
 class PerConnectionSynapticParams:
@@ -270,9 +293,9 @@ class CircuitParams:
     
     # MEC connection probabilities (from Hainmueller et al.)
     p_mec_gc: float = 0.025         # Perforant path to GC
-    p_mec_mc: float = 0.0          # Assuming no direct MEC → MC
-    p_mec_pv: float = 0.019        # Direct MEC → PV (1.91% from paper)
-    p_mec_sst: float = 0.0         # NO direct MEC → SST (key asymmetry!)
+    p_mec_mc: float = 0.0          # Assuming no direct MEC -> MC
+    p_mec_pv: float = 0.019        # Direct MEC -> PV (1.91% from paper)
+    p_mec_sst: float = 0.0         # NO direct MEC -> SST (key asymmetry!)
 
     # Interneuron feedback connections  
     p_pv_gc: float = 0.33           # PV feedback inhibition
@@ -691,7 +714,8 @@ class DentateCircuit(nn.Module):
 
     def update_activity_with_dendritic_somatic(self, 
                                                direct_activation: Dict[str, torch.Tensor], 
-                                               external_drive: Dict[str, torch.Tensor] = None):
+                                               external_drive: Dict[str, torch.Tensor] = None,
+                                               dt: Optional[float] = None):
         """Updated activity update using conductance-based dendritic-somatic transfer"""
         if external_drive is None:
             external_drive = {}
@@ -705,7 +729,7 @@ class DentateCircuit(nn.Module):
             'mec': self.mec_activity
         }
 
-        self.synaptic_state_manager.update_synaptic_states(activities)
+        self.synaptic_state_manager.update_synaptic_states(activities, dt=dt)
 
         # Step 2: Update each population using conductance-based transfer
         for pop in ['gc', 'mc', 'pv', 'sst']:
@@ -806,17 +830,24 @@ class DentateCircuit(nn.Module):
                 states['v_soma'])
 
     def forward(self, direct_activation: Dict[str, Tensor], 
-                external_drive: Dict[str, Tensor] = None) -> Dict[str, Tensor]:
+                external_drive: Dict[str, Tensor] = None,
+                dt: Optional[float] = None) -> Dict[str, Tensor]:
         """Single time step forward pass with dendritic-somatic processing"""
 
+        effective_dt = dt if dt is not None else self.circuit_params.dt
+        
         # Tell CUDA graphs where computation boundaries are
         if self.device.type == 'cuda':
             try:
                 torch.compiler.cudagraph_mark_step_begin()
             except AttributeError:
                 pass
-        
-        self.update_activity_with_dendritic_somatic(direct_activation, external_drive)
+
+        # Compute decay factors for this dt (if needed)
+        if hasattr(self, 'synaptic_state_manager'):
+            decay_factors = self.synaptic_state_manager._get_decay_factors(effective_dt)
+            
+        self.update_activity_with_dendritic_somatic(direct_activation, external_drive, dt=effective_dt)
         
         return {
             'gc': self.gc_activity.clone(),
