@@ -13,9 +13,6 @@ from pathlib import Path
 import tqdm
 
 from dendritic_somatic_transfer import (
-    dendritic_somatic_transfer,
-    get_cell_type_parameters,
-    DendriticParameters,
     get_default_device
 )
 from DG_circuit_dendritic_somatic_transfer import (
@@ -121,8 +118,13 @@ class OpsinExpression:
         expression = torch.exp(normal_samples)
 
         # Some cells have no expression (transduction failure)
-        no_expression = torch.rand(self.n_cells, device=self.device) < self.params.failure_rate
-        expression[no_expression] = 0.0
+        sorted_indices = np.argsort(-expression)
+        print(f"sorted expression = {expression[sorted_indices]}")
+        n_failed = int(round(self.params.failure_rate * self.n_cells))
+        print(f"failure_rate = {self.params.failure_rate} n_cells = {self.n_cells} n_failed = {n_failed}")
+        print(f"sorted expression before failure = {expression[sorted_indices]}")
+        expression[sorted_indices[-n_failed:]] = 0.0
+        print(f"sorted expression after failure = {expression[sorted_indices]}")
         
         return expression
     
@@ -150,6 +152,169 @@ class OpsinExpression:
         return activation
 
 
+def get_mec_rotation_pattern(n_mec: int,
+                             trial_index: int,
+                             base_currents: np.ndarray,
+                             n_groups: int = 3,
+                             device: Optional[torch.device] = None) -> torch.Tensor:
+    """
+    Get spatial pattern that rotates across trials
+    
+    Divides MEC population into groups and rotates the group assignment across trials.
+    
+    Args:
+        n_mec: Number of MEC neurons
+        trial_index: Current trial index (0, 1, 2, ...)
+        n_groups: Number of groups to divide MEC population into
+        device: Device to create tensor on
+        
+    Returns:
+        group_tensor: [n_mec] tensor of rates
+    """
+    if device is None:
+        device = get_default_device()
+    
+    # Divide neurons into groups
+    group_size = n_mec // n_groups
+    remainder = n_mec % n_groups
+    
+    # Apply circular rotation based on trial index
+    rotation_amount = ((trial_index + 1) * group_size) % n_mec
+    rotated_array = np.roll(base_currents, rotation_amount)
+
+    return torch.from_numpy(rotated_array).float().to(device)
+
+
+def generate_time_varying_mec_pattern(n_mec: int,
+                                      duration: float,
+                                      dt: float,
+                                      base_current: float,
+                                      trial_index: int,
+                                      pattern_type: str = 'oscillatory',
+                                      theta_freq: float = 5.0,
+                                      theta_amplitude: float = 0.3,
+                                      gamma_freq: float = 20.0,
+                                      gamma_amplitude: float = 0.15,
+                                      gamma_coupling_strength: float = 0.8,
+                                      gamma_preferred_phase: float = 0.0,
+                                      drift_timescale: float = 200.0,
+                                      drift_amplitude: float = 0.4,
+                                      rotation_groups: int = 3,
+                                      device: Optional[torch.device] = None) -> torch.Tensor:
+    """
+    Generate time-varying MEC firing pattern with trial rotation
+    
+    Creates temporally-structured input patterns that:
+    1. Vary over time to average out spatial biases within trials
+    2. Rotate spatial structure across trials for ensemble balance
+    
+    Args:
+        n_mec: Number of MEC neurons
+        duration: Total duration in ms
+        dt: Time step in ms
+        base_current: Base current level (pA)
+        trial_index: Current trial index for rotation
+        pattern_type: 'oscillatory', 'drift', or 'constant'
+        theta_freq: Theta oscillation frequency (Hz)
+        theta_amplitude: Relative theta modulation depth (0-1)
+        gamma_freq: Gamma oscillation frequency (Hz)  
+        gamma_amplitude: Relative gamma modulation depth (0-1)
+        drift_timescale: Correlation time for drift pattern (ms)
+        drift_amplitude: Relative drift amplitude (0-1)
+        rotation_groups: Number of groups for trial rotation
+        device: Device to create tensors on
+        
+    Returns:
+        mec_pattern: [n_mec, n_timesteps] tensor of MEC currents (pA)
+    """
+    if device is None:
+        device = get_default_device()
+    
+    n_steps = int(duration / dt)
+    time_vec = torch.arange(n_steps, device=device) * dt  # in ms
+    
+    # Get spatial rotation pattern for this trial
+    base_rates = get_mec_rotation_pattern(
+        n_mec, trial_index, base_current, rotation_groups, device
+    )  # [n_mec]
+    
+    if pattern_type == 'constant':
+        # No temporal variation, just spatial rotation
+        mec_pattern = base_rates.unsqueeze(1).expand(-1, n_steps)
+        
+    elif pattern_type == 'oscillatory':
+        # Oscillatory modulation with theta and gamma components
+        
+        # Generate random phase offsets for each neuron
+        theta_phases = torch.rand(n_mec, device=device) * 2 * np.pi
+        gamma_phases = torch.rand(n_mec, device=device) * 2 * np.pi
+
+        # Time in seconds for frequency calculation
+        time_sec = time_vec / 1000.0  # [n_steps]
+        
+        # Theta modulation: [n_mec, n_steps]
+        theta_component = theta_amplitude * torch.sin(
+            2 * np.pi * theta_freq * time_sec.unsqueeze(0) + theta_phases.unsqueeze(1)
+        )
+
+        # Theta-modulated gamma envelope
+        # Gamma amplitude peaks at specific theta phase
+        # gamma_coupling_strength controls coupling (0=independent, 1=fully coupled)
+        # gamma_preferred_phase controls which theta phase gamma peaks at
+
+        # Compute theta phase at each time point for each neuron
+        theta_phase_matrix = 2 * np.pi * theta_freq * time_sec.unsqueeze(0) + theta_phases.unsqueeze(1)
+    
+        # Gamma envelope: varies from (1 - coupling_strength) to (1 + coupling_strength)
+        # Peaks when theta is at preferred phase
+        gamma_envelope = 1.0 + gamma_coupling_strength * torch.sin(
+            theta_phase_matrix + gamma_preferred_phase
+        )
+
+        # Gamma oscillation with theta-modulated amplitude: [n_mec, n_steps]
+        gamma_oscillation = torch.sin(
+            2 * np.pi * gamma_freq * time_sec.unsqueeze(0) + gamma_phases.unsqueeze(1)
+        )
+        gamma_component = gamma_envelope * gamma_amplitude * gamma_oscillation
+        
+        # Combined pattern: base * (1 + theta + gamma)
+        modulation = 1.0 + theta_component + gamma_component
+        mec_pattern = base_rates.unsqueeze(1) * modulation
+        
+    elif pattern_type == 'drift':
+        # Ornstein-Uhlenbeck process for slow drift
+        
+        # OU parameters
+        tau = drift_timescale  # correlation time in ms
+        sigma = drift_amplitude * base_current  # noise amplitude
+        
+        # Initialize with random starting points
+        mec_pattern = torch.zeros(n_mec, n_steps, device=device)
+        mec_pattern[:, 0] = base_rates
+        
+        # Generate OU process for each neuron
+        sqrt_dt = np.sqrt(dt)
+        for t in range(1, n_steps):
+            # OU dynamics: dx = -(x - mu)/tau * dt + sigma * sqrt(dt) * dW
+            drift_term = -(mec_pattern[:, t-1] - base_rates) / tau * dt
+            noise_term = sigma * sqrt_dt * torch.randn(n_mec, device=device)
+            mec_pattern[:, t] = mec_pattern[:, t-1] + drift_term + noise_term
+            
+            # Clip to reasonable range (prevent negative currents)
+            mec_pattern[:, t] = torch.clamp(mec_pattern[:, t], 
+                                           min=base_current * 0.2,
+                                           max=base_current * 2.0)
+    
+    else:
+        raise ValueError(f"Unknown pattern_type: {pattern_type}. Use 'oscillatory', 'drift', or 'constant'")
+    
+    # Ensure no negative currents
+    mec_pattern = torch.clamp(mec_pattern, min=0.0)
+    
+    return mec_pattern
+
+
+    
 class OptogeneticExperiment:
     """
     Simulate optogenetic stimulation experiments
@@ -163,7 +328,18 @@ class OptogeneticExperiment:
                  optimization_json_file: Optional[str] = None,
                  device: Optional[torch.device] = None,
                  base_seed: int = 42,
-                 adaptive_config: Optional[GradientAdaptiveStepConfig] = None):
+                 adaptive_config: Optional[GradientAdaptiveStepConfig] = None,
+                 use_time_varying_mec: bool = True,
+                 mec_pattern_type: str = 'oscillatory',
+                 mec_theta_freq: float = 5.0,
+                 mec_theta_amplitude: float = 0.3,
+                 mec_gamma_freq: float = 20.0,
+                 mec_gamma_amplitude: float = 0.15,
+                 mec_gamma_coupling_strength: float = 0.8,
+                 mec_gamma_preferred_phase: float = 0.0,
+                 mec_drift_timescale: float = 200.0,
+                 mec_drift_amplitude: float = 0.4,
+                 mec_rotation_groups: int = 3):
         """
         Initialize optogenetic experiment
         
@@ -174,6 +350,15 @@ class OptogeneticExperiment:
             optimization_json_file: Optional path to optimization results JSON
             device: Device to run on
             base_seed: Base random seed for reproducibility (default: 42)
+            use_time_varying_mec: Whether to use time-varying MEC input (default: True)
+            mec_pattern_type: Type of temporal pattern ('oscillatory', 'drift', 'constant')
+            mec_theta_freq: Theta oscillation frequency in Hz (default: 5.0)
+            mec_theta_amplitude: Theta modulation depth 0-1 (default: 0.3)
+            mec_gamma_freq: Gamma oscillation frequency in Hz (default: 20.0)
+            mec_gamma_amplitude: Gamma modulation depth 0-1 (default: 0.15)
+            mec_drift_timescale: Correlation time for drift pattern in ms (default: 200.0)
+            mec_drift_amplitude: Drift amplitude relative to base (default: 0.4)
+            mec_rotation_groups: Number of groups for spatial rotation (default: 3)
         """
         self.circuit_params = circuit_params
         self.opsin_params = opsin_params
@@ -182,6 +367,18 @@ class OptogeneticExperiment:
         self.base_seed = base_seed
         # Store adaptive config
         self.adaptive_config = adaptive_config
+
+        self.use_time_varying_mec = use_time_varying_mec
+        self.mec_pattern_type = mec_pattern_type
+        self.mec_theta_freq = mec_theta_freq
+        self.mec_theta_amplitude = mec_theta_amplitude
+        self.mec_gamma_freq = mec_gamma_freq
+        self.mec_gamma_amplitude = mec_gamma_amplitude
+        self.mec_gamma_coupling_strength = mec_gamma_coupling_strength
+        self.mec_gamma_preferred_phase = mec_gamma_preferred_phase
+        self.mec_drift_timescale = mec_drift_timescale
+        self.mec_drift_amplitude = mec_drift_amplitude
+        self.mec_rotation_groups = mec_rotation_groups
         
         if optimization_json_file is not None:
             success = self._load_optimization_results(optimization_json_file)
@@ -190,12 +387,14 @@ class OptogeneticExperiment:
             else:
                 print(f"Failed to load optimization file. Using default parameters.")
 
-        # Create initial circuit (will be recreated for each trial)
+        # Create initial circuit (will be recreated for each trial if regenerate_connectivity is True)
         self.circuit = self._create_circuit(base_seed)
-        
+        self.opsin_expression = {}
+ 
         print(f"OptogeneticExperiment initialized on device: {self.device}")
         print(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
 
+        
     def _create_circuit(self, seed: int) -> DentateCircuit:
         """Create circuit with specified seed for connectivity"""
         set_random_seed(seed, self.device)
@@ -311,6 +510,8 @@ class OptogeneticExperiment:
                              ds_times: Optional[List[float]] = None,
                              plot_activity: bool = False,
                              n_trials: int = 1,
+                             regenerate_connectivity_per_trial: bool = False,
+                             regenerate_opsin_per_trial: bool = False,
                              adaptive_step: bool = True) -> Dict:
         """
         Simulate optogenetic stimulation experiment with MEC drive
@@ -329,7 +530,11 @@ class OptogeneticExperiment:
             ds_times: Specific dentate spike times (optional)
             plot_activity: Whether to plot activity
             n_trials: Number of trials to average (default: 1)
-            
+            regenerate_connectivity_per_trial: If True, create new circuit with different
+              connectivity for each trial (default: False)
+            regenerate_opsin_per_trial: If True, create new opsin expression
+              for each trial (default: False)
+        
         Returns:
             Dict with averaged results over trials, including:
                 - time: Time vector
@@ -342,7 +547,7 @@ class OptogeneticExperiment:
         # Storage for multi-trial results
         all_trial_results = []
         
-        # Run multiple trials with different connectivity
+        # Run multiple trials
         for trial in range(n_trials):
             # Set seed for this trial
             trial_seed = self.base_seed + trial
@@ -350,11 +555,19 @@ class OptogeneticExperiment:
             
             if trial == 0:
                 print(f"\nRunning {n_trials} trial(s)...")
-            print(f"  Trial {trial + 1}/{n_trials}: Creating circuit with seed {trial_seed}...")
-            
-            # Create NEW circuit for this trial with fresh connectivity
-            self.circuit = self._create_circuit(trial_seed)
-            
+
+            if regenerate_connectivity_per_trial:
+                print(f"  Trial {trial + 1}/{n_trials}: Creating circuit with seed {trial_seed}...")
+                # Create new circuit for this trial with fresh connectivity
+                self.circuit = self._create_circuit(trial_seed)
+            else:
+                print(f"  Trial {trial + 1}/{n_trials}...")
+
+            if (self.opsin_expression.get(target_population, None) is None) or regenerate_opsin_per_trial:
+                print(f"  Creating opsin expression...")
+                self.opsin_expression[target_population] = self.create_opsin_expression(target_population)
+
+                
             # Run single trial
             if adaptive_step:
                 trial_result = self._simulate_single_trial_adaptive(
@@ -367,7 +580,7 @@ class OptogeneticExperiment:
                     opsin_current=opsin_current,
                     include_dentate_spikes=include_dentate_spikes,
                     ds_times=ds_times,
-                    plot_activity=(plot_activity and trial == 0),  # Only plot first trial
+                    plot_activity=plot_activity, # and trial == 0),  # Only plot first trial
                     trial_index=trial,
                     adaptive_config=self.adaptive_config
                 )
@@ -382,22 +595,26 @@ class OptogeneticExperiment:
                     opsin_current=opsin_current,
                     include_dentate_spikes=include_dentate_spikes,
                     ds_times=ds_times,
-                    plot_activity=(plot_activity and trial == 0),  # Only plot first trial
+                    plot_activity=plot_activity, # and trial == 0),  # Only plot first trial
                     trial_index=trial
                 )
             
             all_trial_results.append(trial_result)
-            
-            # Clean up to free memory
-            del self.circuit
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
+
+            # Clean up to free memory (only if we created new circuits)
+            if regenerate_connectivity_per_trial:
+                del self.circuit
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
         
         # Aggregate results across trials
         aggregated_results = self._aggregate_trial_results(all_trial_results, n_trials)
-        
-        print(f"Completed {n_trials} trial(s) with different connectivity")
-        
+
+        if regenerate_connectivity_per_trial:
+            print(f"Completed {n_trials} trial(s) with different connectivity")
+        else:
+            print(f"Completed {n_trials} trial(s) with the same connectivity")
+            
         return aggregated_results
 
 
@@ -451,16 +668,21 @@ class OptogeneticExperiment:
         self.circuit.reset_state()
 
         # Create opsin expression
-        opsin = self.create_opsin_expression(target_population)
+        opsin = self.opsin_expression[target_population]
         target_positions = self.circuit.layout.positions[target_population]
         activation_prob = opsin.calculate_activation(target_positions, light_intensity)
 
         # Identify stimulated vs non-stimulated cells (unchanged)
-        expression_threshold = 0.2
-        stimulated_mask = opsin.expression_levels >= expression_threshold
+        activation_threshold = 1e-2
+        stimulated_mask = activation_prob >= activation_threshold
         stimulated_indices = torch.where(stimulated_mask)[0].cpu().numpy()
         non_stimulated_indices = torch.where(~stimulated_mask)[0].cpu().numpy()
+        activation_prob[non_stimulated_indices] = 0.0
+        plot_direct_activation = {}
+        print(f"activation_prob: {activation_prob}")
 
+        print(f"stimulated_indices = {stimulated_indices}")
+        print(f"non_stimulated_indices = {non_stimulated_indices}")
         # Simulation parameters
         duration = stim_start + stim_duration + post_duration
         stim_start_step_time = stim_start  # Store as time, not step index
@@ -472,6 +694,29 @@ class OptogeneticExperiment:
         time_grid = torch.linspace(0, duration, n_steps, device=self.device)
         activity_storage = initialize_activity_storage(self.circuit, time_grid)
 
+        if self.use_time_varying_mec:
+            mec_pattern = generate_time_varying_mec_pattern(
+                n_mec=self.circuit_params.n_mec,
+                duration=duration,
+                dt=storage_dt,  # Generate at storage resolution
+                base_current=mec_current,
+                trial_index=trial_index,
+                pattern_type=self.mec_pattern_type,
+                theta_freq=self.mec_theta_freq,
+                theta_amplitude=self.mec_theta_amplitude,
+                gamma_freq=self.mec_gamma_freq,
+                gamma_amplitude=self.mec_gamma_amplitude,
+                gamma_coupling_strength=self.mec_gamma_coupling_strength,
+                gamma_preferred_phase=self.mec_gamma_preferred_phase,
+                drift_timescale=self.mec_drift_timescale,
+                drift_amplitude=self.mec_drift_amplitude,
+                rotation_groups=self.mec_rotation_groups,
+                device=self.device
+            )  # [n_mec, n_steps]
+        else:
+            # Fall back to constant MEC input with noise
+            mec_pattern = None
+        
         # Generate dentate spike times (unchanged)
         if include_dentate_spikes:
             if ds_times is None:
@@ -499,10 +744,20 @@ class OptogeneticExperiment:
             direct_activation = {}
             if (state.current_time >= stim_start_step_time) and (state.current_time < stim_end_time):
                 direct_activation[target_population] = activation_prob * opsin_current
+                plot_direct_activation[target_population] = activation_prob * opsin_current
 
-            # Calculate MEC external drive
+            # Calculate MEC external drive from time-varying pattern
             external_drive = {}
-            mec_drive = torch.ones(self.circuit_params.n_mec, device=self.device) * mec_current
+            if self.use_time_varying_mec:
+                # Interpolate MEC pattern to current time
+                time_idx = int(state.current_time / storage_dt)
+                if time_idx < mec_pattern.shape[1]:
+                    mec_drive = mec_pattern[:, time_idx]
+                else:
+                    mec_drive = mec_pattern[:, -1]
+            else:
+                # Original constant drive
+                mec_drive = mec_current
 
             # Add dentate spike drive
             for ds_time in ds_times:
@@ -553,9 +808,15 @@ class OptogeneticExperiment:
                     'part2_label': f'Non-stimulated (n={len(non_stimulated_indices)})'
                 }
             }
+            #fig, _ = vis.plot_activity_patterns(
+            #    activity_trace_cpu,
+            #    save_path=f"protocol/DG_{target_population}_stimulation_activity_{light_intensity}_trial{trial_index}.png"
+            #)
+
             fig, _ = vis.plot_activity_raster(
                 activity_trace_cpu,
                 split_populations=split_populations,
+                direct_activation=plot_direct_activation,
                 save_path=f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
@@ -596,22 +857,21 @@ class OptogeneticExperiment:
         # Reset circuit state
         self.circuit.reset_state()
         
-        # Create opsin expression
-        opsin = self.create_opsin_expression(target_population)
         target_positions = self.circuit.layout.positions[target_population]
 
         print(f"opsin_expression {target_population}: {opsin.expression_levels}")
 
         # Calculate direct optogenetic activation
+        opsin = self.opsin_expression[target_population]
         activation_prob = opsin.calculate_activation(target_positions, light_intensity)
 
         # Identify stimulated vs non-stimulated cells
-        # Identify stimulated vs non-stimulated cells
         # (cells with opsin expression above threshold)
-        expression_threshold = 0.2
-        stimulated_mask = opsin.expression_levels >= expression_threshold
+        activation_threshold = 1e-2
+        stimulated_mask = activation_prob >= activation_threshold
         stimulated_indices = torch.where(stimulated_mask)[0].cpu().numpy()
         non_stimulated_indices = torch.where(~stimulated_mask)[0].cpu().numpy()
+        activation_prob[non_stimulated_indices] = 0.0
         
         # Simulation parameters
         dt = self.circuit_params.dt
@@ -629,6 +889,27 @@ class OptogeneticExperiment:
             'sst': torch.zeros(self.circuit_params.n_sst, n_steps, device=self.device),
             'mec': torch.zeros(self.circuit_params.n_mec, n_steps, device=self.device)
         }
+
+        # Generate time-varying MEC pattern
+        if self.use_time_varying_mec:
+            mec_pattern = generate_time_varying_mec_pattern(
+                n_mec=self.circuit_params.n_mec,
+                duration=duration,
+                dt=dt,
+                base_current=mec_current,
+                trial_index=trial_index,
+                pattern_type=self.mec_pattern_type,
+                theta_freq=self.mec_theta_freq,
+                theta_amplitude=self.mec_theta_amplitude,
+                gamma_freq=self.mec_gamma_freq,
+                gamma_amplitude=self.mec_gamma_amplitude,
+                drift_timescale=self.mec_drift_timescale,
+                drift_amplitude=self.mec_drift_amplitude,
+                rotation_groups=self.mec_rotation_groups,
+                device=self.device
+            )  # [n_mec, n_steps]
+        else:
+            mec_pattern = None
         
         # Generate dentate spike times (random occurrences)
         if include_dentate_spikes:
@@ -636,7 +917,9 @@ class OptogeneticExperiment:
                 ds_times = self._generate_dentate_spike_times(duration, baseline_rate=0.5)
         else:
             ds_times = []
-        
+
+        plot_direct_activation = {}
+            
         # Run simulation
         for t in range(n_steps):
             current_time = t * dt
@@ -645,10 +928,18 @@ class OptogeneticExperiment:
             if (t >= stim_start_step) and (t < stim_end_step):
                 # Convert to strong current injection
                 direct_activation[target_population] = activation_prob * opsin_current
+                plot_direct_activation[target_population] = activation_prob * opsin_current
                 
             # Calculate MEC external drive (dentate spikes + baseline)
             external_drive = {}
-            mec_drive = torch.ones(self.circuit_params.n_mec, device=self.device) * mec_current
+            # Calculate MEC external drive from time-varying pattern
+            external_drive = {}
+            if self.use_time_varying_mec:
+                mec_drive = mec_pattern[:, t]
+            else:
+                # Original constant drive with noise
+                mec_drive = mec_current
+
             
             # Add dentate spike drive
             for ds_time in ds_times:
@@ -690,6 +981,7 @@ class OptogeneticExperiment:
             fig, _ = vis.plot_activity_raster(
                 activity_trace_cpu,
                 split_populations=split_populations,
+                direct_activation=plot_direct_activation,
                 save_path=f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
@@ -981,19 +1273,32 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                intensities: List[float] = [0.5, 1.0, 2.0],
                                mec_current: float = 100.0,
                                opsin_current: float = 100.0,
-                               stim_start: float = 1000.0,
+                               stim_start: float = 1500.0,
                                stim_duration: float = 1000.0,
-                               warmup: float = 250.0,
+                               warmup: float = 500.0,
                                plot_activity: bool = True,
                                device: Optional[torch.device] = None,
                                n_trials: int = 1,
+                               regenerate_connectivity_per_trial: bool = False,
                                base_seed: int = 42,
                                load_results_file: Optional[str] = None,
                                save_results_file: Optional[str] = None,
                                auto_save: bool = True,
                                save_full_activity: bool = False,
                                adaptive_step: bool = True,
-                               adaptive_config: Optional[GradientAdaptiveStepConfig] = None):
+                               adaptive_config: Optional[GradientAdaptiveStepConfig] = None,
+                               use_time_varying_mec: bool = False,
+                               mec_pattern_type: str = 'oscillatory',
+                               mec_theta_freq: float = 5.0,
+                               mec_theta_amplitude: float = 0.3,
+                               mec_gamma_freq: float = 20.0,
+                               mec_gamma_amplitude: float = 0.15,
+                               mec_gamma_coupling_strength: float = 0.8,
+                               mec_gamma_preferred_phase: float = 0.0,
+                               mec_drift_timescale: float = 200.0,
+                               mec_drift_amplitude: float = 0.4,
+                               mec_rotation_groups: int = 3,
+                               validate_input_balance: bool = True):
     """
     Compare PV vs SST stimulation with anatomical connectivity
     
@@ -1057,7 +1362,18 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
         optimization_json_file=optimization_json_file,
         device=device,
         base_seed=base_seed,
-        adaptive_config=adaptive_config
+        adaptive_config=adaptive_config,
+        use_time_varying_mec=use_time_varying_mec,
+        mec_pattern_type=mec_pattern_type,
+        mec_theta_freq=mec_theta_freq,
+        mec_theta_amplitude=mec_theta_amplitude,
+        mec_gamma_freq=mec_gamma_freq,
+        mec_gamma_amplitude=mec_gamma_amplitude,
+        mec_gamma_coupling_strength=mec_gamma_coupling_strength,
+        mec_gamma_preferred_phase=mec_gamma_preferred_phase,
+        mec_drift_timescale=mec_drift_timescale,
+        mec_drift_amplitude=mec_drift_amplitude,
+        mec_rotation_groups=mec_rotation_groups
     )
     
     print(f"\nRunning comparative experiment with {n_trials} trial(s) per condition")
@@ -1110,6 +1426,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                 mec_current=mec_current,
                 opsin_current=opsin_current,
                 n_trials=n_trials,
+                regenerate_connectivity_per_trial=regenerate_connectivity_per_trial,
                 adaptive_step=adaptive_step
             )
             if adaptive_step and 'adaptive_stats' in result:
@@ -1751,14 +2068,16 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         # Add correlation line
         from scipy import stats
         slope, intercept, r_value, p_value, std_err = stats.linregress(baseline_rates, stim_rates)
-        print(f"baseline_rates = {baseline_rates}")
-        print(f"stim_rates = {stim_rates}")
-        print(f"intercept = {intercept}")
+        
         line = slope * baseline_rates + intercept
         ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, 
                label=f'Fit (R={r_value:.2f})')
 
-
+        if hasattr(baseline_rates, 'numpy'):
+            baseline_rates = baseline_rates.numpy()
+        if hasattr(stim_rates, 'numpy'):
+            stim_rates = stim_rates.numpy()
+            
         # Identity line
         max_rate = max(np.max(baseline_rates), np.max(stim_rates))
         ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5, linewidth=1.5, 
@@ -1806,7 +2125,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         
     main_title = 'Dentate Gyrus Interneuron Effects'
     if has_multitrial:
-        main_title += f' (Average of {n_trials} Trials with Different Connectivity)'
+        main_title += f' (Average of {n_trials} Trials)'
     else:
         main_title += ' (Representative Single Trial)'
         
@@ -2075,6 +2394,825 @@ def test_disinhibition_hypothesis(optimization_json_file: Optional[str] = None,
                 print(f"  Change variability: {result['std_change_full']:.3f} -> {result['std_change_no_inh']:.3f}")
      
 
+def test_interneuron_interactions(
+    optimization_json_file: Optional[str] = None,
+    target_populations: List[str] = ['pv', 'sst'],
+    intensities: List[float] = [0.5, 1.0, 2.0],
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    stim_start: float = 1500.0,
+    stim_duration: float = 1000.0,
+    warmup: float = 500.0,
+    plot_activity: bool = True,
+    device: Optional[torch.device] = None,
+    n_trials: int = 1,
+    base_seed: int = 42,
+    save_results_file: Optional[str] = None
+) -> Dict:
+    """
+    Test role of interneuron-interneuron interactions in paradoxical excitation
+    
+    This test blocks connections between interneurons (PV<->SST, PV<->PV, SST<->SST)
+    while keeping excitatory inputs and outputs intact. If paradoxical excitation
+    depends on interneuron interactions (e.g., disinhibition via PV->SST), blocking
+    these connections should reduce the effect.
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        target_populations: List of populations to stimulate
+        intensities: List of light intensities to test
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
+        plot_activity: Whether to plot activity traces
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average
+        base_seed: Base random seed
+        save_results_file: If provided, save results to this file
+        
+    Returns:
+        Dictionary with results for each target population
+    """
+    
+    if device is None:
+        device = get_default_device()
+    
+    print("\n" + "="*80)
+    print("TEST: Interneuron-Interneuron Interaction Hypothesis")
+    print("="*80)
+    print("\nBlocking connections:")
+    print("  - PV -> PV (prevents lateral inhibition within PV population)")
+    print("  - PV -> SST (prevents PV-mediated disinhibition of SST)")
+    print("  - SST -> PV (prevents SST-mediated disinhibition of PV)")
+    print("  - SST -> SST (prevents lateral inhibition within SST population)")
+    print("\nPrediction: If paradoxical excitation relies on interneuron")
+    print("           interactions (e.g., PV->SST disinhibition), this")
+    print("           manipulation should reduce the effect.")
+    print("="*80 + "\n")
+    
+    circuit_params = CircuitParams()
+    opsin_params = OpsinParams()
+    
+    # Create modified synaptic parameters that block interneuron interactions
+    base_synaptic_params = PerConnectionSynapticParams()
+    
+    blocked_synaptic_params = PerConnectionSynapticParams(
+        ampa_g_mean=base_synaptic_params.ampa_g_mean,
+        ampa_g_std=base_synaptic_params.ampa_g_std,
+        ampa_g_min=base_synaptic_params.ampa_g_min,
+        ampa_g_max=base_synaptic_params.ampa_g_max,
+        gaba_g_mean=base_synaptic_params.gaba_g_mean,
+        gaba_g_std=base_synaptic_params.gaba_g_std,
+        gaba_g_min=base_synaptic_params.gaba_g_min,
+        gaba_g_max=base_synaptic_params.gaba_g_max,
+        distribution=base_synaptic_params.distribution,
+        connection_modulation={
+            **base_synaptic_params.connection_modulation,
+            # Block all interneuron-interneuron connections
+            'pv_pv': 0.01,
+            'pv_sst': 0.01,
+            'sst_pv': 0.01,
+            'sst_sst': 0.01,
+        }
+    )
+    
+    results = {
+        'full_network': {},
+        'blocked_int_int': {}
+    }
+    
+    for target in target_populations:
+        print(f"\n{'='*60}")
+        print(f"Testing {target.upper()} stimulation")
+        print('='*60)
+        
+        # Run full network (control)
+        print("\n1. Full Network (Control)")
+        print("-"*60)
+        experiment_full = OptogeneticExperiment(
+            circuit_params, base_synaptic_params, opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=base_seed
+        )
+        
+        full_results = {}
+        for intensity in intensities:
+            print(f"\n  Testing intensity: {intensity}")
+            result = experiment_full.simulate_stimulation(
+                target, intensity,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                plot_activity=(plot_activity and intensity == intensities[-1]),
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                n_trials=n_trials
+            )
+            
+            # Analyze results
+            time = result['time']
+            activity_mean = result['activity_trace_mean']
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+            
+            analysis = {}
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop == target:
+                    continue
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                rate_change = stim_rate - baseline_rate
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                
+                analysis[f'{pop}_excited'] = excited_fraction.item()
+                analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+            full_results[intensity] = analysis
+        
+        results['full_network'][target] = full_results
+        
+        # Run with blocked interneuron interactions
+        print("\n2. Blocked Interneuron-Interneuron Connections")
+        print("-"*60)
+        experiment_blocked = OptogeneticExperiment(
+            circuit_params, blocked_synaptic_params, opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=base_seed + 1000  # Different connectivity
+        )
+        
+        blocked_results = {}
+        for intensity in intensities:
+            print(f"\n  Testing intensity: {intensity}")
+            result = experiment_blocked.simulate_stimulation(
+                target, intensity,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                plot_activity=(plot_activity and intensity == intensities[-1]),
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                n_trials=n_trials
+            )
+            
+            time = result['time']
+            activity_mean = result['activity_trace_mean']
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+            
+            analysis = {}
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop == target:
+                    continue
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                rate_change = stim_rate - baseline_rate
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                
+                analysis[f'{pop}_excited'] = excited_fraction.item()
+                analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+            blocked_results[intensity] = analysis
+        
+        results['blocked_int_int'][target] = blocked_results
+        
+        # Print comparison
+        print(f"\n{'='*60}")
+        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        print('='*60)
+        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Int-Int':<20} {'Change':<15}")
+        print('-'*60)
+        
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            if pop == target:
+                continue
+            full_exc = full_results[intensities[-1]][f'{pop}_excited']
+            blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
+            change = blocked_exc - full_exc
+            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+    
+    # Save results if requested
+    if save_results_file:
+        import pickle
+        with open(save_results_file, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"\nResults saved to: {save_results_file}")
+    
+    return results
+
+
+def test_excitation_to_interneurons(
+    optimization_json_file: Optional[str] = None,
+    target_populations: List[str] = ['pv', 'sst'],
+    intensities: List[float] = [0.5, 1.0, 2.0],
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    stim_start: float = 1500.0,
+    stim_duration: float = 1000.0,
+    warmup: float = 500.0,
+    plot_activity: bool = True,
+    device: Optional[torch.device] = None,
+    n_trials: int = 1,
+    base_seed: int = 42,
+    save_results_file: Optional[str] = None
+) -> Dict:
+    """
+    Test disinhibition hypothesis by blocking excitation to interneurons
+    
+    This is the cleanest test of the disinhibition hypothesis. By blocking all
+    excitatory inputs to interneurons (MEC->PV, GC->PV, MC->PV, GC->SST, MC->SST)
+    while keeping excitation to principal cells intact, we can test if paradoxical
+    excitation requires recruitment of the inhibitory network.
+    
+    Prediction: If paradoxical excitation is mediated by disinhibition (i.e.,
+               activating one interneuron population reduces inhibition from
+               another), then blocking excitatory inputs to interneurons should
+               eliminate the effect.
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        target_populations: List of populations to stimulate
+        intensities: List of light intensities to test
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
+        plot_activity: Whether to plot activity traces
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average
+        base_seed: Base random seed
+        save_results_file: If provided, save results to this file
+        
+    Returns:
+        Dictionary with results for each target population
+    """
+    
+    if device is None:
+        device = get_default_device()
+    
+    print("\n" + "="*80)
+    print("TEST: Disinhibition Hypothesis (Clean Test)")
+    print("="*80)
+    print("\nBlocking connections:")
+    print("  - MEC -> PV (blocks external excitation to PV)")
+    print("  - GC -> PV (blocks local excitation to PV)")
+    print("  - MC -> PV (blocks distant excitation to PV)")
+    print("  - GC -> SST (blocks local excitation to SST)")
+    print("  - MC -> SST (blocks distant excitation to SST)")
+    print("\nKept intact:")
+    print("  - All excitation to principal cells (GC, MC)")
+    print("  - All inhibition from interneurons")
+    print("  - Direct optogenetic activation of target interneurons")
+    print("\nPrediction: If paradoxical excitation requires excitatory")
+    print("           recruitment of the inhibitory network (disinhibition),")
+    print("           this should eliminate the effect.")
+    print("="*80 + "\n")
+    
+    circuit_params = CircuitParams()
+    opsin_params = OpsinParams()
+    
+    base_synaptic_params = PerConnectionSynapticParams()
+    
+    blocked_synaptic_params = PerConnectionSynapticParams(
+        ampa_g_mean=base_synaptic_params.ampa_g_mean,
+        ampa_g_std=base_synaptic_params.ampa_g_std,
+        ampa_g_min=base_synaptic_params.ampa_g_min,
+        ampa_g_max=base_synaptic_params.ampa_g_max,
+        gaba_g_mean=base_synaptic_params.gaba_g_mean,
+        gaba_g_std=base_synaptic_params.gaba_g_std,
+        gaba_g_min=base_synaptic_params.gaba_g_min,
+        gaba_g_max=base_synaptic_params.gaba_g_max,
+        distribution=base_synaptic_params.distribution,
+        connection_modulation={
+            **base_synaptic_params.connection_modulation,
+            # Block all excitation TO interneurons
+            'mec_pv': 0.01,
+            'gc_pv': 0.01,
+            'mc_pv': 0.01,
+            'gc_sst': 0.01,
+            'mc_sst': 0.01,
+        }
+    )
+    
+    results = {
+        'full_network': {},
+        'blocked_exc_to_int': {}
+    }
+    
+    for target in target_populations:
+        print(f"\n{'='*60}")
+        print(f"Testing {target.upper()} stimulation")
+        print('='*60)
+        
+        # Run full network (control)
+        print("\n1. Full Network (Control)")
+        print("-"*60)
+        experiment_full = OptogeneticExperiment(
+            circuit_params, base_synaptic_params, opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=base_seed
+        )
+        
+        full_results = {}
+        for intensity in intensities:
+            print(f"\n  Testing intensity: {intensity}")
+            result = experiment_full.simulate_stimulation(
+                target, intensity,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                plot_activity=(plot_activity and intensity == intensities[-1]),
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                n_trials=n_trials
+            )
+            
+            time = result['time']
+            activity_mean = result['activity_trace_mean']
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+            
+            analysis = {}
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop == target:
+                    continue
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                rate_change = stim_rate - baseline_rate
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                
+                analysis[f'{pop}_excited'] = excited_fraction.item()
+                analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+            full_results[intensity] = analysis
+        
+        results['full_network'][target] = full_results
+        
+        # Run with blocked excitation to interneurons
+        print("\n2. Blocked Excitation to Interneurons")
+        print("-"*60)
+        experiment_blocked = OptogeneticExperiment(
+            circuit_params, blocked_synaptic_params, opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=base_seed + 1000
+        )
+        
+        blocked_results = {}
+        for intensity in intensities:
+            print(f"\n  Testing intensity: {intensity}")
+            result = experiment_blocked.simulate_stimulation(
+                target, intensity,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                plot_activity=(plot_activity and intensity == intensities[-1]),
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                n_trials=n_trials
+            )
+            
+            time = result['time']
+            activity_mean = result['activity_trace_mean']
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+            
+            analysis = {}
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop == target:
+                    continue
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                rate_change = stim_rate - baseline_rate
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                
+                analysis[f'{pop}_excited'] = excited_fraction.item()
+                analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+            blocked_results[intensity] = analysis
+        
+        results['blocked_exc_to_int'][target] = blocked_results
+        
+        # Print comparison
+        print(f"\n{'='*60}")
+        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        print('='*60)
+        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Exc->Int':<20} {'Change':<15}")
+        print('-'*60)
+        
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            if pop == target:
+                continue
+            full_exc = full_results[intensities[-1]][f'{pop}_excited']
+            blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
+            change = blocked_exc - full_exc
+            
+            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+            
+            if abs(change) > 0.05:  # Significant reduction
+                print(f"             → {'STRONG' if abs(change) > 0.15 else 'MODERATE'} reduction suggests disinhibition mechanism")
+    
+    if save_results_file:
+        import pickle
+        with open(save_results_file, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"\nResults saved to: {save_results_file}")
+    
+    return results
+
+
+def test_recurrent_excitation(
+    optimization_json_file: Optional[str] = None,
+    target_populations: List[str] = ['pv', 'sst'],
+    intensities: List[float] = [0.5, 1.0, 2.0],
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    stim_start: float = 1500.0,
+    stim_duration: float = 1000.0,
+    warmup: float = 500.0,
+    plot_activity: bool = True,
+    device: Optional[torch.device] = None,
+    n_trials: int = 1,
+    base_seed: int = 42,
+    save_results_file: Optional[str] = None
+) -> Dict:
+    """
+    Test role of recurrent excitation among principal cells
+    
+    This test blocks recurrent excitatory connections among principal cells
+    (GC->MC, MC->GC, MC->MC) while keeping all connections involving interneurons
+    intact. This tests whether paradoxical excitation depends on amplification
+    through recurrent excitatory loops.
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        target_populations: List of populations to stimulate
+        intensities: List of light intensities to test
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
+        plot_activity: Whether to plot activity traces
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average
+        base_seed: Base random seed
+        save_results_file: If provided, save results to this file
+        
+    Returns:
+        Dictionary with results for each target population
+    """
+    
+    if device is None:
+        device = get_default_device()
+    
+    print("\n" + "="*80)
+    print("TEST: Recurrent Excitation Hypothesis")
+    print("="*80)
+    print("\nBlocking connections:")
+    print("  - GC -> MC (blocks feedforward excitation)")
+    print("  - MC -> GC (blocks feedback excitation)")
+    print("  - MC -> MC (blocks lateral excitation within MC)")
+    print("\nKept intact:")
+    print("  - All connections involving interneurons")
+    print("  - External drive (MEC -> GC, MEC -> MC)")
+    print("\nPrediction: If paradoxical excitation depends on amplification")
+    print("           through recurrent excitatory loops among principal")
+    print("           cells, blocking these connections should reduce")
+    print("           the effect.")
+    print("="*80 + "\n")
+    
+    circuit_params = CircuitParams()
+    opsin_params = OpsinParams()
+    
+    base_synaptic_params = PerConnectionSynapticParams()
+    
+    blocked_synaptic_params = PerConnectionSynapticParams(
+        ampa_g_mean=base_synaptic_params.ampa_g_mean,
+        ampa_g_std=base_synaptic_params.ampa_g_std,
+        ampa_g_min=base_synaptic_params.ampa_g_min,
+        ampa_g_max=base_synaptic_params.ampa_g_max,
+        gaba_g_mean=base_synaptic_params.gaba_g_mean,
+        gaba_g_std=base_synaptic_params.gaba_g_std,
+        gaba_g_min=base_synaptic_params.gaba_g_min,
+        gaba_g_max=base_synaptic_params.gaba_g_max,
+        distribution=base_synaptic_params.distribution,
+        connection_modulation={
+            **base_synaptic_params.connection_modulation,
+            # Block recurrent excitation among principal cells
+            'gc_mc': 0.01,
+            'mc_gc': 0.01,
+            'mc_mc': 0.01,
+        }
+    )
+    
+    results = {
+        'full_network': {},
+        'blocked_recurrent': {}
+    }
+    
+    for target in target_populations:
+        print(f"\n{'='*60}")
+        print(f"Testing {target.upper()} stimulation")
+        print('='*60)
+        
+        # Run full network (control)
+        print("\n1. Full Network (Control)")
+        print("-"*60)
+        experiment_full = OptogeneticExperiment(
+            circuit_params, base_synaptic_params, opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=base_seed
+        )
+        
+        full_results = {}
+        for intensity in intensities:
+            print(f"\n  Testing intensity: {intensity}")
+            result = experiment_full.simulate_stimulation(
+                target, intensity,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                plot_activity=(plot_activity and intensity == intensities[-1]),
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                n_trials=n_trials
+            )
+            
+            time = result['time']
+            activity_mean = result['activity_trace_mean']
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+            
+            analysis = {}
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop == target:
+                    continue
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                rate_change = stim_rate - baseline_rate
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                
+                analysis[f'{pop}_excited'] = excited_fraction.item()
+                analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+            full_results[intensity] = analysis
+        
+        results['full_network'][target] = full_results
+        
+        # Run with blocked recurrent excitation
+        print("\n2. Blocked Recurrent Excitation")
+        print("-"*60)
+        experiment_blocked = OptogeneticExperiment(
+            circuit_params, blocked_synaptic_params, opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=base_seed + 1000
+        )
+        
+        blocked_results = {}
+        for intensity in intensities:
+            print(f"\n  Testing intensity: {intensity}")
+            result = experiment_blocked.simulate_stimulation(
+                target, intensity,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                plot_activity=(plot_activity and intensity == intensities[-1]),
+                mec_current=mec_current,
+                opsin_current=opsin_current,
+                n_trials=n_trials
+            )
+            
+            time = result['time']
+            activity_mean = result['activity_trace_mean']
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+            
+            analysis = {}
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if pop == target:
+                    continue
+                baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                rate_change = stim_rate - baseline_rate
+                baseline_std = torch.std(baseline_rate)
+                
+                excited_fraction = torch.mean((rate_change > baseline_std).float())
+                
+                analysis[f'{pop}_excited'] = excited_fraction.item()
+                analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+            blocked_results[intensity] = analysis
+        
+        results['blocked_recurrent'][target] = blocked_results
+        
+        # Print comparison
+        print(f"\n{'='*60}")
+        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        print('='*60)
+        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Recurrent':<20} {'Change':<15}")
+        print('-'*60)
+        
+        for pop in ['gc', 'mc']:  # Focus on principal cells for this test
+            full_exc = full_results[intensities[-1]][f'{pop}_excited']
+            blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
+            change = blocked_exc - full_exc
+            
+            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+            
+            if abs(change) > 0.05:
+                print(f"             → Recurrent excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
+    
+    if save_results_file:
+        import pickle
+        with open(save_results_file, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"\nResults saved to: {save_results_file}")
+    
+    return results
+
+
+def run_all_ablation_tests(
+    optimization_json_file: Optional[str] = None,
+    target_populations: List[str] = ['pv', 'sst'],
+    intensities: List[float] = [1.0],
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    stim_start: float = 1500.0,
+    stim_duration: float = 1000.0,
+    warmup: float = 500.0,
+    device: Optional[torch.device] = None,
+    n_trials: int = 3,
+    base_seed: int = 42,
+    output_dir: str = "./ablation_tests"
+) -> Dict:
+    """
+    Run all three ablation tests and create summary comparison
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        target_populations: List of populations to stimulate
+        intensities: List of light intensities to test
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average
+        base_seed: Base random seed
+        output_dir: Directory to save results
+        
+    Returns:
+        Dictionary with all test results
+    """
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True, parents=True)
+    
+    print("\n" + "="*80)
+    print("ABLATION TEST SUITE")
+    print("="*80)
+    print(f"\nTesting {len(target_populations)} populations with {n_trials} trials each")
+    print(f"Results will be saved to: {output_dir}")
+    print("="*80)
+    
+    all_results = {}
+    
+    # Test 1: Interneuron-interneuron interactions
+    print("\n\n" + "#"*80)
+    print("# TEST 1/3: Interneuron-Interneuron Interactions")
+    print("#"*80)
+    results_int_int = test_interneuron_interactions(
+        optimization_json_file=optimization_json_file,
+        target_populations=target_populations,
+        intensities=intensities,
+        mec_current=mec_current,
+        opsin_current=opsin_current,
+        stim_start=stim_start,
+        stim_duration=stim_duration,
+        warmup=warmup,
+        plot_activity=False,
+        device=device,
+        n_trials=n_trials,
+        base_seed=base_seed,
+        save_results_file=str(output_path / "test1_int_int.pkl")
+    )
+    all_results['interneuron_interactions'] = results_int_int
+    
+    # Test 2: Excitation to interneurons (key disinhibition test)
+    print("\n\n" + "#"*80)
+    print("# TEST 2/3: Excitation to Interneurons (Disinhibition Test)")
+    print("#"*80)
+    results_exc_int = test_excitation_to_interneurons(
+        optimization_json_file=optimization_json_file,
+        target_populations=target_populations,
+        intensities=intensities,
+        mec_current=mec_current,
+        opsin_current=opsin_current,
+        stim_start=stim_start,
+        stim_duration=stim_duration,
+        warmup=warmup,
+        plot_activity=False,
+        device=device,
+        n_trials=n_trials,
+        base_seed=base_seed + 2000,
+        save_results_file=str(output_path / "test2_exc_to_int.pkl")
+    )
+    all_results['excitation_to_interneurons'] = results_exc_int
+    
+    # Test 3: Recurrent excitation
+    print("\n\n" + "#"*80)
+    print("# TEST 3/3: Recurrent Excitation")
+    print("#"*80)
+    results_recurrent = test_recurrent_excitation(
+        optimization_json_file=optimization_json_file,
+        target_populations=target_populations,
+        intensities=intensities,
+        mec_current=mec_current,
+        opsin_current=opsin_current,
+        stim_start=stim_start,
+        stim_duration=stim_duration,
+        warmup=warmup,
+        plot_activity=False,
+        device=device,
+        n_trials=n_trials,
+        base_seed=base_seed + 4000,
+        save_results_file=str(output_path / "test3_recurrent.pkl")
+    )
+    all_results['recurrent_excitation'] = results_recurrent
+    
+    # Create summary comparison
+    print("\n\n" + "="*80)
+    print("ABLATION TEST SUMMARY")
+    print("="*80)
+    
+    intensity = intensities[-1]
+    
+    for target in target_populations:
+        print(f"\n{target.upper()} Stimulation at intensity {intensity}")
+        print("-"*80)
+        print(f"{'Manipulation':<30} {'GC Excited':<15} {'MC Excited':<15} {'Effect':<15}")
+        print("-"*80)
+        
+        # Full network baseline
+        full_gc = results_exc_int['full_network'][target][intensity]['gc_excited']
+        full_mc = results_exc_int['full_network'][target][intensity]['mc_excited']
+        print(f"{'Full Network (baseline)':<30} {full_gc:>6.1%}          {full_mc:>6.1%}          -")
+        
+        # Test 1: Block interneuron interactions
+        test1_gc = results_int_int['blocked_int_int'][target][intensity]['gc_excited']
+        test1_mc = results_int_int['blocked_int_int'][target][intensity]['mc_excited']
+        change1_gc = (test1_gc - full_gc) / (full_gc + 1e-6)
+        change1_mc = (test1_mc - full_mc) / (full_mc + 1e-6)
+        print(f"{'Block Int-Int':<30} {test1_gc:>6.1%}          {test1_mc:>6.1%}          {(change1_gc+change1_mc)/2:>+6.1%}")
+        
+        # Test 2: Block excitation to interneurons
+        test2_gc = results_exc_int['blocked_exc_to_int'][target][intensity]['gc_excited']
+        test2_mc = results_exc_int['blocked_exc_to_int'][target][intensity]['mc_excited']
+        change2_gc = (test2_gc - full_gc) / (full_gc + 1e-6)
+        change2_mc = (test2_mc - full_mc) / (full_mc + 1e-6)
+        print(f"{'Block Exc->Int (KEY TEST)':<30} {test2_gc:>6.1%}          {test2_mc:>6.1%}          {(change2_gc+change2_mc)/2:>+6.1%}")
+        
+        # Test 3: Block recurrent excitation
+        test3_gc = results_recurrent['blocked_recurrent'][target][intensity]['gc_excited']
+        test3_mc = results_recurrent['blocked_recurrent'][target][intensity]['mc_excited']
+        change3_gc = (test3_gc - full_gc) / (full_gc + 1e-6)
+        change3_mc = (test3_mc - full_mc) / (full_mc + 1e-6)
+        print(f"{'Block Recurrent':<30} {test3_gc:>6.1%}          {test3_mc:>6.1%}          {(change3_gc+change3_mc)/2:>+6.1%}")
+        
+        print("\nInterpretation:")
+        avg_change2 = (change2_gc + change2_mc) / 2
+        if avg_change2 < -0.5:
+            print("  ✓ STRONG support for disinhibition hypothesis")
+            print("    (>50% reduction when blocking exc. to interneurons)")
+        elif avg_change2 < -0.3:
+            print("  ✓ MODERATE support for disinhibition hypothesis")
+            print("    (30-50% reduction when blocking exc. to interneurons)")
+        else:
+            print("  ✗ WEAK support for disinhibition hypothesis")
+            print("    (<30% reduction suggests other mechanisms)")
+    
+    # Save combined results
+    combined_file = output_path / "all_ablation_tests.pkl"
+    import pickle
+    with open(combined_file, 'wb') as f:
+        pickle.dump(all_results, f)
+    print(f"\n\nAll results saved to: {combined_file}")
+    
+    return all_results
+
 
 
 if __name__ == "__main__":
@@ -2091,14 +3229,16 @@ if __name__ == "__main__":
                        help='Device to run on (default: auto-detect)')
     parser.add_argument('--n-trials', type=int, default=3,
                        help='Number of trials to average (default: 3)')
+    parser.add_argument('--regenerate-connectivity', action='store_true',
+                        help='Regenerate circuit connectivity for each trial (default: False, reuse same circuit)')
     parser.add_argument('--base-seed', type=int, default=42,
                        help='Base random seed (default: 42)')
     parser.add_argument('--mec-current', type=float, default=40.0,
                         help='MEC drive current in pA (default: 40.0)')
     parser.add_argument('--opsin-current', type=float, default=200.0,
                        help='Optogenetic current in pA (default: 200.0)')
-    parser.add_argument('--stim-start', type=float, default=1000.0,
-                        help='Optogenetic stimulus start time [ms] (default: 1000.0)')
+    parser.add_argument('--stim-start', type=float, default=1500.0,
+                        help='Optogenetic stimulus start time [ms] (default: 1500.0)')
     parser.add_argument('--stim-duration', type=float, default=1000.0,
                         help='Optogenetic stimulus duration [ms] (default: 1000.0)')
     parser.add_argument('--load-results', type=str, default=None,
@@ -2119,6 +3259,26 @@ if __name__ == "__main__":
                         help='Low gradient threshold (Hz/ms)')
     parser.add_argument('--adaptive-gradient-high', type=float, default=10.0,
                         help='High gradient threshold (Hz/ms)')
+    parser.add_argument('--time-varying-mec', action='store_true',
+                       help='Enable time-varying MEC input')
+    parser.add_argument('--mec-pattern-type', type=str, default='oscillatory',
+                       choices=['oscillatory', 'drift', 'constant'],
+                       help='Type of temporal pattern for MEC input')
+    parser.add_argument('--mec-theta-freq', type=float, default=5.0,
+                       help='Theta oscillation frequency (Hz)')
+    parser.add_argument('--mec-theta-amplitude', type=float, default=0.3,
+                       help='Theta modulation depth (0-1)')
+    parser.add_argument('--mec-gamma-freq', type=float, default=20.0,
+                       help='Gamma oscillation frequency (Hz)')
+    parser.add_argument('--mec-gamma-amplitude', type=float, default=0.15,
+                       help='Gamma modulation depth (0-1)')
+    parser.add_argument('--mec-rotation-groups', type=int, default=3,
+                       help='Number of groups for spatial rotation')
+    parser.add_argument('--mec-gamma-coupling', type=float, default=0.8,
+                        help='Gamma-theta coupling strength (0=independent, 1=fully coupled)')
+    parser.add_argument('--mec-gamma-phase', type=float, default=0.0,
+                        help='Preferred theta phase for gamma peak (radians, 0=peak, pi=trough)')
+    
     
     args = parser.parse_args()
 
@@ -2156,11 +3316,12 @@ if __name__ == "__main__":
     # Run comparative experiment with multi-trial averaging
     results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
         optimization_json_file=args.optimization_file,
-        intensities=[0.5, 1.0, 2.0],
+        intensities=[0.5, 1.0, 1.5],
         mec_current=args.mec_current,
         opsin_current=args.opsin_current,
         device=device,
         n_trials=args.n_trials,
+        regenerate_connectivity_per_trial=args.regenerate_connectivity,
         base_seed=args.base_seed,
         stim_start=args.stim_start,
         stim_duration=args.stim_duration,
@@ -2168,7 +3329,16 @@ if __name__ == "__main__":
         save_results_file=args.save_results,
         auto_save=not args.no_auto_save,
         adaptive_step=args.adaptive_step,
-        adaptive_config=adaptive_config
+        adaptive_config=adaptive_config,
+        use_time_varying_mec=args.time_varying_mec,
+        mec_pattern_type=args.mec_pattern_type,
+        mec_theta_freq=args.mec_theta_freq,
+        mec_theta_amplitude=args.mec_theta_amplitude,
+        mec_gamma_freq=args.mec_gamma_freq,
+        mec_gamma_amplitude=args.mec_gamma_amplitude,
+        mec_gamma_coupling_strength=args.mec_gamma_coupling,
+        mec_gamma_preferred_phase=args.mec_gamma_phase,
+        mec_rotation_groups=args.mec_rotation_groups
     )
 
     # Print results with multi-trial statistics
@@ -2183,7 +3353,7 @@ if __name__ == "__main__":
             print(f"\n{target.upper()} Stimulation Results (Average of {args.n_trials} trials):")
             print("-" * 50)
 
-            for intensity in [0.5, 1.0, 2.0]:
+            for intensity in [0.5, 1.0, 1.5]:
                 analysis = results[target][intensity]
                 print(f"\nIntensity {intensity}:")
 
@@ -2216,4 +3386,17 @@ if __name__ == "__main__":
     # Plot results with multi-trial statistics
     plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=0.5, save_path="protocol")
     plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=1.0, save_path="protocol")
-    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=2.0, save_path="protocol")
+    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=1.5, save_path="protocol")
+
+    
+    run_all_ablation_tests(
+        optimization_json_file=args.optimization_file,
+        intensities=[1.0],
+        mec_current=args.mec_current,
+        opsin_current=args.opsin_current,
+        stim_start=args.stim_start,
+        stim_duration=args.stim_duration,
+        device=device,
+        n_trials=args.n_trials,
+        base_seed=args.base_seed,
+        output_dir="./ablation_tests")

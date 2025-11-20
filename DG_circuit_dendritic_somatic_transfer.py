@@ -77,17 +77,18 @@ class SynapticStateManager:
             
             if pre_pop not in activities:
                 continue
-                
+
             pre_rates = activities[pre_pop]
             states = syn_data['states']
             max_conductances = syn_data['max_conductances']
             connectivity = syn_data['connectivity']
             synapse_type = syn_data['synapse_type']
-            
+
             # Calculate synaptic input (firing rate * max conductance * connectivity)
             synaptic_input = pre_rates.unsqueeze(1) * max_conductances * connectivity
             
             if synapse_type == 'excitatory':
+
                 # Update AMPA conductances
                 states['ampa_conductance'] = (
                     ampa_decay * states['ampa_conductance'] + 
@@ -170,24 +171,24 @@ class PerConnectionSynapticParams:
     # Connection-type specific modulation factors
     connection_modulation: Dict[str, float] = field(default_factory=lambda: {
         # Excitatory connections
-        'mec_gc': 1.361,      # Strong perforant path
-        'mec_pv': 0.1,        # Perforant path to PV
-        'gc_mc': 1.826,       # Strong mossy fiber collaterals
-        'gc_pv': 0.1,         # Weak excitation to PV
-        'gc_sst': 1.468,      # Strong excitation to SST
-        'mc_gc': 1.41 ,       # Moderate associational
-        'mc_mc': 4.825,       # Strong recurrent
-        'mc_pv': 6.0,         # Very strong excitation to PV
-        'mc_sst': 2.0,        # Strong excitation to SST
+        'mec_gc': 1.4,       # Perforant path to GC
+        'mec_pv': 0.5,         # Perforant path to PV
+        'gc_mc': 0.5,          # Mossy fiber collaterals
+        'gc_pv': 0.5,          # Excitation to PV
+        'gc_sst': 1.5,        # Excitation to SST
+        'mc_gc': 1.4,         # Associational
+        'mc_mc': 0.15, #4.825,  # MC recurrent
+        'mc_pv': 0.5,         # Excitation to PV
+        'mc_sst': 2.0,        # Excitation to SST
         
         # Inhibitory connections  
-        'pv_gc': 3.662,       # Strong perisomatic inhibition
-        'pv_mc': 4.127,       # Strong inhibition of MC
-        'pv_pv': 1.875,       # Moderate PV lateral inhibition
-        'sst_gc': 1.22,       # Moderate dendritic inhibition
-        'sst_mc': 1.065,      # Moderate inhibition of MC
-        'sst_pv': 1.51,       # Moderate disinhibition
-        'sst_sst': 4.369      # SST lateral inhibition
+        'pv_gc': 3.5, #3.662,       # Perisomatic inhibition
+        'pv_mc': 0.1,             # Inhibition of MC
+        'pv_pv': 0.15, #1.875,       # PV lateral inhibition
+        'sst_gc': 4.0, #1.22       # GC dendritic inhibition
+        'sst_mc': 6.0,            # Inhibition of MC
+        'sst_pv': 0.5, #1.51,       # IN disinhibition
+        'sst_sst': 1.0 #4.369       # SST lateral inhibition
     })
     
     # Reversal potentials (mV)
@@ -326,7 +327,7 @@ class CircuitParams:
 class OpsinParams:
     """Opsin expression and light activation parameters"""
     expression_mean: float = 0.8
-    expression_std: float = 0.2
+    expression_std: float = 0.05
     failure_rate: float = 0.5
     light_decay: float = 0.3          # mm^-1
     hill_coeff: float = 2.5
@@ -762,7 +763,7 @@ class DentateCircuit(nn.Module):
                     total_gaba += conductances['gaba']
                     total_nmda += conductances['nmda']
 
-            # Add direct activation as additional AMPA-like conductance
+           # Add direct activation as additional AMPA-like conductance
             direct_current = direct_activation.get(pop, torch.zeros_like(current_activity))
             direct_conductance = torch.clamp(direct_current / 70.0, min=0.0)
             total_ampa += direct_conductance

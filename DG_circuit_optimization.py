@@ -42,7 +42,14 @@ from DG_circuit_dendritic_somatic_transfer import (
 )
 
 from DG_batch_circuit_dendritic_somatic_transfer import (
-    BatchDentateCircuit, BatchCircuitEvaluator
+    BatchDentateCircuit, update_batch_circuit_with_adaptive_dt
+)
+
+from gradient_adaptive_stepper import (
+    GradientAdaptiveStepConfig,
+    GradientAdaptiveStepper,
+    AdaptiveSimulationState,
+    update_circuit_with_adaptive_dt
 )
 
 def configure_torch_threads(n_threads):
@@ -169,6 +176,20 @@ class OptimizationConfig:
     # Simulation device (cpu or cuda)
     device: Optional[torch.device] = None
 
+    # Adaptive stepping configuration
+    adaptive_step: bool = False  # Default OFF
+    adaptive_config: Optional[GradientAdaptiveStepConfig] = None
+
+    def __post_init__(self):
+        """Create default adaptive config if adaptive_step enabled but no config provided"""
+        if self.adaptive_step and self.adaptive_config is None:
+            self.adaptive_config = GradientAdaptiveStepConfig(
+                dt_min=0.05,
+                dt_max=0.3,
+                gradient_low=0.5,
+                gradient_high=10.0
+            )
+    
 class OptimizableConnectionParameters(nn.Module):
     """
     Learnable connection modulation parameters
@@ -358,6 +379,379 @@ def auto_adjust_targets_for_constraints(targets: OptimizationTargets) -> Optimiz
 
 
 # ============================================================================
+# Batch Circuit Evaluator (moved from batch module to eliminate circular deps)
+# ============================================================================
+
+class BatchCircuitEvaluator:
+    """
+    Evaluates multiple parameter configurations in parallel using batched simulation
+    
+    Provides high-level interface for optimization algorithms to evaluate
+    batches of connection modulation parameters efficiently.
+    
+    Note: This class was moved from DG_batch_circuit_dendritic_somatic_transfer
+    to DG_circuit_optimization to eliminate circular dependencies, as it uses
+    optimization-specific structures (OptimizationTargets, OptimizationConfig).
+    """
+    
+    def __init__(self,
+                 circuit_params,
+                 base_synaptic_params,
+                 opsin_params,
+                 targets,
+                 config,
+                 device: Optional[torch.device] = None,
+                 adaptive_step: bool = False,
+                 adaptive_config: Optional[GradientAdaptiveStepConfig] = None):
+        """
+        Initialize batched circuit evaluator
+        
+        Args:
+            circuit_params: CircuitParams instance
+            base_synaptic_params: PerConnectionSynapticParams instance
+            opsin_params: OpsinParams instance
+            targets: OptimizationTargets instance
+            config: OptimizationConfig instance
+            device: Device to run simulations on
+            adaptive_step: If True, use adaptive time stepping
+            adaptive_config: Configuration for adaptive stepping (optional)
+        """
+        self.circuit_params = circuit_params
+        self.base_synaptic_params = base_synaptic_params
+        self.opsin_params = opsin_params
+        self.targets = targets
+        self.config = config
+        self.device = device if device is not None else get_default_device()
+        self.adaptive_step = adaptive_step
+        
+        # Create default adaptive config if needed
+        if self.adaptive_step and adaptive_config is None:
+            self.adaptive_config = GradientAdaptiveStepConfig(
+                dt_min=0.05,
+                dt_max=0.3,
+                gradient_low=0.5,
+                gradient_high=10.0
+            )
+        else:
+            self.adaptive_config = adaptive_config
+        
+        stepping_mode = "adaptive" if self.adaptive_step else "fixed-dt"
+        print(f"BatchCircuitEvaluator initialized on device: {self.device} ({stepping_mode})")
+    
+    def evaluate_parameter_batch(self,
+                                 parameter_batch: List[Dict[str, float]],
+                                 mec_drive: float,
+                                 mec_drive_std: float = 1.0) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Evaluate a batch of parameter configurations in parallel
+        
+        Dispatches to fixed-dt or adaptive-dt implementation.
+        
+        Args:
+            parameter_batch: List of connection_modulation dicts, length = batch_size
+            mec_drive: MEC drive level (pA)
+            mec_drive_std: MEC drive standard deviation (pA)
+            
+        Returns:
+            losses: Tensor of shape [batch_size]
+            firing_rates_batch: Dict mapping pop_name -> rates [batch_size]
+        """
+        if self.adaptive_step:
+            return self._evaluate_parameter_batch_adaptive(parameter_batch, mec_drive, mec_drive_std)
+        else:
+            return self._evaluate_parameter_batch_fixed(parameter_batch, mec_drive, mec_drive_std)
+    
+    def _evaluate_parameter_batch_fixed(self,
+                                       parameter_batch: List[Dict[str, float]],
+                                       mec_drive: float,
+                                       mec_drive_std: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Evaluate batch with fixed time step (original implementation)
+        """
+        batch_size = len(parameter_batch)
+        
+        # Create batched circuit
+        circuit = BatchDentateCircuit(
+            batch_size=batch_size,
+            circuit_params=self.circuit_params,
+            synaptic_params=self.base_synaptic_params,
+            opsin_params=self.opsin_params,
+            device=self.device
+        )
+        
+        # Set per-batch connection modulation
+        circuit.set_connection_modulation_batch(parameter_batch)
+        
+        # Run simulation
+        circuit.reset_state()
+        
+        # MEC input: [batch_size, n_mec]
+        mec_input = mec_drive + torch.randn(
+            batch_size, self.circuit_params.n_mec, 
+            device=self.device
+        ) * mec_drive_std
+        
+        # Collect activities over time
+        activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+        
+        for t in range(self.config.simulation_duration):
+            external_drive = {'mec': mec_input}
+            activities = circuit({}, external_drive)
+            
+            if t >= self.config.warmup_duration:
+                for pop in activities_over_time:
+                    if pop in activities:
+                        activities_over_time[pop].append(activities[pop])
+        
+        # Calculate losses
+        losses, firing_rates_batch = self._calculate_losses(activities_over_time, batch_size)
+        
+        return losses, firing_rates_batch
+
+    def _evaluate_parameter_batch_adaptive(self,
+                                      parameter_batch: List[Dict[str, float]],
+                                      mec_drive: float,
+                                      mec_drive_std: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Evaluate batch with synchronized adaptive time stepping
+
+        All batch elements use the same dt at each step (synchronized).
+        """
+        batch_size = len(parameter_batch)
+
+        # Create batched circuit
+        circuit = BatchDentateCircuit(
+            batch_size=batch_size,
+            circuit_params=self.circuit_params,
+            synaptic_params=self.base_synaptic_params,
+            opsin_params=self.opsin_params,
+            device=self.device,
+            compile_circuit = False
+        )
+
+        circuit.set_connection_modulation_batch(parameter_batch)
+        circuit.reset_state()
+
+        # MEC input: [batch_size, n_mec]
+        mec_input = mec_drive + torch.randn(
+            batch_size, self.circuit_params.n_mec,
+            device=self.device
+        ) * mec_drive_std
+
+        # Initialize adaptive stepper and state
+        stepper = GradientAdaptiveStepper(self.adaptive_config)
+        state = AdaptiveSimulationState(self.device)
+
+        # Storage on fixed grid
+        storage_dt = self.circuit_params.dt
+        duration = self.config.warmup_duration + self.config.simulation_duration
+        n_steps = int(duration / storage_dt)
+        time_grid = torch.arange(n_steps, device=self.device) * storage_dt
+        warmup_steps = int(self.config.warmup_duration / storage_dt)
+
+        # Initialize storage: [batch, neurons, time]
+        activity_storage = {
+            'gc': torch.zeros(batch_size, self.circuit_params.n_gc, n_steps, device=self.device),
+            'mc': torch.zeros(batch_size, self.circuit_params.n_mc, n_steps, device=self.device),
+            'pv': torch.zeros(batch_size, self.circuit_params.n_pv, n_steps, device=self.device),
+            'sst': torch.zeros(batch_size, self.circuit_params.n_sst, n_steps, device=self.device),
+        }
+
+        # Create constant tensors once (avoids repeated tensor creation warning)
+        zero_tensor = torch.tensor(0.0, device=self.device)
+
+        # Adaptive simulation loop
+        activity_current = None
+
+        while state.current_time < duration:
+            # Compute synchronized dt across batch
+            if state.step_index > 0:
+                # Compute gradient from batch activities
+                grad_magnitude = self._compute_batch_gradient(
+                    activity_current, state.activity_prev, state.dt_history[-1]
+                )
+
+                # Update smoothed gradient (EMA)
+                stepper.grad_smooth = (
+                    self.adaptive_config.gradient_alpha * grad_magnitude +
+                    (1 - self.adaptive_config.gradient_alpha) * stepper.grad_smooth
+                )
+
+                # Map gradient to dt using stepper's logic
+                dt_adaptive = stepper._gradient_to_dt(stepper.grad_smooth)
+
+                # Apply rate limiting
+                max_increase = stepper.dt_current * self.adaptive_config.max_dt_change_factor
+                max_decrease = stepper.dt_current / self.adaptive_config.max_dt_change_factor
+                dt_adaptive = np.clip(dt_adaptive, max_decrease, max_increase)
+
+                # Apply absolute bounds
+                dt_adaptive = np.clip(dt_adaptive, self.adaptive_config.dt_min, self.adaptive_config.dt_max)
+
+                # Update stepper's current dt
+                stepper.dt_current = dt_adaptive
+            else:
+                dt_adaptive = self.adaptive_config.dt_max
+
+            # Don't overshoot
+            if state.current_time + dt_adaptive > duration:
+                dt_adaptive = duration - state.current_time
+
+            # Update circuit with adaptive dt
+            # Forward pass
+            external_drive = {'mec': mec_input}
+            activity_current = update_batch_circuit_with_adaptive_dt(
+                circuit, {}, external_drive, dt_adaptive
+            )
+
+            # Interpolate to fixed grid
+            if state.step_index == 0:
+                for pop in activity_storage:
+                    if pop in activity_current:
+                        activity_storage[pop][:, :, 0] = activity_current[pop]
+            else:
+                self._interpolate_batch_to_grid(
+                    activity_current, state.activity_prev,
+                    state.current_time, state.current_time + dt_adaptive,
+                    time_grid, activity_storage
+                )
+
+            # Update state
+            state.update(activity_current, dt_adaptive, stepper.grad_smooth)
+
+        # Extract post-warmup activities
+        activities_over_time = {
+            pop: [activity_storage[pop][:, :, t] for t in range(warmup_steps, n_steps)]
+            for pop in activity_storage
+        }
+
+        # Calculate losses
+        losses, firing_rates_batch = self._calculate_losses(activities_over_time, batch_size)
+
+        # Store adaptive stats
+        self._last_adaptive_stats = state.get_statistics()
+
+        return losses, firing_rates_batch
+    
+    def _compute_batch_gradient(self, activities_current, activities_prev, dt):
+        """Compute average gradient magnitude across batch for synchronized stepping"""
+        gradients = []
+        
+        for pop_name in activities_current.keys():
+            if pop_name not in activities_prev:
+                continue
+            
+            # Mean across neurons and batch
+            delta = torch.mean(activities_current[pop_name] - activities_prev[pop_name])
+            grad = abs(delta.item()) / dt
+            gradients.append(grad)
+        
+        return np.mean(gradients) if gradients else 0.0
+    
+    def _interpolate_batch_to_grid(self, activity_current, activity_prev,
+                                   time_prev, time_current, time_grid, storage):
+        """Linear interpolation for batch data to fixed time grid"""
+        mask = (time_grid > time_prev) & (time_grid <= time_current)
+        grid_indices = torch.where(mask)[0]
+        
+        if len(grid_indices) == 0:
+            return
+        
+        dt_step = time_current - time_prev
+        
+        for grid_idx in grid_indices:
+            grid_time = time_grid[grid_idx].item()
+            
+            if dt_step > 1e-9:
+                alpha = (grid_time - time_prev) / dt_step
+            else:
+                alpha = 1.0
+            
+            # Interpolate for batch: [batch, neurons]
+            for pop_name in activity_current.keys():
+                if pop_name in storage and pop_name in activity_prev:
+                    interpolated = (1 - alpha) * activity_prev[pop_name] + alpha * activity_current[pop_name]
+                    storage[pop_name][:, :, grid_idx] = interpolated
+
+    def _calculate_losses(self, activities_over_time, batch_size):
+        """
+        Calculate losses from activity time series
+
+        Args:
+            activities_over_time: Dict mapping pop -> list of tensors [batch, neurons]
+            batch_size: Batch size
+
+        Returns:
+            losses: Tensor [batch_size]
+            firing_rates_batch: Dict mapping pop -> rates [batch_size]
+        """
+        losses = torch.zeros(batch_size, device=self.device)
+        firing_rates_batch = {pop: torch.zeros(batch_size, device=self.device) 
+                             for pop in ['gc', 'mc', 'pv', 'sst']}
+
+        # Create constant tensors once (avoid repeated creation)
+        zero_tensor = torch.tensor(0.0, device=self.device)
+        penalty_tensor = torch.tensor(1e2, device=self.device)
+
+        for pop in activities_over_time:
+            if len(activities_over_time[pop]) > 0:
+                # Stack: [time, batch, neurons] -> mean over time: [batch, neurons]
+                pop_time_series = torch.stack(activities_over_time[pop], dim=0)
+                mean_rates = torch.mean(pop_time_series, dim=0)  # [batch, neurons]
+
+                # Population average firing rate per batch element: [batch]
+                pop_firing_rates = torch.mean(mean_rates, dim=1)
+                firing_rates_batch[pop] = pop_firing_rates
+
+                # Calculate loss components
+                if pop in self.targets.target_rates:
+                    target_rate = self.targets.target_rates[pop]
+                    tolerance = self.targets.rate_tolerance[pop]
+
+                    errors = torch.abs(pop_firing_rates - target_rate)
+
+                    # Huber loss with tolerance
+                    rate_losses = torch.where(
+                        errors <= tolerance,
+                        0.5 * errors ** 2,
+                        tolerance * errors - 0.5 * tolerance ** 2
+                    )
+
+                    # Zero rate penalty (use pre-created tensors)
+                    zero_mask = torch.isclose(
+                        pop_firing_rates,
+                        zero_tensor,
+                        atol=1e-2, rtol=1e-2
+                    )
+                    rate_losses = torch.where(zero_mask, penalty_tensor, rate_losses)
+
+                    losses += rate_losses
+
+                # Sparsity loss
+                if pop in self.targets.sparsity_targets:
+                    target_sparsity = self.targets.sparsity_targets[pop]
+                    actual_sparsity = torch.sum(
+                        mean_rates > self.targets.activity_threshold, 
+                        dim=1
+                    ).float() / mean_rates.shape[1]
+
+                    sparsity_errors = (actual_sparsity - target_sparsity) ** 2
+                    losses += sparsity_errors * self.targets.loss_weights['sparsity']
+
+        # Add constraint violations
+        for b in range(batch_size):
+            firing_rates_dict = {pop: firing_rates_batch[pop][b].item() 
+                                for pop in firing_rates_batch}
+            constraint_violation, _ = evaluate_rate_ordering_constraints(
+                firing_rates_dict,
+                self.targets.rate_ordering_constraints
+            )
+            losses[b] += self.targets.constraint_violation_weight * constraint_violation
+
+        return losses, firing_rates_batch
+
+                    
+# ============================================================================
 # Evaluation Strategy Pattern
 # ============================================================================
 
@@ -428,8 +822,16 @@ class SequentialStrategy(EvaluationStrategy):
             firing_rates_list.append(firing_rates)
         
         return losses, firing_rates_list
-    
+
     def _evaluate_single(self, connection_modulation, mec_current, mec_current_std, n_trials):
+        """Evaluate single parameter configuration (dispatches to fixed or adaptive)"""
+        if self.config.adaptive_step:
+            return self._evaluate_single_adaptive(connection_modulation, mec_current, mec_current_std, n_trials)
+        else:
+            return self._evaluate_single_fixed(connection_modulation, mec_current, mec_current_std, n_trials)
+
+    
+    def _evaluate_single_fixed(self, connection_modulation, mec_current, mec_current_std, n_trials):
         """Evaluate single parameter configuration"""
         # Create synaptic params with modulation
         synaptic_params = PerConnectionSynapticParams(
@@ -470,7 +872,172 @@ class SequentialStrategy(EvaluationStrategy):
             total_loss += trial_loss
         
         return total_loss / n_trials, firing_rates
-    
+
+    def _evaluate_single_adaptive(self, connection_modulation, mec_current, mec_current_std, n_trials):
+        """Evaluate single parameter configuration with adaptive time stepping"""
+        # Create synaptic params with modulation
+        synaptic_params = PerConnectionSynapticParams(
+            ampa_g_mean=self.base_synaptic_params.ampa_g_mean,
+            ampa_g_std=self.base_synaptic_params.ampa_g_std,
+            gaba_g_mean=self.base_synaptic_params.gaba_g_mean,
+            gaba_g_std=self.base_synaptic_params.gaba_g_std,
+            distribution=self.base_synaptic_params.distribution,
+            connection_modulation=connection_modulation
+        )
+        
+        # Create circuit
+        circuit = DentateCircuit(
+            self.circuit_params, synaptic_params, self.opsin_params,
+            device=self.device
+        )
+        
+        total_loss = 0.0
+        all_adaptive_stats = []
+
+        for trial in range(n_trials):
+            circuit.reset_state()
+            
+            mec_input = mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std
+            
+            # Run adaptive simulation
+            result = self._run_adaptive_simulation(
+                circuit, mec_input, 
+                self.config.simulation_duration,
+                self.config.warmup_duration
+            )
+            
+            activities_over_time = result['activities_over_time']
+            all_adaptive_stats.append(result['adaptive_stats'])
+            
+            # Calculate loss
+            trial_loss, firing_rates = self._calculate_loss(activities_over_time)
+            total_loss += trial_loss
+        
+        # Store adaptive stats (averaged across trials) for diagnostics
+        # This is optional - could be accessed if needed
+        self._last_adaptive_stats = self._aggregate_adaptive_stats(all_adaptive_stats)
+        
+        return total_loss / n_trials, firing_rates
+
+    def _run_adaptive_simulation(self, circuit, mec_input, duration, warmup):
+        """
+        Run circuit simulation with adaptive time stepping
+        
+        Returns activities on a fixed grid (for compatibility with loss calculation)
+        """
+        # Initialize adaptive stepper
+        stepper = GradientAdaptiveStepper(self.config.adaptive_config)
+        state = AdaptiveSimulationState(self.device)
+        
+        # Storage on fixed grid (for loss calculation compatibility)
+        storage_dt = self.circuit_params.dt
+        total_duration = warmup + duration
+        n_steps = int(total_duration / storage_dt)
+        time_grid = torch.arange(n_steps, device=self.device) * storage_dt
+        
+        activity_storage = {
+            'gc': torch.zeros(self.circuit_params.n_gc, n_steps, device=self.device),
+            'mc': torch.zeros(self.circuit_params.n_mc, n_steps, device=self.device),
+            'pv': torch.zeros(self.circuit_params.n_pv, n_steps, device=self.device),
+            'sst': torch.zeros(self.circuit_params.n_sst, n_steps, device=self.device),
+        }
+        
+        warmup_steps = int(warmup / storage_dt)
+
+        # Adaptive simulation loop
+        while state.current_time < total_duration:
+            # Compute dt for this step
+            if state.step_index > 0:
+                dt_adaptive = stepper.compute_dt(
+                    activity_current,
+                    state.activity_prev,
+                    state.dt_history[-1]
+                )
+            else:
+                dt_adaptive = self.config.adaptive_config.dt_max
+            
+            # Ensure we don't overshoot
+            if state.current_time + dt_adaptive > total_duration:
+                dt_adaptive = total_duration - state.current_time
+            
+            # Setup inputs
+            external_drive = {'mec': mec_input}
+            
+            # Update circuit with adaptive dt
+            activity_current = update_circuit_with_adaptive_dt(
+                circuit, {}, external_drive, dt_adaptive
+            )
+
+            # Interpolate to fixed grid
+            if state.step_index == 0:
+                # First step: store at t=0
+                for pop in activity_storage:
+                    activity_storage[pop][:, 0] = activity_current[pop]
+            else:
+                self._interpolate_to_grid(
+                    activity_current,
+                    state.activity_prev,
+                    state.current_time,
+                    state.current_time + dt_adaptive,
+                    time_grid,
+                    activity_storage
+                )
+            
+            # Update state
+            state.update(activity_current, dt_adaptive, stepper.grad_smooth)
+            
+        # Extract activities after warmup (for loss calculation)
+        activities_over_time = {
+            pop: [activity_storage[pop][:, t] for t in range(warmup_steps, n_steps)]
+            for pop in activity_storage
+        }
+
+        return {
+            'activities_over_time': activities_over_time,
+            'adaptive_stats': state.get_statistics()
+        }
+
+    def _interpolate_to_grid(self, activity_current, activity_prev, 
+                            time_prev, time_current, time_grid, storage):
+        """Linear interpolation of activities to fixed time grid"""
+        # Find grid indices in this interval
+        mask = (time_grid > time_prev) & (time_grid <= time_current)
+        grid_indices = torch.where(mask)[0]
+        
+        if len(grid_indices) == 0:
+            return
+        
+        dt_step = time_current - time_prev
+        
+        for grid_idx in grid_indices:
+            grid_time = time_grid[grid_idx].item()
+            
+            # Linear interpolation weight
+            if dt_step > 1e-9:
+                alpha = (grid_time - time_prev) / dt_step
+            else:
+                alpha = 1.0
+            
+            # Interpolate each population
+            for pop_name in activity_current.keys():
+                if pop_name in storage and pop_name in activity_prev:
+                    interpolated = (1 - alpha) * activity_prev[pop_name] + alpha * activity_current[pop_name]
+                    storage[pop_name][:, grid_idx] = interpolated
+
+    def _aggregate_adaptive_stats(self, stats_list):
+        """Aggregate adaptive statistics across trials"""
+        if not stats_list:
+            return None
+        
+        return {
+            'n_steps_mean': np.mean([s['n_steps'] for s in stats_list]),
+            'n_steps_std': np.std([s['n_steps'] for s in stats_list]),
+            'avg_dt_mean': np.mean([s['avg_dt'] for s in stats_list]),
+            'avg_dt_std': np.std([s['avg_dt'] for s in stats_list]),
+            'min_dt': np.min([s['min_dt'] for s in stats_list]),
+            'max_dt': np.max([s['max_dt'] for s in stats_list]),
+        }
+                    
     def _calculate_loss(self, activities_over_time):
         """Calculate loss from activity time series"""
         total_loss = 0.0
@@ -509,11 +1076,14 @@ class SequentialStrategy(EvaluationStrategy):
         return total_loss, firing_rates
     
     def get_strategy_info(self):
+        step_mode = "adaptive-dt" if self.config.adaptive_step else "fixed-dt"
         return {
             'name': 'Sequential',
             'device': str(self.device),
             'parallelism': 'None',
+            'step_strategy': step_mode,
             'description': 'Sequential evaluation, best for gradient-based optimization'
+
         }
 
 
@@ -539,8 +1109,11 @@ class BatchGPUStrategy(EvaluationStrategy):
         # Create evaluator
         self.evaluator = BatchCircuitEvaluator(
             circuit_params, base_synaptic_params, opsin_params,
-            targets, config, device=device
-        )
+            targets, config, device=device,
+            adaptive_step=config.adaptive_step if hasattr(config, 'adaptive_step') else False,
+            adaptive_config=config.adaptive_config if hasattr(config, 'adaptive_config') else None)
+    
+
     
     def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate all configurations in parallel on GPU"""
@@ -568,14 +1141,21 @@ class BatchGPUStrategy(EvaluationStrategy):
                 for pop in firing_rates_batch
             }
             firing_rates_list.append(firing_rates)
-        
+
+        # Store adaptive stats if available
+        if hasattr(self.evaluator, '_last_adaptive_stats'):
+            self._last_adaptive_stats = self.evaluator._last_adaptive_stats
+            
         return losses_list, firing_rates_list
     
     def get_strategy_info(self):
+        step_mode = "adaptive-dt" if self.config.adaptive_step else "fixed-dt"
+
         return {
             'name': 'BatchGPU',
             'device': str(self.device),
             'parallelism': 'Data parallelism (batched)',
+            'step_strategy': step_mode,
             'description': f'Batch evaluation on GPU, optimal for population-based methods'
         }
 
@@ -634,7 +1214,7 @@ class MultiprocessCPUStrategy(EvaluationStrategy):
         # Use multiprocessing pool
         ctx = mp.get_context('spawn')
         with ctx.Pool(processes=self.n_workers) as pool:
-            results = pool.map(_worker_evaluate_single, eval_args)
+            results = pool.map(_worker_evaluate_single_adaptive, eval_args)
         
         # Unpack results
         losses = [r[0] for r in results]
@@ -650,7 +1230,54 @@ class MultiprocessCPUStrategy(EvaluationStrategy):
             'description': f'Multiprocess evaluation on CPU with {self.n_workers} workers'
         }
 
+def _worker_evaluate_single_adaptive(args):
+    """Worker function for multiprocess evaluation with adaptive stepping"""
+    (connection_modulation, mec_current, mec_current_std, n_trials, circuit_factory_data,
+     targets, config) = args
+    
+    from DG_circuit_dendritic_somatic_transfer import DentateCircuit, PerConnectionSynapticParams
+    #from DG_batch_circuit_dendritic_somatic_transfer import BatchCircuitEvaluator
+    
+    device = torch.device('cpu')
+    circuit_params, base_synaptic_params_dict, opsin_params = circuit_factory_data
+    
+    # Create synaptic params
+    synaptic_params = PerConnectionSynapticParams(
+        ampa_g_mean=base_synaptic_params_dict['ampa_g_mean'],
+        ampa_g_std=base_synaptic_params_dict['ampa_g_std'],
+        gaba_g_mean=base_synaptic_params_dict['gaba_g_mean'],
+        gaba_g_std=base_synaptic_params_dict['gaba_g_std'],
+        distribution=base_synaptic_params_dict['distribution'],
+        connection_modulation=connection_modulation
+    )
+    
+    # Create evaluator with adaptive stepping (batch_size=1 for single parameter set)
+    evaluator = BatchCircuitEvaluator(
+        circuit_params, synaptic_params, opsin_params,
+        targets, config, device=device,
+        adaptive_step=config.adaptive_step if hasattr(config, 'adaptive_step') else False,
+        adaptive_config=config.adaptive_config if hasattr(config, 'adaptive_config') else None
+    )
+    
+    total_loss = 0.0
+    firing_rates = {}
+    
+    for trial in range(n_trials):
+        # Evaluate single parameter configuration
+        losses, firing_rates_batch = evaluator.evaluate_parameter_batch(
+            [connection_modulation], mec_current, mec_current_std
+        )
+        
+        # Extract results (batch_size=1)
+        trial_loss = losses[0].item()
+        trial_firing_rates = {pop: rates[0].item() for pop, rates in firing_rates_batch.items()}
+        
+        total_loss += trial_loss
+        firing_rates = trial_firing_rates  # Keep last trial's rates
+    
+    return total_loss / n_trials, firing_rates
 
+    
 def _worker_evaluate_single(args):
     """Worker function for multiprocess evaluation (module-level for pickling)"""
     (connection_modulation, mec_current, mec_current_std, n_trials, circuit_factory_data,
@@ -786,7 +1413,7 @@ class CircuitOptimizer:
         self.history = {'loss': [], 'parameters': []}
         
         print(f"CircuitOptimizer initialized on device: {self.device}")
-    
+
     def _select_strategy(self, method: str, **kwargs) -> EvaluationStrategy:
         """
         Automatically select optimal evaluation strategy based on method and device
@@ -797,6 +1424,11 @@ class CircuitOptimizer:
         3. Population-based + CPU -> MultiprocessCPU (process parallelism)
         4. Differential Evolution -> MultiprocessCPU (scipy limitation)
         """
+
+        # Extract adaptive stepping configuration
+        adaptive_step = kwargs.get('adaptive_step', self.config.adaptive_step if hasattr(self.config, 'adaptive_step') else False)
+        adaptive_config = kwargs.get('adaptive_config', self.config.adaptive_config if hasattr(self.config, 'adaptive_config') else None)
+        
         if method == 'gradient':
             strategy = SequentialStrategy(
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
@@ -1270,9 +1902,10 @@ def create_default_targets() -> OptimizationTargets:
     )
 
 
-def create_default_config(device: Optional[torch.device] = None) -> OptimizationConfig:
+def create_default_config(device: Optional[torch.device] = None,
+                         adaptive_step: bool = False) -> OptimizationConfig:
     """Create default optimization configuration"""
-    return OptimizationConfig(
+    config = OptimizationConfig(
         learning_rate=0.1,
         max_iterations=300,
         mec_drive_levels=[40.0],
@@ -1280,21 +1913,26 @@ def create_default_config(device: Optional[torch.device] = None) -> Optimization
         n_trials=2,
         simulation_duration=600,
         warmup_duration=100,
-        device=device
+        device=device,
+        adaptive_step=adaptive_step
     )
+    return config
 
-def create_default_global_opt_config(device: Optional[torch.device] = None) -> OptimizationConfig:
+def create_default_global_opt_config(device: Optional[torch.device] = None,
+                                     adaptive_step: bool = False) -> OptimizationConfig:
     """Create default optimization configuration for global optimization"""
-    return OptimizationConfig(
+    config = OptimizationConfig(
         learning_rate=0.1,
         max_iterations=20,
         mec_drive_levels=[28.0],
         mec_drive_std=1.0,
-        n_trials=3,  # Reduce for faster iteration
+        n_trials=3,
         simulation_duration=1000,
         warmup_duration=200,
-        device=device
+        device=device,
+        adaptive_step=adaptive_step
     )
+    return config
 
 def run_optimization(method='particle_swarm', device=None, **kwargs):
     """

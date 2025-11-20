@@ -583,24 +583,30 @@ class DGCircuitVisualization:
 
     def plot_activity_raster(self, activity_trace, vmin=0, vmax=None, 
                              mean_linewidth=2.5, cmap='coolwarm', save_path=None,
-                             split_populations=None):
+                             split_populations=None, direct_activation=None,
+                             activation_cmap='plasma', activation_width=0.015):
         """
         Plot circuit activity as raster plots with neurons sorted by mean firing rate
 
         Each neuron's activity is shown as a row in a heatmap, with color indicating
         firing rate. Neurons are ordered by mean firing rate (highest at top).
         Population mean firing rate is superimposed as a line trace.
+        Optionally shows direct current injection as a color-coded vertical bar.
 
         Args:
             activity_trace: Dictionary with population keys, each containing array of shape (n_cells, timesteps)
             vmin: Minimum value for colormap (default: 0 Hz)
             vmax: Maximum value for colormap (default: auto-computed per population)
             mean_linewidth: Line width for population mean trace overlay
-            cmap: Colormap name (default: 'coolwarm')
+            cmap: Colormap name for activity (default: 'coolwarm')
             save_path: Path to save figure
             split_populations: Dict mapping population name to dict with 'unit_ids_part1' and 'unit_ids_part2'.
                                Example: {'pv': {'unit_ids_part1': [0,1,2], 'unit_ids_part2': [3,4,5]}}
                                If provided, creates separate panels for each part.
+            direct_activation: Dict mapping population names to arrays of current injection values (n_cells,).
+                               Only populations with direct activation need to be included.
+            activation_cmap: Colormap name for direct activation visualization (default: 'plasma')
+            activation_width: Width of activation bar as fraction of figure width (default: 0.08)
         """
         # Determine number of timesteps
         timesteps = None
@@ -617,7 +623,7 @@ class DGCircuitVisualization:
             for pop in split_populations:
                 if pop in activity_trace:
                     n_populations += 1  # Add one more panel for the split
-        
+
         fig, axes = plt.subplots(2, 3, figsize=self.config.figsize_large, dpi=self.config.dpi)
         axes = axes.flatten()
 
@@ -626,10 +632,8 @@ class DGCircuitVisualization:
 
         panel_idx = 0
         for idx, (pop, activity) in enumerate(activity_trace.items()):
-            if idx >= len(axes):
+            if panel_idx >= len(axes):
                 break
-
-            ax = axes[idx]
 
             # Get activity data (convert from torch tensor if needed)
             if hasattr(activity, 'cpu'):
@@ -638,6 +642,15 @@ class DGCircuitVisualization:
                 activity_data = np.array(activity)
 
             n_cells = activity_data.shape[0]
+
+            # Get direct activation data for this population if available
+            activation_data = None
+            if direct_activation is not None and pop in direct_activation:
+                activation_data = direct_activation[pop]
+                if hasattr(activation_data, 'cpu'):
+                    activation_data = activation_data.cpu().numpy()
+                else:
+                    activation_data = np.array(activation_data)
 
             # Check if this population should be split
             should_split = split_populations and pop in split_populations
@@ -653,18 +666,27 @@ class DGCircuitVisualization:
                 if len(unit_ids_part1) > 0:
                     ax = axes[panel_idx]
                     activity_part1 = activity_data[unit_ids_part1, :]
+                    activation_part1 = activation_data[unit_ids_part1] if activation_data is not None else None
+
                     self._plot_single_raster(ax, activity_part1, time_axis, pop, 
                                             vmin, vmax, cmap, mean_linewidth,
-                                            title_suffix=f' - {part1_label}')
+                                            title_suffix=f' - {part1_label}',
+                                            direct_activation=activation_part1,
+                                            activation_cmap=activation_cmap,
+                                            activation_width=activation_width)
                     panel_idx += 1
 
                 # Plot Part 2
                 if len(unit_ids_part2) > 0:
                     ax = axes[panel_idx]
                     activity_part2 = activity_data[unit_ids_part2, :]
+                    activation_part2 = activation_data[unit_ids_part2] if activation_data is not None else None
                     self._plot_single_raster(ax, activity_part2, time_axis, pop, 
-                                            vmin, vmax, cmap, mean_linewidth,
-                                            title_suffix=f' - {part2_label}')
+                                             vmin, vmax, cmap, mean_linewidth,
+                                             title_suffix=f' - {part2_label}',
+                                             direct_activation=activation_part2,
+                                             activation_cmap=activation_cmap,
+                                             activation_width=activation_width)
                     panel_idx += 1
 
                 # Store combined mean activity
@@ -673,14 +695,15 @@ class DGCircuitVisualization:
                 # Plot normally (no split)
                 ax = axes[panel_idx]
                 self._plot_single_raster(ax, activity_data, time_axis, pop, 
-                                        vmin, vmax, cmap, mean_linewidth)
+                                         vmin, vmax, cmap, mean_linewidth,
+                                         direct_activation=activation_data,
+                                         activation_cmap=activation_cmap,
+                                         activation_width=activation_width)
                 activity_history[pop] = np.mean(activity_data, axis=0).tolist()
                 panel_idx += 1
 
-
-
         # Remove unused subplots
-        for idx in range(len(activity_trace), len(axes)):
+        for idx in range(panel_idx, len(axes)):
             fig.delaxes(axes[idx])
 
         plt.suptitle('DG Circuit Activity Rasters: Neurons Sorted by Mean Firing Rate', 
@@ -694,7 +717,9 @@ class DGCircuitVisualization:
 
 
     def _plot_single_raster(self, ax, activity_data, time_axis, pop, 
-                            vmin, vmax, cmap, mean_linewidth, title_suffix=''):
+                            vmin, vmax, cmap, mean_linewidth, title_suffix='',
+                            direct_activation=None, activation_cmap='plasma',
+                            activation_width=0.015, sort_by_activity=False):
         """
         Helper method to plot a single raster panel
 
@@ -703,24 +728,89 @@ class DGCircuitVisualization:
             activity_data: Activity array (n_cells, timesteps)
             time_axis: Time vector
             pop: Population name
-            vmin, vmax: Colormap limits
-            cmap: Colormap name
+            vmin, vmax: Colormap limits for activity
+            cmap: Colormap name for activity
             mean_linewidth: Line width for mean trace
             title_suffix: Optional suffix for title (e.g., ' - Stimulated')
+            direct_activation: Optional array of current injection values (n_cells,)
+            activation_cmap: Colormap name for activation visualization
+            activation_width: Width of activation bar as fraction of axis width
         """
         n_cells = activity_data.shape[0]
 
         # Calculate mean activity per neuron across time
         mean_activity_per_neuron = np.mean(activity_data, axis=1)
+        if pop == 'pv':
+            print(f"mean_activity_per_neuron = {mean_activity_per_neuron}")
 
         # Sort neurons by mean firing rate (descending - highest at top)
         sorted_indices = np.argsort(mean_activity_per_neuron)[::-1]
-        sorted_activity = activity_data[sorted_indices, :]
+        if sort_by_activity:
+            sorted_activity = activity_data[sorted_indices, :]
+        else:
+            sorted_activity = activity_data
 
-        # Determine colormap range
+        # Sort direct activation data if provided
+        sorted_activation = None
+        if direct_activation is not None and np.sum(direct_activation) > 0.0:
+            if sort_by_activity:
+                sorted_activation = direct_activation[sorted_indices]
+            else:
+                sorted_activation = direct_activation
+            
+
+        # Determine colormap range for activity
         vmax_pop = vmax if vmax is not None else np.percentile(sorted_activity, 99)
 
-        # Plot raster as heatmap
+        # Create activation bar axis if needed
+        if sorted_activation is not None:
+            # Get current axis position
+            pos = ax.get_position()
+
+            # Create narrow axis for activation bar immediately to the left of main axis
+            spacing = 0.005  # Minimal spacing between activation bar and main plot
+            activation_ax = ax.figure.add_axes([pos.x0 - activation_width - spacing, 
+                                               pos.y0, 
+                                               activation_width, 
+                                               pos.height])
+
+            # Determine activation colormap range
+            activation_vmin = np.min(sorted_activation)
+            activation_vmax = np.max(sorted_activation)
+
+            # Plot activation as vertical bar (2D heatmap with single column)
+            activation_2d = sorted_activation.reshape(-1, 1)
+
+            im_activation = activation_ax.imshow(activation_2d,
+                                                 aspect='auto',
+                                                 cmap=activation_cmap,
+                                                 vmin=activation_vmin,
+                                                 vmax=activation_vmax,
+                                                 interpolation='nearest',
+                                                 extent=[0, 1, n_cells, 0])
+
+            # Configure activation axis
+            activation_ax.set_ylabel('')
+            activation_ax.set_xlabel('')
+            activation_ax.set_xticks([])
+            activation_ax.set_yticks([])
+            activation_ax.set_title('Activation\nCurrent', fontsize=8, pad=2)
+
+            # Add horizontal colorbar below the activation bar
+            cbar_height = 0.02  # Height of colorbar
+            cbar_bottom_offset = 0.03  # Space below activation axis
+
+            cbar_ax = ax.figure.add_axes([pos.x0 - activation_width - spacing,
+                                          pos.y0 - cbar_bottom_offset - cbar_height,
+                                          activation_width,
+                                          cbar_height])
+
+            cbar_activation = plt.colorbar(im_activation, cax=cbar_ax, 
+                                           orientation='horizontal')
+            cbar_activation.set_label('nA', fontsize=8, labelpad=2)
+            cbar_activation.ax.tick_params(labelsize=7)
+
+        # Plot raster as heatmap on main axis
         im = ax.imshow(sorted_activity, 
                        aspect='auto',
                        cmap=cmap,
@@ -730,6 +820,17 @@ class DGCircuitVisualization:
                        extent=[time_axis[0], time_axis[-1], n_cells, 0],
                        alpha=0.6,
                        zorder=1)
+
+        # Configure primary axis (raster)
+        ax.set_xlabel('Time (ms)')
+        if sorted_activation is None:
+            ax.set_ylabel('Neuron Index\n(sorted by activity)')
+
+        # Add activation indicator to title if present
+        title_prefix = f'{pop.upper()} Activity Raster'
+        if sorted_activation is not None:
+            title_prefix += ' [with input current]'
+        ax.set_title(f'{title_prefix}{title_suffix}\n({n_cells} cells)')
 
         # Add colorbar with proper spacing
         cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.08)
@@ -757,19 +858,14 @@ class DGCircuitVisualization:
                  label=f'Mean={np.mean(mean_activity):.1f} Hz',
                  zorder=2)
 
-        # Configure primary axis (raster)
-        ax.set_xlabel('Time (ms)')
-        ax.set_ylabel('Neuron Index\n(sorted by activity)')
-        ax.set_title(f'{pop.upper()} Activity Raster{title_suffix}\n({n_cells} cells)')
-
         # Configure secondary axis (mean trace) with padding
         ax2.set_ylabel('Normalized Mean Activity', rotation=270, labelpad=25)
         ax2.set_ylim([0, n_cells])
         ax2.legend(loc='upper right', framealpha=0.7)
-        ax2.tick_params(axis='y', pad=8)
+        ax2.set_yticks([])
 
         # Add grid on primary axis
-        ax.grid(False)
+        ax.grid(False)    
     
     def plot_network_graph(self, connection_types=None, layout_type='spring',
                           node_size_scale=1.0, save_path=None):
