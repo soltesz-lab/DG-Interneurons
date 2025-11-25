@@ -86,6 +86,7 @@ class SynapticStateManager:
 
             # Calculate synaptic input (firing rate * max conductance * connectivity)
             synaptic_input = pre_rates.unsqueeze(1) * max_conductances * connectivity
+
             
             if synapse_type == 'excitatory':
 
@@ -102,6 +103,8 @@ class SynapticStateManager:
                 )
                 
             elif synapse_type == 'inhibitory':
+                #if post_pop == 'sst':
+                #    print(f'{pre_pop} {post_pop} inhibitory synaptic input: {torch.sum(synaptic_input)}')
                 # Update GABA conductances
                 states['gaba_conductance'] = (
                     gaba_decay * states['gaba_conductance'] + 
@@ -171,24 +174,24 @@ class PerConnectionSynapticParams:
     # Connection-type specific modulation factors
     connection_modulation: Dict[str, float] = field(default_factory=lambda: {
         # Excitatory connections
-        'mec_gc': 1.4,       # Perforant path to GC
-        'mec_pv': 0.5,         # Perforant path to PV
+        'mec_gc': 1.0,       # Perforant path to GC
+        'mec_pv': 0.125,         # Perforant path to PV
         'gc_mc': 0.5,          # Mossy fiber collaterals
-        'gc_pv': 0.5,          # Excitation to PV
-        'gc_sst': 1.5,        # Excitation to SST
-        'mc_gc': 1.4,         # Associational
-        'mc_mc': 0.15, #4.825,  # MC recurrent
-        'mc_pv': 0.5,         # Excitation to PV
-        'mc_sst': 2.0,        # Excitation to SST
+        'gc_pv': 0.07,          # Excitation to PV
+        'gc_sst': 0.05,        # Excitation to SST
+        'mc_gc': 1.0,         # Associational
+        'mc_mc': 0.25, #4.825,  # MC recurrent
+        'mc_pv': 0.75,         # Excitation to PV
+        'mc_sst': 0.5,        # Excitation to SST
         
         # Inhibitory connections  
         'pv_gc': 3.5, #3.662,       # Perisomatic inhibition
-        'pv_mc': 0.1,             # Inhibition of MC
+        'pv_mc': 0.5,               # Inhibition of MC
         'pv_pv': 0.15, #1.875,       # PV lateral inhibition
-        'sst_gc': 4.0, #1.22       # GC dendritic inhibition
-        'sst_mc': 6.0,            # Inhibition of MC
+        'sst_gc': 1.0, #1.22        # GC dendritic inhibition
+        'sst_mc': 0.5,              # Inhibition of MC
         'sst_pv': 0.5, #1.51,       # IN disinhibition
-        'sst_sst': 1.0 #4.369       # SST lateral inhibition
+        
     })
     
     # Reversal potentials (mV)
@@ -281,15 +284,15 @@ class CircuitParams:
     n_mec: int = 60  # MEC layer 2 principal cells
     
     # Local connection probabilities (GC -> local targets)
-    p_gc_mc_local: float = 0.3   # GC to nearby MC
-    p_gc_pv_local: float = 0.05    # GC to nearby PV
+    p_gc_mc_local: float = 0.04    # GC to nearby MC
+    p_gc_pv_local: float = 0.15    # GC to nearby PV
     p_gc_sst_local: float = 0.06   # GC to nearby SST
     
     # MC connection probabilities
-    p_mc_gc_local: float = 0.01      # MC to local GC
-    p_mc_gc_distant: float = 0.02    # MC to distant GC
+    p_mc_gc_local: float = 0.005      # MC to local GC
+    p_mc_gc_distant: float = 0.01    # MC to distant GC
     p_mc_pv_distant: float = 0.08    # MC to distant PV
-    p_mc_sst: float = 0.25           # MC to local SST (molecular layer)
+    p_mc_sst: float = 0.1           # MC to local SST (molecular layer)
     p_mc_mc_distant: float = 0.02    # MC to distant MC
     
     # MEC connection probabilities (from Hainmueller et al.)
@@ -299,14 +302,14 @@ class CircuitParams:
     p_mec_sst: float = 0.0         # NO direct MEC -> SST (key asymmetry!)
 
     # Interneuron feedback connections  
-    p_pv_gc: float = 0.33           # PV feedback inhibition
+    p_pv_gc: float = 0.05          # PV feedback inhibition
     p_pv_mc: float = 0.1           # PV to MC inhibition
     p_pv_pv: float = 0.11          # PV lateral inhibition
-    p_pv_sst: float = 0.0          
-    p_sst_gc: float = 0.2          # SST dendritic inhibition
+    p_pv_sst: float = 0.02          
+    p_sst_gc: float = 0.04         # SST dendritic inhibition
     p_sst_mc: float = 0.3          # SST to MC inhibition
-    p_sst_pv: float = 0.15         # SST to PV feedback
-    p_sst_sst: float = 0.05        # SST to SST feedback
+    p_sst_pv: float = 0.05         # SST to PV feedback
+    p_sst_sst: float = 0.0         # SST to SST feedback
     
     # Population heterogeneity for competition
     pv_subpop_ratio: float = 0.6   # Fraction in "fast" PV subpopulation
@@ -316,7 +319,7 @@ class CircuitParams:
     gc_layer_thickness: float = 0.05   # Thin granule cell layer
     hilar_thickness: float = 0.3       # Hilar region thickness
     ml_thickness: float = 0.4          # Molecular layer thickness
-    local_radius: float = 0.5          # Local connection radius
+    local_radius: float = 0.9          # Local connection radius
     distant_min: float = 0.9           # Minimum distance for "distant"
     mec_distance: float = 2.0          # Distance from MEC to DG
     
@@ -329,7 +332,7 @@ class OpsinParams:
     expression_mean: float = 0.8
     expression_std: float = 0.05
     failure_rate: float = 0.5
-    light_decay: float = 0.3          # mm^-1
+    light_decay: float = 0.4          # mm^-1
     hill_coeff: float = 2.5
     half_sat: float = 0.4
 
@@ -339,51 +342,51 @@ class SpatialLayout:
     """Handle 3D spatial organization of DG populations"""
     
     def __init__(self, params: CircuitParams, device: Optional[torch.device] = None):
+        self.scale = 0.5
         self.params = params
         self.device = device if device is not None else get_default_device()
         self.positions = self._create_anatomical_layout()
-        self.scale = 1.0
         
     def _create_anatomical_layout(self) -> Dict[str, Tensor]:
         """Create anatomically realistic 3D layout"""
         positions = {}
         
         # Granule cell layer (tightly packed, z ≈ 0)
-        gc_x = torch.randn(self.params.n_gc, device=self.device) * 0.8
-        gc_y = torch.randn(self.params.n_gc, device=self.device) * 0.8
-        gc_z = torch.randn(self.params.n_gc, device=self.device) * self.params.gc_layer_thickness
+        gc_x = self.scale * torch.randn(self.params.n_gc, device=self.device) * 0.8
+        gc_y = self.scale * torch.randn(self.params.n_gc, device=self.device) * 0.8
+        gc_z = self.scale * torch.randn(self.params.n_gc, device=self.device) * self.params.gc_layer_thickness
         positions['gc'] = torch.stack([gc_x, gc_y, gc_z], dim=1)
         
         # Mossy cells (hilar region, z > 0)
-        mc_x = torch.randn(self.params.n_mc, device=self.device) * 0.6
-        mc_y = torch.randn(self.params.n_mc, device=self.device) * 0.6
-        mc_z = torch.abs(torch.randn(self.params.n_mc, device=self.device)) * self.params.hilar_thickness - 0.05
+        mc_x = self.scale * torch.randn(self.params.n_mc, device=self.device) * 0.6
+        mc_y = self.scale * torch.randn(self.params.n_mc, device=self.device) * 0.6
+        mc_z = self.scale * torch.abs(torch.randn(self.params.n_mc, device=self.device)) * self.params.hilar_thickness - 0.05
         positions['mc'] = torch.stack([mc_x, mc_y, mc_z], dim=1)
         
         # PV interneurons (distributed across layers)
-        pv_x = torch.randn(self.params.n_pv, device=self.device) * 0.7
-        pv_y = torch.randn(self.params.n_pv, device=self.device) * 0.7
-        pv_z = torch.randn(self.params.n_pv, device=self.device) * (self.params.hilar_thickness + self.params.gc_layer_thickness) * 0.3
+        pv_x = self.scale * torch.randn(self.params.n_pv, device=self.device) * 0.7
+        pv_y = self.scale * torch.randn(self.params.n_pv, device=self.device) * 0.7
+        pv_z = self.scale * torch.randn(self.params.n_pv, device=self.device) * (self.params.hilar_thickness + self.params.gc_layer_thickness) * 0.3
         positions['pv'] = torch.stack([pv_x, pv_y, pv_z], dim=1)
         
         # SST interneurons (hilar region bias, z > 0)
-        sst_x = torch.randn(self.params.n_sst, device=self.device) * 0.8
-        sst_y = torch.randn(self.params.n_sst, device=self.device) * 0.8
-        sst_z = torch.abs(torch.randn(self.params.n_sst, device=self.device)) * self.params.hilar_thickness + 0.05
+        sst_x = self.scale * torch.randn(self.params.n_sst, device=self.device) * 0.8
+        sst_y = self.scale * torch.randn(self.params.n_sst, device=self.device) * 0.8
+        sst_z = self.scale * torch.abs(torch.randn(self.params.n_sst, device=self.device)) * self.params.hilar_thickness + 0.05
         positions['sst'] = torch.stack([sst_x, sst_y, sst_z], dim=1)
         
         # MEC layer 2 (distant from DG)
-        mec_x = torch.randn(self.params.n_mec, device=self.device) * 1.0 + self.params.mec_distance
-        mec_y = torch.randn(self.params.n_mec, device=self.device) * 0.6
-        mec_z = -torch.rand(self.params.n_mec, device=self.device) * self.params.ml_thickness
+        mec_x = self.scale * torch.randn(self.params.n_mec, device=self.device) * 1.0 + self.params.mec_distance
+        mec_y = self.scale * torch.randn(self.params.n_mec, device=self.device) * 0.6
+        mec_z = self.scale * -torch.rand(self.params.n_mec, device=self.device) * self.params.ml_thickness
         positions['mec'] = torch.stack([mec_x, mec_y, mec_z], dim=1)
         
         return positions
     
     def distance_matrix(self, pop1: str, pop2: str) -> Tensor:
         """Calculate distance matrix between two populations"""
-        pos1 = self.positions[pop1]
-        pos2 = self.positions[pop2]
+        pos1 = self.positions[pop1] / self.scale
+        pos2 = self.positions[pop2] / self.scale
         
         diff = pos1.unsqueeze(1) - pos2.unsqueeze(0)
         distances = torch.norm(diff, dim=2)
@@ -425,7 +428,7 @@ class ConnectivityMatrix:
             'gc_pv': ('gc', 'pv', 'excitatory', self.circuit_params.p_gc_pv_local, 'local'),
             'gc_sst': ('gc', 'sst', 'excitatory', self.circuit_params.p_gc_sst_local, 'local'),
             'mc_gc': ('mc', 'gc', 'excitatory', (self.circuit_params.p_mc_gc_local, self.circuit_params.p_mc_gc_distant), 'mixed'),
-            'mc_pv': ('mc', 'pv', 'excitatory', self.circuit_params.p_mc_pv_distant, 'distant'),
+            'mc_pv': ('mc', 'pv', 'excitatory', self.circuit_params.p_mc_pv_distant, 'random'),
             'mc_sst': ('mc', 'sst', 'excitatory', self.circuit_params.p_mc_sst, 'local'),
             'mc_mc': ('mc', 'mc', 'excitatory', self.circuit_params.p_mc_mc_distant, 'distant'),
             'mec_gc': ('mec', 'gc', 'excitatory', self.circuit_params.p_mec_gc, 'random'),
@@ -435,7 +438,7 @@ class ConnectivityMatrix:
             'pv_gc': ('pv', 'gc', 'inhibitory', self.circuit_params.p_pv_gc, 'random'),
             'pv_mc': ('pv', 'mc', 'inhibitory', self.circuit_params.p_pv_mc, 'random'),
             'pv_pv': ('pv', 'pv', 'inhibitory', self.circuit_params.p_pv_pv, 'competitive'),
-            'pv_sst': ('pv', 'sst', 'inhibitory', self.circuit_params.p_pv_sst, 'local'),
+            'pv_sst': ('pv', 'sst', 'inhibitory', self.circuit_params.p_pv_sst, 'random'),
             'sst_gc': ('sst', 'gc', 'inhibitory', self.circuit_params.p_sst_gc, 'random'),
             'sst_mc': ('sst', 'mc', 'inhibitory', self.circuit_params.p_sst_mc, 'random'),
             'sst_pv': ('sst', 'pv', 'inhibitory', self.circuit_params.p_sst_pv, 'random'),

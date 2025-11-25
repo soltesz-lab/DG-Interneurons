@@ -133,7 +133,6 @@ class OpsinExpression:
         # Distance from fiber tip (assumed at mid-point)
         fiber_position = 0.5
         distances = torch.abs(torch.norm(positions, dim=1) - fiber_position)
-        
         # Light attenuation with tissue depth
         attenuated_intensity = light_intensity * torch.exp(-distances / self.params.light_decay)
 
@@ -3261,7 +3260,7 @@ if __name__ == "__main__":
                         help='High gradient threshold (Hz/ms)')
     parser.add_argument('--time-varying-mec', action='store_true',
                        help='Enable time-varying MEC input')
-    parser.add_argument('--mec-pattern-type', type=str, default='oscillatory',
+    parser.add_argument('--mec-pattern-type', type=str, default='constant',
                        choices=['oscillatory', 'drift', 'constant'],
                        help='Type of temporal pattern for MEC input')
     parser.add_argument('--mec-theta-freq', type=float, default=5.0,
@@ -3349,7 +3348,7 @@ if __name__ == "__main__":
         print(f"MEC -> MC connections: {mec_conn['mec_to_mc']}")
         print(f"MEC -> SST connections: {mec_conn['mec_to_sst']}")
 
-        for target in ['pv', 'sst']:
+        for target in ['sst', 'pv']:
             print(f"\n{target.upper()} Stimulation Results (Average of {args.n_trials} trials):")
             print("-" * 50)
 

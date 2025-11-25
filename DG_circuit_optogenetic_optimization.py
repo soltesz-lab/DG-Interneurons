@@ -23,7 +23,8 @@ import json
 from datetime import datetime
 import multiprocessing as mp
 
-from DG_protocol import OpsinExpression
+from DG_protocol import OpsinExpression, generate_time_varying_mec_pattern
+
 
 # Import existing optimization components
 from DG_circuit_optimization import (
@@ -110,7 +111,7 @@ class OptogeneticTargets:
         }
     })
 
-    pre_stim_duration: float = 500.0
+    pre_stim_duration: float = 1000.0
     stim_duration: float = 1000.0
     
     # Light intensity for stimulation
@@ -169,7 +170,19 @@ class BatchOptogeneticEvaluator:
                  base_seed: int = 42,
                  adaptive_step: bool = False,  
                  adaptive_config: Optional[GradientAdaptiveStepConfig] = None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 use_time_varying_mec: bool = False,
+                 mec_pattern_type: str = 'oscillatory',
+                 mec_theta_freq: float = 5.0,
+                 mec_theta_amplitude: float = 0.3,
+                 mec_gamma_freq: float = 20.0,
+                 mec_gamma_amplitude: float = 0.15,
+                 mec_gamma_coupling_strength: float = 0.8,
+                 mec_gamma_preferred_phase: float = 0.0,
+                 mec_drift_timescale: float = 200.0,
+                 mec_drift_amplitude: float = 0.4,
+                 mec_rotation_groups: int = 3):
+
         """
         Initialize batch optogenetic evaluator
         
@@ -183,6 +196,17 @@ class BatchOptogeneticEvaluator:
             base_seed: Base random seed for reproducibility (default: 42)
             adaptive_step: If True, use adaptive time stepping
             adaptive_config: Configuration for adaptive stepping (optional)
+            use_time_varying_mec: If True, use time-varying MEC patterns (default: False)
+            mec_pattern_type: Type of temporal pattern ('oscillatory', 'drift', 'constant')
+            mec_theta_freq: Theta oscillation frequency (Hz)
+            mec_theta_amplitude: Theta modulation depth (0-1)
+            mec_gamma_freq: Gamma oscillation frequency (Hz)
+            mec_gamma_amplitude: Gamma modulation depth (0-1)
+            mec_gamma_coupling_strength: Gamma-theta coupling (0=independent, 1=fully coupled)
+            mec_gamma_preferred_phase: Preferred theta phase for gamma peak (radians)
+            mec_drift_timescale: Correlation time for drift pattern (ms)
+            mec_drift_amplitude: Drift amplitude relative to base (0-1)
+            mec_rotation_groups: Number of groups for spatial rotation across trials
         """
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
@@ -204,6 +228,18 @@ class BatchOptogeneticEvaluator:
         else:
             self.adaptive_config = adaptive_config
 
+        self.use_time_varying_mec = use_time_varying_mec
+        self.mec_pattern_type = mec_pattern_type
+        self.mec_theta_freq = mec_theta_freq
+        self.mec_theta_amplitude = mec_theta_amplitude
+        self.mec_gamma_freq = mec_gamma_freq
+        self.mec_gamma_amplitude = mec_gamma_amplitude
+        self.mec_gamma_coupling_strength = mec_gamma_coupling_strength
+        self.mec_gamma_preferred_phase = mec_gamma_preferred_phase
+        self.mec_drift_timescale = mec_drift_timescale
+        self.mec_drift_amplitude = mec_drift_amplitude
+        self.mec_rotation_groups = mec_rotation_groups
+            
         if verbose:
             self.logger.setLevel(logging.INFO)
             ch = logging.StreamHandler()
@@ -212,7 +248,114 @@ class BatchOptogeneticEvaluator:
             
         self.logger.info(f"BatchOptogeneticEvaluator initialized on device: {self.device}")
         self.logger.info(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
+        if self.use_time_varying_mec:
+            self.logger.info(f"  MEC pattern: {mec_pattern_type} (theta={mec_theta_freq}Hz, gamma={mec_gamma_freq}Hz)")
+
+
+    def _generate_mec_input(self,
+                           batch_size: int,
+                           duration: float,
+                           dt: float,
+                           mec_current: float,
+                           mec_current_std: float,
+                           trial_index: int) -> torch.Tensor:
+        """
+        Generate MEC input pattern for a trial
+
+        Uses generate_time_varying_mec_pattern from DG_protocol for consistency.
+
+        Args:
+            batch_size: Number of parameter configurations in batch
+            duration: Total simulation duration (ms)
+            dt: Time step (ms)
+            mec_current: Base MEC current (pA)
+            mec_current_std: Standard deviation for noise (pA)
+            trial_index: Current trial index for rotation
+
+        Returns:
+            MEC input tensor:
+            - If use_time_varying_mec: [batch_size, n_mec, n_steps]
+            - Otherwise: [batch_size, n_mec] constant + noise
+        """
+        if self.use_time_varying_mec:
+            # Generate time-varying pattern using shared function
+            n_steps = int(duration / dt)
+
+            # Generate pattern for each batch element with trial rotation
+            # Each batch element gets the same temporal pattern but different spatial rotation
+            mec_patterns = []
+            for b in range(batch_size):
+                pattern = generate_time_varying_mec_pattern(
+                    n_mec=self.circuit_params.n_mec,
+                    duration=duration,
+                    dt=dt,
+                    base_current=mec_current,
+                    trial_index=trial_index + b,  # Offset by batch index for variation
+                    pattern_type=self.mec_pattern_type,
+                    theta_freq=self.mec_theta_freq,
+                    theta_amplitude=self.mec_theta_amplitude,
+                    gamma_freq=self.mec_gamma_freq,
+                    gamma_amplitude=self.mec_gamma_amplitude,
+                    gamma_coupling_strength=self.mec_gamma_coupling_strength,
+                    gamma_preferred_phase=self.mec_gamma_preferred_phase,
+                    drift_timescale=self.mec_drift_timescale,
+                    drift_amplitude=self.mec_drift_amplitude,
+                    rotation_groups=self.mec_rotation_groups,
+                    device=self.device
+                )
+                mec_patterns.append(pattern)
+
+            # Stack: [batch_size, n_mec, n_steps]
+            return torch.stack(mec_patterns, dim=0)
+        else:
+            # Original constant + noise approach
+            mec_input = mec_current + torch.randn(
+                batch_size, 
+                self.circuit_params.n_mec,
+                device=self.device
+            ) * mec_current_std
+            return mec_input
+
+    def _create_opsin_activation(self, 
+                                target_pop: str,
+                                layout,
+                                opsin_current: float) -> torch.Tensor:
+        """
+        Create opsin activation currents for target population
+
+        Uses the same activation logic as DG_protocol.OpsinExpression.calculate_activation
+        to ensure consistency between optimization and experimental protocols.
+
+        Args:
+            target_pop: Target population name ('pv', 'sst', etc.)
+            layout: SpatialLayout instance with cell positions
+            opsin_current: Maximum optogenetic current (pA)
+
+        Returns:
+            Activation currents for target population [n_cells]
+        """
+        # Create opsin expression for target population
+        n_target_cells = getattr(self.circuit_params, f'n_{target_pop}')
+        opsin_expression = OpsinExpression(
+            self.opsin_params,
+            n_cells=n_target_cells,
+            device=self.device
+        )
+
+        # Get positions for target population
+        target_positions = layout.positions[target_pop]
+
+        # Calculate activation probability using shared logic
+        light_intensity = self.targets.optogenetic_targets.stimulation_intensity
+        activation_prob = opsin_expression.calculate_activation(target_positions, light_intensity)
+
+        # Convert activation probability to optogenetic current
+        target_opto_current = activation_prob * opsin_current
+
+        return target_opto_current
     
+
+        
     def evaluate_parameter_batch(self,
                                  parameter_batch: List[Dict[str, float]],
                                  mec_current: float,
@@ -286,6 +429,9 @@ class BatchOptogeneticEvaluator:
         # Average over trials
         total_losses = torch.zeros(batch_size, device=self.device)
         all_firing_rates = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
+        duration = self.config.warmup_duration + self.config.simulation_duration
+        dt = self.circuit_params.dt
+        n_steps = int(duration / dt)
         
         for trial in range(self.config.n_trials):
             # Set seed for this trial (base_seed + trial_index)
@@ -308,24 +454,33 @@ class BatchOptogeneticEvaluator:
             
             # Reset state (activities, but connectivity is already new)
             circuit.reset_state()
-            
+
+
             # MEC input: [batch_size, n_mec]
-            mec_input = mec_current + torch.randn(
-                batch_size, 
-                self.circuit_params.n_mec,
-                device=self.device
-            ) * mec_current_std
+            mec_input = self._generate_mec_input(
+                batch_size=batch_size,
+                duration=duration,
+                dt=dt,
+                mec_current=mec_current,
+                mec_current_std=mec_current_std,
+                trial_index=trial
+            )
             
             # Collect activities over time
             activities_over_time = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
 
-            dt = self.circuit_params.dt
-            duration = self.config.warmup_duration + self.config.simulation_duration
-            n_steps = int(duration / dt)
             warmup_steps = int(self.config.warmup_duration / dt)
             
             for t in range(n_steps):
-                external_drive = {'mec': mec_input}
+                # Get MEC drive for this timestep
+                if self.use_time_varying_mec:
+                    # Extract current timestep: [batch_size, n_mec]
+                    mec_drive = mec_input[:, :, t]
+                else:
+                    # Constant input (already [batch_size, n_mec])
+                    mec_drive = mec_input
+
+                external_drive = {'mec': mec_drive}
                 activities = circuit({}, external_drive)
                 
                 if t >= warmup_steps:
@@ -413,9 +568,9 @@ class BatchOptogeneticEvaluator:
 
 
     def _evaluate_optogenetic_batch(self,
-                                parameter_batch: List[Dict[str, float]],
-                                mec_current: float,
-                                mec_current_std: float) -> Tuple[torch.Tensor, Dict]:
+                                    parameter_batch: List[Dict[str, float]],
+                                    mec_current: float,
+                                    mec_current_std: float) -> Tuple[torch.Tensor, Dict]:
         """
         Evaluate optogenetic objectives for batch of parameters
         
@@ -617,6 +772,7 @@ class BatchOptogeneticEvaluator:
 
         return total_opto_losses, accumulated_details
 
+
     def _run_adaptive_optogenetic_simulation(self, circuit, mec_input, target_pop, opsin_current=200.0):
         """
         Run optogenetic simulation with adaptive stepping
@@ -640,7 +796,7 @@ class BatchOptogeneticEvaluator:
         pre_stim_steps = int(self.targets.optogenetic_targets.pre_stim_duration / storage_dt)
         stim_steps = int(self.targets.optogenetic_targets.stim_duration / storage_dt)
 
-        # We'll collect activities on the fixed grid for pre-stim and stim periods
+        # Collect activities on the fixed grid for pre-stim and stim periods
         pre_stim_storage = {
             'gc': torch.zeros(batch_size, self.circuit_params.n_gc, pre_stim_steps, device=self.device),
             'mc': torch.zeros(batch_size, self.circuit_params.n_mc, pre_stim_steps, device=self.device),
@@ -669,32 +825,15 @@ class BatchOptogeneticEvaluator:
         pre_stim_grid = torch.arange(pre_stim_steps, device=self.device) * storage_dt + warmup_end
         stim_grid = torch.arange(stim_steps, device=self.device) * storage_dt + pre_stim_end
 
-        
-        # Setup opsin expression for target population ONLY
-        n_target_cells = getattr(self.circuit_params, f'n_{target_pop}')
-        opsin_expression = OpsinExpression(
-            self.opsin_params,
-            n_cells=n_target_cells,
-            device=self.device
+        # Create opsin activation using shared helper method
+        target_opto_current = self._create_opsin_activation(
+            target_pop,
+            circuit.layout,
+            opsin_current
         )
-        
-        # Get positions for target population
-        target_positions = circuit.layout.positions[target_pop]
-        
-        # Calculate activation probability for target population neurons
-        light_intensity = self.targets.optogenetic_targets.stimulation_intensity
-        activation_prob = opsin_expression.calculate_activation(target_positions, light_intensity)
-        
-        # Convert activation probabilities to optogenetic current for target neurons
-        target_opto_current = activation_prob * opsin_current
 
         # Adaptive simulation loop
         activity_current = None
-
-        total_opto_losses = torch.zeros(batch_size, device=self.device)
-        
-        # Accumulate results over trials
-        accumulated_details = {'pv': {}, 'sst': {}}
 
         while state.current_time < total_duration:
             # Compute dt
@@ -784,31 +923,31 @@ class BatchOptogeneticEvaluator:
         pop_features = {}
         for pop in stim_activities:
             if len(stim_activities[pop]) > 0:
-                
+
                 pop_pre_stim_activities = torch.stack(pre_stim_activities[pop], dim=0)
                 pop_stim_activities = torch.stack(stim_activities[pop], dim=0)
 
                 # Baseline and stimulation periods
                 baseline_rates = torch.mean(pop_pre_stim_activities, dim=0)  # [batch, neurons]
                 stim_rates = torch.mean(pop_stim_activities, dim=0)  # [batch, neurons]
-                
+
                 # Changes
                 rate_changes = stim_rates - baseline_rates
                 baseline_std = torch.std(baseline_rates, dim=1, keepdim=True)  # [batch, 1]
-                
+
                 # Fraction activated (per batch element)
                 activated_fraction = torch.mean(
                     (rate_changes > baseline_std).float(), dim=1
                 )  # [batch]
-                
+
                 baseline_mean = torch.mean(baseline_rates, dim=1)  # [batch]
                 stim_mean = torch.mean(stim_rates, dim=1)  # [batch]
                 mean_change = torch.mean(rate_changes, dim=1)  # [batch]
-                
+
                 # Gini coefficients (computed on CPU for numpy compatibility)
                 baseline_gini_list = []
                 stim_gini_list = []
-                
+
                 for b in range(batch_size):
                     baseline_gini_list.append(
                         calculate_gini_coefficient(baseline_rates[b].cpu().numpy())
@@ -816,12 +955,12 @@ class BatchOptogeneticEvaluator:
                     stim_gini_list.append(
                         calculate_gini_coefficient(stim_rates[b].cpu().numpy())
                     )
-                
+
                 # Convert to torch tensors
                 baseline_gini = torch.tensor(baseline_gini_list, device=self.device)
                 stim_gini = torch.tensor(stim_gini_list, device=self.device)
                 gini_change = stim_gini - baseline_gini
-                
+
                 pop_features[pop] = {
                     'baseline_mean': baseline_mean,
                     'stim_mean': stim_mean,
@@ -832,11 +971,10 @@ class BatchOptogeneticEvaluator:
                     'gini_change': gini_change,
                 }
 
-        
+
         return {'population_features': pop_features,
                 'adaptive_stats': state.get_statistics()}
-
-
+    
     def _interpolate_batch_to_grid_phase(self, activity_current, activity_prev,
                                          time_prev, time_current, time_grid, storage, phase_start):
         """
@@ -879,7 +1017,8 @@ class BatchOptogeneticEvaluator:
                     interpolated = ((1.0 - alpha) * activity_prev[pop_name] + 
                                    alpha * activity_current[pop_name])
                     storage[pop_name][:, :, grid_idx_item] = interpolated    
-    
+
+
     def _simulate_batch_optogenetic_stimulation(self,
                                                 parameter_batch: List[Dict[str, float]],
                                                 target_pop: str,
@@ -889,32 +1028,37 @@ class BatchOptogeneticEvaluator:
                                                 stim_start: float = 1000.0,
                                                 stim_duration: float = 2000.0,
                                                 post_duration: float = 250.0,
-                                                warmup: float = 250.0,
+                                                warmup: float = 500.0,
                                                 opsin_current: float = 200.0) -> Dict[str, torch.Tensor]:
         """
         Run optogenetic stimulation for a batch of parameter sets
-        
-        Uses provided trial_seed for circuit creation
-        
+
+        Uses provided trial_seed for circuit creation. 
+
         Args:
             parameter_batch: List of connection modulation dicts
             target_pop: Population to stimulate ('pv' or 'sst')
             mec_current: MEC drive level
             mec_current_std: MEC drive level stdev
             trial_seed: Random seed for this trial (already set externally)
-        
-        Returns dict with baseline and stimulation statistics for each population
+            stim_start: Stimulation start time (ms)
+            stim_duration: Stimulation duration (ms)
+            post_duration: Post-stimulation period (ms)
+            warmup: Pre-stimulation warmup (ms)
+            opsin_current: Optogenetic current amplitude (pA)
+
+        Returns:
+            Dict with baseline and stimulation statistics for each population
         """
-        
+
         batch_size = len(parameter_batch)
-        
+
         # Stimulation protocol parameters
         if stim_start < warmup:
             stim_start = warmup
-        duration = stim_start + stim_duration
-        
+        duration = stim_start + stim_duration + post_duration
+
         # Create new batch circuit with current random seed
-        # Note: seed was already set by caller, this ensures fresh connectivity
         circuit = BatchDentateCircuit(
             batch_size=batch_size,
             circuit_params=self.circuit_params,
@@ -922,52 +1066,48 @@ class BatchOptogeneticEvaluator:
             opsin_params=self.opsin_params,
             device=self.device
         )
-        
+
         circuit.set_connection_modulation_batch(parameter_batch)
-        
-        # Setup opsin expression for target population ONLY
-        n_target_cells = getattr(self.circuit_params, f'n_{target_pop}')
-        opsin_expression = OpsinExpression(
-            self.opsin_params,
-            n_cells=n_target_cells,
-            device=self.device
+
+        # Create opsin activation using shared helper method
+        target_opto_current = self._create_opsin_activation(
+            target_pop, 
+            circuit.layout, 
+            opsin_current
         )
-        
-        # Get positions for target population
-        target_positions = circuit.layout.positions[target_pop]
-        
-        # Calculate activation probability for target population neurons
-        light_intensity = self.targets.optogenetic_targets.stimulation_intensity
-        activation_prob = opsin_expression.calculate_activation(target_positions, light_intensity)
-        
-        # Convert activation probabilities to optogenetic current for target neurons
-        target_opto_current = activation_prob * opsin_current
-        
+
+        # Generate MEC input pattern
+        dt = self.circuit_params.dt
+        n_steps = int(duration / dt)
+
+        # Get trial index from seed offset (trial_seed = base_seed + trial_index)
+        trial_index = trial_seed - self.base_seed
+
+        mec_input = self._generate_mec_input(
+            batch_size=batch_size,
+            duration=duration,
+            dt=dt,
+            mec_current=mec_current,
+            mec_current_std=mec_current_std,
+            trial_index=trial_index
+        )
+
         # Storage for time series: [time, batch, neurons]
         activities_time_series = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst']}
-        
+
         # Run simulation
         circuit.reset_state()
-        mec_input = mec_current + torch.randn(
-            batch_size, 
-            self.circuit_params.n_mec,
-            device=self.device
-        ) * mec_current_std
-        
-        # Simulation parameters
-        dt = self.circuit_params.dt
-        duration = stim_start + stim_duration + post_duration
-        n_steps = int(duration / dt)
+
         stim_start_step = int(stim_start / dt)
         stim_end_step = int((stim_start + stim_duration) / dt)
         time_tensor = torch.arange(n_steps, device=self.device) * dt
 
         for t in range(n_steps):
             current_time = t * dt
-            
+
             # Create per-population optogenetic drives
             direct_activation = {}
-            
+
             if (t >= stim_start_step) and (t < stim_end_step):
                 # Apply optogenetic stimulation only to target population
                 for pop, n_neurons in [('gc', self.circuit_params.n_gc),
@@ -989,48 +1129,57 @@ class BatchOptogeneticEvaluator:
                                        ('sst', self.circuit_params.n_sst)]:
                     direct_activation[pop] = torch.zeros(batch_size, n_neurons,
                                                         device=self.device)
-            
-            external_drive = {'mec': mec_input}
+
+            # Get MEC drive for this timestep
+            if self.use_time_varying_mec:
+                # Extract current timestep: [batch_size, n_mec]
+                mec_drive = mec_input[:, :, t]
+            else:
+                # Constant input (already [batch_size, n_mec])
+                mec_drive = mec_input
+
+            external_drive = {'mec': mec_drive}
+
             activities = circuit(direct_activation, external_drive)
-            
+
             for pop in activities_time_series:
                 activities_time_series[pop].append(activities[pop])
-        
+
         # Convert to tensors: [time, batch, neurons]
         for pop in activities_time_series:
             if len(activities_time_series[pop]) > 0:
                 activities_time_series[pop] = torch.stack(activities_time_series[pop], dim=0)
-                
+
         # Calculate statistics
         baseline_mask = (time_tensor >= warmup) & (time_tensor < stim_start)
         stim_mask = (time_tensor >= stim_start) & (time_tensor < (stim_start + stim_duration))
-        
+
         results = {}
         for pop in activities_time_series:
             if len(activities_time_series[pop]) > 0:
                 pop_series = activities_time_series[pop]  # [time, batch, neurons]
-                
+
                 # Baseline and stimulation periods
                 baseline_rates = torch.mean(pop_series[baseline_mask], dim=0)  # [batch, neurons]
                 stim_rates = torch.mean(pop_series[stim_mask], dim=0)  # [batch, neurons]
-                
+
                 # Changes
                 rate_changes = stim_rates - baseline_rates
                 baseline_std = torch.std(baseline_rates, dim=1, keepdim=True)  # [batch, 1]
-                
+
                 # Fraction activated (per batch element)
                 activated_fraction = torch.mean(
                     (rate_changes > baseline_std).float(), dim=1
                 )  # [batch]
-                
+
                 baseline_mean = torch.mean(baseline_rates, dim=1)  # [batch]
                 stim_mean = torch.mean(stim_rates, dim=1)  # [batch]
                 mean_change = torch.mean(rate_changes, dim=1)  # [batch]
-                
+
                 # Gini coefficients (computed on CPU for numpy compatibility)
                 baseline_gini_list = []
                 stim_gini_list = []
-                
+
                 for b in range(batch_size):
                     baseline_gini_list.append(
                         calculate_gini_coefficient(baseline_rates[b].cpu().numpy())
@@ -1038,12 +1187,12 @@ class BatchOptogeneticEvaluator:
                     stim_gini_list.append(
                         calculate_gini_coefficient(stim_rates[b].cpu().numpy())
                     )
-                
+
                 # Convert to torch tensors
                 baseline_gini = torch.tensor(baseline_gini_list, device=self.device)
                 stim_gini = torch.tensor(stim_gini_list, device=self.device)
                 gini_change = stim_gini - baseline_gini
-                
+
                 results[pop] = {
                     'baseline_mean': baseline_mean,
                     'stim_mean': stim_mean,
@@ -1053,13 +1202,14 @@ class BatchOptogeneticEvaluator:
                     'stim_gini': stim_gini,
                     'gini_change': gini_change,
                 }
-        
+
         # Clean up
         del circuit
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
-        
+
         return results
+
     
     def _calculate_optogenetic_losses_batch(self,
                                            opto_results: Dict,
@@ -1505,7 +1655,18 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
                  targets, config, device, base_seed=42,
                  adaptive_step=False, adaptive_config=None,
-                 verbose=False):
+                 verbose=False,
+                 use_time_varying_mec=False,
+                 mec_pattern_type='oscillatory',
+                 mec_theta_freq=5.0,
+                 mec_theta_amplitude=0.3,
+                 mec_gamma_freq=20.0,
+                 mec_gamma_amplitude=0.15,
+                 mec_gamma_coupling_strength=0.8,
+                 mec_gamma_preferred_phase=0.0,
+                 mec_drift_timescale=200.0,
+                 mec_drift_amplitude=0.4,
+                 mec_rotation_groups=3):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
@@ -1516,6 +1677,17 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
         self.adaptive_step = adaptive_step
         self.adaptive_config = adaptive_config
         self.verbose = verbose
+        self.use_time_varying_mec = use_time_varying_mec
+        self.mec_pattern_type = mec_pattern_type
+        self.mec_theta_freq = mec_theta_freq
+        self.mec_theta_amplitude = mec_theta_amplitude
+        self.mec_gamma_freq = mec_gamma_freq
+        self.mec_gamma_amplitude = mec_gamma_amplitude
+        self.mec_gamma_coupling_strength = mec_gamma_coupling_strength
+        self.mec_gamma_preferred_phase = mec_gamma_preferred_phase
+        self.mec_drift_timescale = mec_drift_timescale
+        self.mec_drift_amplitude = mec_drift_amplitude
+        self.mec_rotation_groups = mec_rotation_groups
     
     def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
         """Evaluate configurations one at a time"""
@@ -1529,7 +1701,20 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
                 self.targets, self.config, device=self.device, base_seed=self.base_seed,
                 adaptive_step=self.adaptive_step,
                 adaptive_config=self.adaptive_config,
-                verbose=self.verbose
+                verbose=self.verbose,
+                # Pass MEC pattern parameters
+                use_time_varying_mec=self.use_time_varying_mec,
+                mec_pattern_type=self.mec_pattern_type,
+                mec_theta_freq=self.mec_theta_freq,
+                mec_theta_amplitude=self.mec_theta_amplitude,
+                mec_gamma_freq=self.mec_gamma_freq,
+                mec_gamma_amplitude=self.mec_gamma_amplitude,
+                mec_gamma_coupling_strength=self.mec_gamma_coupling_strength,
+                mec_gamma_preferred_phase=self.mec_gamma_preferred_phase,
+                mec_drift_timescale=self.mec_drift_timescale,
+                mec_drift_amplitude=self.mec_drift_amplitude,
+                mec_rotation_groups=self.mec_rotation_groups
+
             )
             
             loss_tensor, details = evaluator.evaluate_parameter_batch([params], mec_current, mec_current_std)
@@ -1587,7 +1772,19 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
     """Batch GPU evaluation for population-based optimization"""
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
-                 targets, config, device, base_seed=42, verbose=False):
+                 targets, config, device, base_seed=42, verbose=False,
+                 use_time_varying_mec=False,
+                 mec_pattern_type='oscillatory',
+                 mec_theta_freq=5.0,
+                 mec_theta_amplitude=0.3,
+                 mec_gamma_freq=20.0,
+                 mec_gamma_amplitude=0.15,
+                 mec_gamma_coupling_strength=0.8,
+                 mec_gamma_preferred_phase=0.0,
+                 mec_drift_timescale=200.0,
+                 mec_drift_amplitude=0.4,
+                 mec_rotation_groups=3):
+
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
@@ -1601,7 +1798,19 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
         self.evaluator = BatchOptogeneticEvaluator(
             circuit_params, base_synaptic_params, opsin_params,
             targets, config, device=device, base_seed=base_seed,
-            verbose=self.verbose
+            verbose=self.verbose,
+            # Pass MEC pattern parameters
+            use_time_varying_mec=use_time_varying_mec,
+            mec_pattern_type=mec_pattern_type,
+            mec_theta_freq=mec_theta_freq,
+            mec_theta_amplitude=mec_theta_amplitude,
+            mec_gamma_freq=mec_gamma_freq,
+            mec_gamma_amplitude=mec_gamma_amplitude,
+            mec_gamma_coupling_strength=mec_gamma_coupling_strength,
+            mec_gamma_preferred_phase=mec_gamma_preferred_phase,
+            mec_drift_timescale=mec_drift_timescale,
+            mec_drift_amplitude=mec_drift_amplitude,
+            mec_rotation_groups=mec_rotation_groups
         )
 
         
@@ -1675,7 +1884,18 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
     
     def __init__(self, circuit_params, base_synaptic_params, opsin_params,
                  targets, config, device, n_workers=None, n_threads_per_worker=1,
-                 base_seed=42, adaptive_step=False, adaptive_config=False, verbose=False):
+                 base_seed=42, adaptive_step=False, adaptive_config=False, verbose=False,
+                 use_time_varying_mec=False,
+                 mec_pattern_type='oscillatory',
+                 mec_theta_freq=5.0,
+                 mec_theta_amplitude=0.3,
+                 mec_gamma_freq=20.0,
+                 mec_gamma_amplitude=0.15,
+                 mec_gamma_coupling_strength=0.8,
+                 mec_gamma_preferred_phase=0.0,
+                 mec_drift_timescale=200.0,
+                 mec_drift_amplitude=0.4,
+                 mec_rotation_groups=3):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
@@ -1687,6 +1907,18 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
 
         self.adaptive_step = adaptive_step
         self.adaptive_config = adaptive_config
+
+        self.use_time_varying_mec = use_time_varying_mec
+        self.mec_pattern_type = mec_pattern_type
+        self.mec_theta_freq = mec_theta_freq
+        self.mec_theta_amplitude = mec_theta_amplitude
+        self.mec_gamma_freq = mec_gamma_freq
+        self.mec_gamma_amplitude = mec_gamma_amplitude
+        self.mec_gamma_coupling_strength = mec_gamma_coupling_strength
+        self.mec_gamma_preferred_phase = mec_gamma_preferred_phase
+        self.mec_drift_timescale = mec_drift_timescale
+        self.mec_drift_amplitude = mec_drift_amplitude
+        self.mec_rotation_groups = mec_rotation_groups
         
         # Configure workers
         n_cores = mp.cpu_count()
@@ -1706,7 +1938,22 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
                 'gaba_g_std': base_synaptic_params.gaba_g_std,
                 'distribution': base_synaptic_params.distribution,
             },
-            opsin_params
+            opsin_params,
+            # MEC pattern parameters
+            {
+                'use_time_varying_mec': use_time_varying_mec,
+                'mec_pattern_type': mec_pattern_type,
+                'mec_theta_freq': mec_theta_freq,
+                'mec_theta_amplitude': mec_theta_amplitude,
+                'mec_gamma_freq': mec_gamma_freq,
+                'mec_gamma_amplitude': mec_gamma_amplitude,
+                'mec_gamma_coupling_strength': mec_gamma_coupling_strength,
+                'mec_gamma_preferred_phase': mec_gamma_preferred_phase,
+                'mec_drift_timescale': mec_drift_timescale,
+                'mec_drift_amplitude': mec_drift_amplitude,
+                'mec_rotation_groups': mec_rotation_groups,
+            }
+            
         )
     
     def evaluate_batch(self, parameter_sets, mec_current, mec_current_std, n_trials):
@@ -1749,7 +1996,7 @@ def _optogenetic_worker_evaluate(args):
      targets, config, base_seed, adaptive_step, adaptive_config, verbose) = args
     
     device = torch.device('cpu')
-    circuit_params, base_synaptic_params_dict, opsin_params = worker_data
+    circuit_params, base_synaptic_params_dict, opsin_params, mec_pattern_params = worker_data
     
     # Create synaptic params
     synaptic_params = PerConnectionSynapticParams(
@@ -1767,7 +2014,8 @@ def _optogenetic_worker_evaluate(args):
         targets, config, device=device, base_seed=base_seed,
         adaptive_step=adaptive_step,
         adaptive_config=adaptive_config,
-        verbose=verbose
+        verbose=verbose,
+        **mec_pattern_params  # Unpack MEC pattern parameters
     )
     
     # Evaluate single parameter set
@@ -1844,31 +2092,60 @@ class OptogeneticCircuitOptimizer:
         self.logger.info(f"  Base seed: {base_seed}")
         self.logger.info(f"  Baseline weight: {targets.baseline_weight}")
         self.logger.info(f"  Optogenetic weight: {targets.optogenetic_weight}")
-    
+
+
     def _select_strategy(self, method: str, **kwargs) -> OptogeneticEvaluationStrategy:
         """Select optimal evaluation strategy based on method and device"""
 
         # Extract adaptive stepping configuration
         adaptive_step = kwargs.get('adaptive_step', self.config.adaptive_step if hasattr(self.config, 'adaptive_step') else False)
         adaptive_config = kwargs.get('adaptive_config', self.config.adaptive_config if hasattr(self.config, 'adaptive_config') else None)
-        
+
+        # NEW: Extract MEC pattern configuration
+        use_time_varying_mec = kwargs.get('use_time_varying_mec', False)
+        mec_pattern_type = kwargs.get('mec_pattern_type', 'oscillatory')
+        mec_theta_freq = kwargs.get('mec_theta_freq', 5.0)
+        mec_theta_amplitude = kwargs.get('mec_theta_amplitude', 0.3)
+        mec_gamma_freq = kwargs.get('mec_gamma_freq', 20.0)
+        mec_gamma_amplitude = kwargs.get('mec_gamma_amplitude', 0.15)
+        mec_gamma_coupling_strength = kwargs.get('mec_gamma_coupling_strength', 0.8)
+        mec_gamma_preferred_phase = kwargs.get('mec_gamma_preferred_phase', 0.0)
+        mec_drift_timescale = kwargs.get('mec_drift_timescale', 200.0)
+        mec_drift_amplitude = kwargs.get('mec_drift_amplitude', 0.4)
+        mec_rotation_groups = kwargs.get('mec_rotation_groups', 3)
+
+        # MEC parameter dict for passing to strategies
+        mec_params = {
+            'use_time_varying_mec': use_time_varying_mec,
+            'mec_pattern_type': mec_pattern_type,
+            'mec_theta_freq': mec_theta_freq,
+            'mec_theta_amplitude': mec_theta_amplitude,
+            'mec_gamma_freq': mec_gamma_freq,
+            'mec_gamma_amplitude': mec_gamma_amplitude,
+            'mec_gamma_coupling_strength': mec_gamma_coupling_strength,
+            'mec_gamma_preferred_phase': mec_gamma_preferred_phase,
+            'mec_drift_timescale': mec_drift_timescale,
+            'mec_drift_amplitude': mec_drift_amplitude,
+            'mec_rotation_groups': mec_rotation_groups,
+        }
+
         if method == 'gradient':
             strategy = OptogeneticSequentialStrategy(
                 self.circuit_params, self.base_synaptic_params, self.opsin_params,
                 self.targets, self.config, self.device, base_seed=self.base_seed,
                 adaptive_step=adaptive_step,
                 adaptive_config=adaptive_config,
-                verbose=True
+                verbose=True,
+                **mec_params
             )
-        
+
         elif method in ['particle_swarm', 'genetic_algorithm']:
             if self.device.type == 'cuda':
                 strategy = OptogeneticBatchGPUStrategy(
                     self.circuit_params, self.base_synaptic_params, self.opsin_params,
                     self.targets, self.config, self.device, base_seed=self.base_seed,
-                    adaptive_step=adaptive_step,
-                    adaptive_config=adaptive_config,
-                    verbose=True
+                    verbose=True,
+                    **mec_params
                 )
             else:
                 strategy = OptogeneticMultiprocessCPUStrategy(
@@ -1879,9 +2156,10 @@ class OptogeneticCircuitOptimizer:
                     base_seed=self.base_seed,
                     adaptive_step=adaptive_step,
                     adaptive_config=adaptive_config,
-                    verbose=True
+                    verbose=True,
+                    **mec_params
                 )
-        
+
         elif method == 'differential_evolution':
             if self.device.type == 'cuda':
                 raise NotImplementedError(
@@ -1896,21 +2174,24 @@ class OptogeneticCircuitOptimizer:
                 base_seed=self.base_seed,
                 adaptive_step=adaptive_step,
                 adaptive_config=adaptive_config,
-                verbose=True
+                verbose=True,
+                **mec_params
             )
-        
+
         else:
             raise ValueError(f"Unknown optimization method: {method}")
-        
+
         # Print strategy info
         info = strategy.get_strategy_info()
         self.logger.info(f"\nEvaluation Strategy: {info['name']}")
         self.logger.info(f"  Device: {info['device']}")
         self.logger.info(f"  Parallelism: {info['parallelism']}")
         self.logger.info(f"  Description: {info['description']}\n")
-        
+
         return strategy
-    
+
+
+        
     def optimize(self, method: str = 'particle_swarm', **kwargs) -> Dict:
         """
         Run optimization with automatic strategy selection
@@ -2086,8 +2367,8 @@ class OptogeneticCircuitOptimizer:
         logger.info(f"\n{'='*80}")
         logger.info("Metadata from optimization evaluation")
         logger.info(f"{'='*80}")
-        logger.info(f"  Baseline loss: {metadata.get('baseline_loss', 'N/A'):.6f}")
-        logger.info(f"  Opto loss: {metadata.get('opto_loss', 'N/A'):.6f}")
+        logger.info(f"  Baseline loss: {metadata.get('baseline_loss', 'N/A')}")
+        logger.info(f"  Opto loss: {metadata.get('opto_loss', 'N/A')}")
 
         if 'baseline_rates' in metadata:
             logger.info("\n  Baseline rates from optimization:")

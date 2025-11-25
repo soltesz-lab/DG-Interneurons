@@ -740,8 +740,7 @@ class DGCircuitVisualization:
 
         # Calculate mean activity per neuron across time
         mean_activity_per_neuron = np.mean(activity_data, axis=1)
-        if pop == 'pv':
-            print(f"mean_activity_per_neuron = {mean_activity_per_neuron}")
+        print(f"population {pop}: mean_activity_per_neuron = {mean_activity_per_neuron}")
 
         # Sort neurons by mean firing rate (descending - highest at top)
         sorted_indices = np.argsort(mean_activity_per_neuron)[::-1]
@@ -768,7 +767,7 @@ class DGCircuitVisualization:
             pos = ax.get_position()
 
             # Create narrow axis for activation bar immediately to the left of main axis
-            spacing = 0.005  # Minimal spacing between activation bar and main plot
+            spacing = 0.0025  # Minimal spacing between activation bar and main plot
             activation_ax = ax.figure.add_axes([pos.x0 - activation_width - spacing, 
                                                pos.y0, 
                                                activation_width, 
@@ -1091,7 +1090,9 @@ if __name__ == "__main__":
     plt.show()
 
     # Individual connectivity matrices
-    connection_types = ['gc_mc', 'mc_gc', 'pv_gc', 'sst_gc']
+    connection_types = ['mec_pv', 'mec_gc', 'gc_mc', 'mc_gc', 'pv_gc',
+                        'sst_gc', 'gc_pv', 'gc_sst', 'mc_pv', 'mc_sst',
+                        'pv_sst', 'sst_pv']
     
     for conn_type in connection_types:
         print(f"Plotting {conn_type} connectivity matrix...")
@@ -1123,7 +1124,7 @@ if __name__ == "__main__":
 
     print("Plotting distance distributions...")
     connection_types = ['gc_mc', 'mc_gc', 'pv_gc', 'sst_gc',
-                        'mc_pv', 'mc_sst', 'sst_pv', 'pv_pv']
+                        'mc_pv', 'mc_sst', 'pv_sst', 'pv_pv']
     fig, stats = vis.plot_distance_distribution(connection_types)
     
     if save_plots:
