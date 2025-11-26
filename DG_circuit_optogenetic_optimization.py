@@ -2216,7 +2216,7 @@ class OptogeneticCircuitOptimizer:
 
     def _optimize_particle_swarm(self, connection_names, n_particles=32, max_iterations=50,
                                  n_workers=None, n_threads_per_worker=1,
-                                 diagnostic_frequency=5, pso_config=None):
+                                 diagnostic_frequency=5, pso_config=None, **kwargs):
         """Particle swarm optimization using Adaptive PSO."""
         import numpy as np
         from adaptive_pso import AdaptivePSO, PSOConfig
@@ -2224,7 +2224,8 @@ class OptogeneticCircuitOptimizer:
         # Select evaluation strategy
         strategy = self._select_strategy('particle_swarm',
                                          n_workers=n_workers,
-                                         n_threads_per_worker=n_threads_per_worker)
+                                         n_threads_per_worker=n_threads_per_worker,
+                                         **kwargs)
 
         # Setup bounds
         bounds = [self.targets.connection_bounds.get(name, (0.1, 5.0))
@@ -2314,13 +2315,14 @@ class OptogeneticCircuitOptimizer:
         }
     
     def _optimize_differential_evolution(self, connection_names, max_iterations=50,
-                                         n_workers=None, n_threads_per_worker=1):
+                                         n_workers=None, n_threads_per_worker=1, **kwargs):
         """Differential evolution with multiprocess CPU"""
         from scipy.optimize import differential_evolution
         
         strategy = self._select_strategy('differential_evolution',
                                          n_workers=n_workers,
-                                         n_threads_per_worker=n_threads_per_worker)
+                                         n_threads_per_worker=n_threads_per_worker,
+                                         **kwargs)
         
         bounds = [self.targets.connection_bounds.get(name, (0.1, 5.0))
                  for name in connection_names]
@@ -2382,7 +2384,7 @@ class OptogeneticCircuitOptimizer:
                     logger.info(f"\n    {target_pop.upper()} stimulation:")
                     for affected_pop in metadata['opto_details'][target_pop]:
                         data = metadata['opto_details'][target_pop][affected_pop]
-                        logger.info(f"      {affected_pop.upper()}: activated_fraction = {data.get('activated_fraction', 'N/A'):.3f}")
+                        logger.info(f"      {affected_pop.upper()}: activated_fraction = {data.get('activated_fraction', 'N/A')}")
         
     
     def _print_diagnostics(self, position, loss, connection_names, metadata=None):
@@ -2557,7 +2559,19 @@ def run_global_optimization(optimization_config,
                             base_seed=42,
                             output_file="DG_optogenetic_optimization_results.json",
                             adaptive_step: bool = False,
-                            adaptive_config: Optional[GradientAdaptiveStepConfig] = None):
+                            adaptive_config: Optional[GradientAdaptiveStepConfig] = None,
+                            # MEC pattern parameters
+                            use_time_varying_mec: bool = False,
+                            mec_pattern_type: str = 'oscillatory',
+                            mec_theta_freq: float = 5.0,
+                            mec_theta_amplitude: float = 0.3,
+                            mec_gamma_freq: float = 20.0,
+                            mec_gamma_amplitude: float = 0.15,
+                            mec_gamma_coupling_strength: float = 0.8,
+                            mec_gamma_preferred_phase: float = 0.0,
+                            mec_drift_timescale: float = 200.0,
+                            mec_drift_amplitude: float = 0.4,
+                            mec_rotation_groups: int = 3):
     """
     Run global optimization with optogenetic objectives using batch GPU interface
     
@@ -2575,6 +2589,19 @@ def run_global_optimization(optimization_config,
         base_seed: Base random seed for reproducibility (default: 42)
         adaptive_step: If True, use gradient-driven adaptive time stepping
         adaptive_config: Configuration for adaptive stepping (optional)
+        # MEC pattern parameters
+        use_time_varying_mec: If True, use time-varying MEC input patterns
+        mec_pattern_type: Type of temporal pattern ('oscillatory', 'drift', 'constant')
+        mec_theta_freq: Theta oscillation frequency in Hz (default: 5.0)
+        mec_theta_amplitude: Theta modulation depth 0-1 (default: 0.3)
+        mec_gamma_freq: Gamma oscillation frequency in Hz (default: 20.0)
+        mec_gamma_amplitude: Gamma modulation depth 0-1 (default: 0.15)
+        mec_gamma_coupling_strength: Gamma-theta coupling 0-1 (default: 0.8)
+        mec_gamma_preferred_phase: Preferred theta phase for gamma peak in radians (default: 0.0)
+        mec_drift_timescale: Correlation time for drift pattern in ms (default: 200.0)
+        mec_drift_amplitude: Drift amplitude relative to base 0-1 (default: 0.4)
+        mec_rotation_groups: Number of groups for spatial rotation across trials (default: 3)
+
     """
 
     # Set adaptive stepping in config
@@ -2593,6 +2620,18 @@ def run_global_optimization(optimization_config,
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
         print(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
+
+    # Print MEC pattern configuration
+    if use_time_varying_mec:
+        print(f"\nMEC Input Configuration:")
+        print(f"  Pattern type: {mec_pattern_type}")
+        print(f"  Theta: {mec_theta_freq} Hz (amplitude: {mec_theta_amplitude})")
+        print(f"  Gamma: {mec_gamma_freq} Hz (amplitude: {mec_gamma_amplitude})")
+        print(f"  Gamma-theta coupling: {mec_gamma_coupling_strength}")
+        print(f"  Spatial rotation: {mec_rotation_groups} groups")
+    else:
+        print(f"\nMEC Input: Constant + noise (traditional)")
+        
     sys.stdout.flush()
         
     # Setup
@@ -2625,7 +2664,18 @@ def run_global_optimization(optimization_config,
         max_iterations=max_iterations,
         n_workers=n_workers,
         n_threads_per_worker=n_threads_per_worker,
-        diagnostic_frequency=diagnostic_frequency
+        diagnostic_frequency=diagnostic_frequency,
+        use_time_varying_mec=use_time_varying_mec,
+        mec_pattern_type=mec_pattern_type,
+        mec_theta_freq=mec_theta_freq,
+        mec_theta_amplitude=mec_theta_amplitude,
+        mec_gamma_freq=mec_gamma_freq,
+        mec_gamma_amplitude=mec_gamma_amplitude,
+        mec_gamma_coupling_strength=mec_gamma_coupling_strength,
+        mec_gamma_preferred_phase=mec_gamma_preferred_phase,
+        mec_drift_timescale=mec_drift_timescale,
+        mec_drift_amplitude=mec_drift_amplitude,
+        mec_rotation_groups=mec_rotation_groups
     )
     
     # Save results
@@ -2659,6 +2709,31 @@ if __name__ == "__main__":
                        help='Low gradient threshold (Hz/ms)')
     parser.add_argument('--adaptive-gradient-high', type=float, default=10.0,
                        help='High gradient threshold (Hz/ms)')
+    # MEC pattern arguments
+    parser.add_argument('--time-varying-mec', action='store_true',
+                       help='Enable time-varying MEC input patterns')
+    parser.add_argument('--mec-pattern-type', type=str, default='oscillatory',
+                       choices=['oscillatory', 'drift', 'constant'],
+                       help='Type of temporal pattern for MEC input (default: oscillatory)')
+    parser.add_argument('--mec-theta-freq', type=float, default=5.0,
+                       help='Theta oscillation frequency in Hz (default: 5.0)')
+    parser.add_argument('--mec-theta-amplitude', type=float, default=0.3,
+                       help='Theta modulation depth 0-1 (default: 0.3)')
+    parser.add_argument('--mec-gamma-freq', type=float, default=20.0,
+                       help='Gamma oscillation frequency in Hz (default: 20.0)')
+    parser.add_argument('--mec-gamma-amplitude', type=float, default=0.15,
+                       help='Gamma modulation depth 0-1 (default: 0.15)')
+    parser.add_argument('--mec-gamma-coupling', type=float, default=0.8,
+                       help='Gamma-theta coupling strength 0-1 (default: 0.8)')
+    parser.add_argument('--mec-gamma-phase', type=float, default=0.0,
+                       help='Preferred theta phase for gamma peak in radians (default: 0.0)')
+    parser.add_argument('--mec-drift-timescale', type=float, default=200.0,
+                       help='Correlation time for drift pattern in ms (default: 200.0)')
+    parser.add_argument('--mec-drift-amplitude', type=float, default=0.4,
+                       help='Drift amplitude relative to base 0-1 (default: 0.4)')
+    parser.add_argument('--mec-rotation-groups', type=int, default=3,
+                       help='Number of groups for spatial rotation (default: 3)')
+
     
     args = parser.parse_args()
 
@@ -2685,7 +2760,19 @@ if __name__ == "__main__":
         base_seed=args.base_seed,
         output_file=args.output_file,
         adaptive_step=args.adaptive_step,
-        adaptive_config=adaptive_config
+        adaptive_config=adaptive_config,
+        # MEC pattern parameters
+        use_time_varying_mec=args.time_varying_mec,
+        mec_pattern_type=args.mec_pattern_type,
+        mec_theta_freq=args.mec_theta_freq,
+        mec_theta_amplitude=args.mec_theta_amplitude,
+        mec_gamma_freq=args.mec_gamma_freq,
+        mec_gamma_amplitude=args.mec_gamma_amplitude,
+        mec_gamma_coupling_strength=args.mec_gamma_coupling,
+        mec_gamma_preferred_phase=args.mec_gamma_phase,
+        mec_drift_timescale=args.mec_drift_timescale,
+        mec_drift_amplitude=args.mec_drift_amplitude,
+        mec_rotation_groups=args.mec_rotation_groups
     )
     
     print(f"\nOptimization Complete!")

@@ -396,7 +396,12 @@ def test_optimizer_integration():
         method='particle_swarm',
         n_particles=8,  # Small for quick test
         max_iterations=2,  # Just 2 iterations
-        diagnostic_frequency=1
+        diagnostic_frequency=1,
+        use_time_varying_mec=True,
+        mec_pattern_type='oscillatory',
+        mec_theta_freq=5.0,
+        mec_gamma_freq=20.0,
+        mec_rotation_groups=3
     )
     elapsed = time.time() - start
     
