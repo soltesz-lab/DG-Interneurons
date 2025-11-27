@@ -117,17 +117,18 @@ class OpsinExpression:
         normal_samples = torch.normal(log_mean, log_std, size=(self.n_cells,), device=self.device)
         expression = torch.exp(normal_samples)
 
-        # Some cells have no expression (transduction failure)
-        sorted_indices = np.argsort(-expression)
-        print(f"sorted expression = {expression[sorted_indices]}")
+        sorted_indices = torch.argsort(expression, descending=True)
+
+        # Calculate number of failed cells
         n_failed = int(round(self.params.failure_rate * self.n_cells))
-        print(f"failure_rate = {self.params.failure_rate} n_cells = {self.n_cells} n_failed = {n_failed}")
-        print(f"sorted expression before failure = {expression[sorted_indices]}")
-        expression[sorted_indices[-n_failed:]] = 0.0
-        print(f"sorted expression after failure = {expression[sorted_indices]}")
-        
+
+        # Set expression to zero for cells with transduction failure
+        if n_failed > 0:
+            failed_cell_indices = sorted_indices[-n_failed:]
+            expression[failed_cell_indices] = 0.0
+
         return expression
-    
+
     def calculate_activation(self, positions: Tensor, light_intensity: float) -> Tensor:
         """Calculate light-induced activation probability"""
         # Distance from fiber tip (assumed at mid-point)
@@ -153,7 +154,7 @@ class OpsinExpression:
 
 def get_mec_rotation_pattern(n_mec: int,
                              trial_index: int,
-                             base_currents: np.ndarray,
+                             base_currents,  # Can be scalar or array
                              n_groups: int = 3,
                              device: Optional[torch.device] = None) -> torch.Tensor:
     """
@@ -164,6 +165,9 @@ def get_mec_rotation_pattern(n_mec: int,
     Args:
         n_mec: Number of MEC neurons
         trial_index: Current trial index (0, 1, 2, ...)
+        base_currents: Base current values - can be:
+                      - scalar (float/int): uniform current, will be broadcast to array
+                      - array (np.ndarray): spatial pattern to rotate
         n_groups: Number of groups to divide MEC population into
         device: Device to create tensor on
         
@@ -173,13 +177,33 @@ def get_mec_rotation_pattern(n_mec: int,
     if device is None:
         device = get_default_device()
     
+    # Handle scalar or array input
+    if isinstance(base_currents, (int, float)):
+        # Scalar: create uniform array
+        base_currents_array = np.full(n_mec, base_currents, dtype=np.float32)
+    elif isinstance(base_currents, np.ndarray):
+        # Already an array
+        base_currents_array = base_currents.astype(np.float32)
+    elif isinstance(base_currents, torch.Tensor):
+        # Convert tensor to numpy
+        base_currents_array = base_currents.cpu().numpy().astype(np.float32)
+    else:
+        raise TypeError(f"base_currents must be scalar, numpy array, or torch tensor, got {type(base_currents)}")
+    
+    # Ensure correct shape
+    if base_currents_array.shape != (n_mec,):
+        if base_currents_array.size == n_mec:
+            base_currents_array = base_currents_array.reshape(n_mec)
+        else:
+            raise ValueError(f"base_currents array has wrong size: {base_currents_array.shape}, expected ({n_mec},)")
+    
     # Divide neurons into groups
     group_size = n_mec // n_groups
     remainder = n_mec % n_groups
     
     # Apply circular rotation based on trial index
     rotation_amount = ((trial_index + 1) * group_size) % n_mec
-    rotated_array = np.roll(base_currents, rotation_amount)
+    rotated_array = np.roll(base_currents_array, rotation_amount)
 
     return torch.from_numpy(rotated_array).float().to(device)
 
