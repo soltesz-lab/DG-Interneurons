@@ -2760,7 +2760,7 @@ if __name__ == "__main__":
         base_seed=args.base_seed,
         output_file=args.output_file,
         adaptive_step=args.adaptive_step,
-        adaptive_config=adaptive_config,
+        adaptive_config=adaptive_step_config,
         # MEC pattern parameters
         use_time_varying_mec=args.time_varying_mec,
         mec_pattern_type=args.mec_pattern_type,

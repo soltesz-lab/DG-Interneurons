@@ -255,10 +255,12 @@ def generate_time_varying_mec_pattern(n_mec: int,
     
     n_steps = int(duration / dt)
     time_vec = torch.arange(n_steps, device=device) * dt  # in ms
-    
+
+    base_currents_array = np.full(n_mec, base_current, dtype=np.float32)
+
     # Get spatial rotation pattern for this trial
     base_rates = get_mec_rotation_pattern(
-        n_mec, trial_index, base_current, rotation_groups, device
+        n_mec, trial_index, base_currents_array, rotation_groups, device
     )  # [n_mec]
     
     if pattern_type == 'constant':
