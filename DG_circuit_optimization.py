@@ -128,23 +128,23 @@ class OptimizationTargets:
     
     # Connection strength bounds (multipliers)
     connection_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
-        'mec_gc': (0.5, 4.0),    # Perforant path can vary widely
-        'mec_pv': (0.1, 5.0),    # Perforant path can vary widely
-        'gc_mc': (0.1, 5.0),     # Mossy fiber strength
-        'mc_gc': (0.1, 5.0),     # Associational pathway  
-        'mc_mc': (0.5, 5.0),     # MC-MC excitation  
-        'pv_gc': (0.1, 5.0),     # Strong inhibition possible
+        'mec_gc': (0.1, 2.0),    # Perforant path can vary widely
+        'mec_pv': (0.1, 2.0),    # Perforant path can vary widely
+        'gc_mc': (0.1, 2.0),     # Mossy fiber strength
+        'mc_gc': (0.1, 2.0),     # Associational pathway  
+        'mc_mc': (0.5, 2.0),     # MC-MC excitation  
+        'pv_gc': (0.1, 4.0),     # Strong inhibition possible
         'sst_gc': (0.1, 3.0),    # Moderate dendritic inhibition
-        'gc_pv': (0.1, 5.0),     # Feedforward excitation
-        'gc_sst': (0.1, 5.0),    # Weaker SST drive
-        'mc_pv': (0.1, 6.0),     # Strong MC to PV
-        'mc_sst': (0.1, 2.0),    # MC to SST
-        'pv_pv': (0.1, 5.0),     # Lateral PV inhibition
+        'gc_pv': (0.1, 2.0),     # Feedforward excitation
+        'gc_sst': (0.1, 2.0),    # Weaker SST drive
+        'mc_pv': (0.1, 3.0),     # Strong MC to PV
+        'mc_sst': (0.1, 3.0),    # MC to SST
+        'pv_pv': (0.1, 4.0),     # Lateral PV inhibition
         'sst_pv': (0.1, 3.0),    # SST disinhibition
         'pv_sst': (0.1, 2.0),    # PV-SST disinhibition
-        'sst_sst': (0.1, 5.0),   # SST lateral inhibition
-        'sst_mc': (0.1, 3.0),    # Moderate dendritic inhibition
-        'pv_mc': (0.1, 5.0),     # Moderate inhibition of MC
+        'sst_sst': (0.1, 4.0),   # SST lateral inhibition
+        'sst_mc': (0.1, 4.0),    # Moderate dendritic inhibition
+        'pv_mc': (0.1, 4.0)     # Moderate inhibition of MC
     })
 
 @dataclass  
