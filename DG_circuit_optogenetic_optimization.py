@@ -670,7 +670,7 @@ class BatchOptogeneticEvaluator:
                                              mec_current: float,
                                              mec_current_std: float) -> Tuple[torch.Tensor, Dict]:
         """
-        Evaluate optogenetic objectives for batch of parameters (adaptive dt)
+        Evaluates optogenetic objectives for batch of parameters (adaptive dt)
 
         Uses synchronized adaptive time stepping for optogenetic experiments.
         """
@@ -699,7 +699,7 @@ class BatchOptogeneticEvaluator:
             self.logger.info(f"  Opto trial {trial + 1}/{self.config.n_trials} (adaptive): seed {trial_seed}...")
 
             for stim_pop in target_pops:
-                # Create circuit WITHOUT compilation for adaptive stepping
+                # Create circuit without compilation for adaptive stepping
                 circuit = BatchDentateCircuit(
                     batch_size=batch_size,
                     circuit_params=self.circuit_params,
@@ -712,12 +712,43 @@ class BatchOptogeneticEvaluator:
                 circuit.set_connection_modulation_batch(parameter_batch)
                 circuit.reset_state()
 
-                # MEC input
-                mec_input = mec_current + torch.randn(
-                    batch_size,
-                    self.circuit_params.n_mec,
-                    device=self.device
-                ) * mec_current_std
+                # MEC input (either constant or time-varying)
+                stim_start = self.targets.optogenetic_targets.pre_stim_duration
+                stim_duration = self.targets.optogenetic_targets.stim_duration
+                duration = self.config.warmup_duration + stim_start + stim_duration
+                dt = self.circuit_params.dt
+
+                if self.use_time_varying_mec:
+                    # Generate time-varying pattern: [batch_size, n_mec, n_steps]
+                    mec_patterns = []
+                    for b in range(batch_size):
+                        pattern = generate_time_varying_mec_pattern(
+                            n_mec=self.circuit_params.n_mec,
+                            duration=duration,
+                            dt=dt,
+                            base_current=mec_current,
+                            trial_index=trial + b,
+                            pattern_type=self.mec_pattern_type,
+                            theta_freq=self.mec_theta_freq,
+                            theta_amplitude=self.mec_theta_amplitude,
+                            gamma_freq=self.mec_gamma_freq,
+                            gamma_amplitude=self.mec_gamma_amplitude,
+                            gamma_coupling_strength=self.mec_gamma_coupling_strength,
+                            gamma_preferred_phase=self.mec_gamma_preferred_phase,
+                            drift_timescale=self.mec_drift_timescale,
+                            drift_amplitude=self.mec_drift_amplitude,
+                            rotation_groups=self.mec_rotation_groups,
+                            device=self.device
+                        )
+                        mec_patterns.append(pattern)
+                    mec_input = torch.stack(mec_patterns, dim=0)  # [batch, n_mec, n_steps]
+                else:
+                    # Constant + noise: [batch_size, n_mec]
+                    mec_input = mec_current + torch.randn(
+                        batch_size,
+                        self.circuit_params.n_mec,
+                        device=self.device
+                    ) * mec_current_std
 
                 # Run adaptive simulation with three phases:
                 # 1. Warmup
@@ -743,14 +774,14 @@ class BatchOptogeneticEvaluator:
                     accumulated_details[stim_pop] = {
                         pop: {k: v.clone() if isinstance(v, torch.Tensor) else v 
                               for k, v in pop_data.items()}
-                        for pop, pop_data in stim_results.items()
+                        for pop, pop_data in stim_results['population_features'].items()
                     }
                 else:
                     # Add to accumulators
-                    for pop in stim_results:
-                        for key, value in stim_results[pop].items():
+                    for pop in stim_results['population_features']:
+                        for key, value in stim_results['population_features'][pop].items():
                             if isinstance(value, torch.Tensor):
-                                accumulated_details[target_pop][pop][key] += value
+                                accumulated_details[stim_pop][pop][key] += value
                 
                 # Clean up
                 del circuit
@@ -793,6 +824,9 @@ class BatchOptogeneticEvaluator:
         """
 
         batch_size = mec_input.shape[0]
+
+        # Detect if MEC input is time-varying
+        is_time_varying = (mec_input.ndim == 3)
 
         # Initialize adaptive stepper
         stepper = GradientAdaptiveStepper(self.adaptive_config)
@@ -878,8 +912,20 @@ class BatchOptogeneticEvaluator:
                 # Stimulation phase
                 direct_activation = {target_pop: target_opto_current}
 
+            # Extract MEC drive based on input type
+            if is_time_varying:
+                # Time-varying: extract current timestep from pattern
+                time_idx = int(state.current_time / storage_dt)
+                if time_idx < mec_input.shape[2]:
+                    mec_drive = mec_input[:, :, time_idx]  # [batch, n_mec]
+                else:
+                    mec_drive = mec_input[:, :, -1]
+            else:
+                # Constant: use as-is
+                mec_drive = mec_input  # [batch, n_mec]
+            
             # Update circuit
-            external_drive = {'mec': mec_input}
+            external_drive = {'mec': mec_drive}
             activity_current = update_batch_circuit_with_adaptive_dt(
                 circuit, direct_activation, external_drive, dt_adaptive
             )
@@ -1255,16 +1301,45 @@ class BatchOptogeneticEvaluator:
             circuit.set_connection_modulation_batch(parameter_batch)
             circuit.reset_state()
 
-            # MEC input
-            mec_input = mec_current + torch.randn(
-                batch_size, 
-                self.circuit_params.n_mec,
-                device=self.device
-            ) * mec_current_std
+            duration = self.config.warmup_duration + self.config.simulation_duration
+            dt = self.circuit_params.dt
 
-            # Run adaptive simulation
+
+            if self.use_time_varying_mec:
+                # Time-varying: [batch_size, n_mec, n_steps]
+                mec_patterns = []
+                for b in range(batch_size):
+                    pattern = generate_time_varying_mec_pattern(
+                        n_mec=self.circuit_params.n_mec,
+                        duration=duration,
+                        dt=dt,
+                        base_current=mec_current,
+                        trial_index=trial + b,
+                        pattern_type=self.mec_pattern_type,
+                        theta_freq=self.mec_theta_freq,
+                        theta_amplitude=self.mec_theta_amplitude,
+                        gamma_freq=self.mec_gamma_freq,
+                        gamma_amplitude=self.mec_gamma_amplitude,
+                        gamma_coupling_strength=self.mec_gamma_coupling_strength,
+                        gamma_preferred_phase=self.mec_gamma_preferred_phase,
+                        drift_timescale=self.mec_drift_timescale,
+                        drift_amplitude=self.mec_drift_amplitude,
+                        rotation_groups=self.mec_rotation_groups,
+                        device=self.device
+                    )
+                    mec_patterns.append(pattern)
+                mec_input = torch.stack(mec_patterns, dim=0)
+            else:
+                # Constant + noise: [batch_size, n_mec]
+                mec_input = mec_current + torch.randn(
+                    batch_size, 
+                    self.circuit_params.n_mec,
+                    device=self.device
+                ) * mec_current_std
+
+            # Run adaptive simulation (handles both input shapes)
             result = self._run_batch_adaptive_baseline(circuit, mec_input)
-
+            
             activities_over_time = result['activities_over_time']
             baseline_adaptive_stats.append(result['adaptive_stats'])
 
@@ -1353,6 +1428,9 @@ class BatchOptogeneticEvaluator:
 
         All batch elements use the same dt at each step (synchronized).
         """
+        # Detect if MEC input is time-varying
+        is_time_varying = (mec_input.ndim == 3)
+        
         # Initialize adaptive stepper
         stepper = GradientAdaptiveStepper(self.adaptive_config)
         state = AdaptiveSimulationState(self.device)
@@ -1393,9 +1471,19 @@ class BatchOptogeneticEvaluator:
             if state.current_time + dt_adaptive > duration:
                 dt_adaptive = duration - state.current_time
 
+            # Extract MEC drive based on input type
+            if is_time_varying:
+                time_idx = int(state.current_time / storage_dt)
+                if time_idx < mec_input.shape[2]:
+                    mec_drive = mec_input[:, :, time_idx]  # [batch, n_mec]
+                else:
+                    mec_drive = mec_input[:, :, -1]
+            else:
+                mec_drive = mec_input  # [batch, n_mec]
+                
             # Update circuit
             external_drive = {'mec': mec_input}
-            activity_current = update_circuit_with_adaptive_dt(
+            activity_current = update_batch_circuit_with_adaptive_dt(
                 circuit, {}, external_drive, dt_adaptive
             )
 
@@ -1423,6 +1511,7 @@ class BatchOptogeneticEvaluator:
             'activities_over_time': activities_over_time,
             'adaptive_stats': state.get_statistics()
         }
+
 
 
 

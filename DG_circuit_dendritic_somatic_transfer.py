@@ -803,10 +803,9 @@ class DentateCircuit(nn.Module):
                 self._dendritic_somatic_transfer(
                     total_ampa, total_gaba, total_nmda, params, adaptation_state
                 )
-            #if pop == 'sst':
+            #if pop == 'gc':
             #    print(f"{pop}: mean activity = {torch.mean(new_activity_tensor)}")
             #else:
-            #if pop == 'sst':
             #    print(f"{pop}: activity = {new_activity_tensor}")
                 
             # Update state variables

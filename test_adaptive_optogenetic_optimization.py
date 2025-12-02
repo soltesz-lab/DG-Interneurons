@@ -3,12 +3,12 @@
 Tests for adaptive stepping in optogenetic circuit optimization
 
 Tests:
-1. Sequential strategy with adaptive stepping
-2. Batch GPU strategy with adaptive stepping (if CUDA available)
-3. Multiprocess CPU strategy with adaptive stepping
-4. Comparison: fixed-dt vs adaptive-dt results
-5. Performance benchmarking
-6. Adaptive statistics validation
+- Sequential strategy with adaptive stepping
+- Batch GPU strategy with adaptive stepping (if CUDA available)
+- Multiprocess CPU strategy with adaptive stepping
+- Comparison: fixed-dt vs adaptive-dt results
+- Performance benchmarking
+- Adaptive statistics validation
 """
 
 import torch
@@ -16,6 +16,7 @@ import time
 import numpy as np
 from pathlib import Path
 
+from DG_protocol import OptogeneticExperiment
 from DG_circuit_optogenetic_optimization import (
     OptogeneticCircuitOptimizer,
     CombinedOptimizationTargets,
@@ -427,6 +428,308 @@ def test_optimizer_integration():
     print("\nFull optimizer integration test PASSED")
     return True
 
+"""
+Add this test to test_adaptive_optogenetic_optimization.py
+
+This test directly compares BatchOptogeneticEvaluator from the optimization
+module vs. OptogeneticExperiment.simulate_stimulation from the protocol module.
+"""
+
+def test_optimization_protocol_consistency():
+    """
+    Cross-validation: Compare optimization evaluator vs protocol evaluator
+    
+    This test reveals discrepancies between:
+    - BatchOptogeneticEvaluator (used in optimization)
+    - OptogeneticExperiment.simulate_stimulation (used in protocol)
+    
+    Both should produce similar results for the same configuration.
+    """
+    print("\n" + "="*80)
+    print("Cross-Validation: Optimization vs Protocol Evaluator")
+    print("="*80)
+    
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
+    
+    # Test parameters
+    param_set = synaptic_params.connection_modulation
+    mec_current = 40.0
+    mec_current_std = 1.0
+    target_pop = 'pv'
+    light_intensity = 1.0
+    
+    # Simulation parameters
+    stim_start = 1500.0
+    stim_duration = 1000.0
+    warmup = 500.0
+    total_duration = warmup + stim_start + stim_duration
+    
+    # Adaptive config
+    adaptive_config = GradientAdaptiveStepConfig(
+        dt_min=0.05,
+        dt_max=0.3,
+        gradient_low=0.5,
+        gradient_high=10.0
+    )
+    
+    print(f"\nTest configuration:")
+    print(f"  Device: {device}")
+    print(f"  Target population: {target_pop}")
+    print(f"  MEC current: {mec_current} pA")
+    print(f"  Adaptive stepping: ENABLED")
+    print(f"  dt range: [{adaptive_config.dt_min}, {adaptive_config.dt_max}] ms")
+    
+    # ========================================================================
+    # PATH 1: Optimization Evaluator (BatchOptogeneticEvaluator)
+    # ========================================================================
+
+    print("\n" + "-"*80)
+    print("PATH 1: Optimization Evaluator (BatchOptogeneticEvaluator)")
+    print("-"*80)
+
+    config_opt = OptimizationConfig(
+        n_trials=1,
+        simulation_duration=stim_duration,
+        warmup_duration=warmup,
+        mec_drive_levels=[mec_current],
+        mec_drive_std=mec_current_std,
+        adaptive_step=True,
+        adaptive_config=adaptive_config
+    )
+
+    # Update optogenetic targets to match protocol
+    targets.optogenetic_targets.pre_stim_duration = stim_start
+    targets.optogenetic_targets.stim_duration = stim_duration
+    targets.optogenetic_targets.stimulation_intensity = light_intensity
+
+    evaluator_opt = BatchOptogeneticEvaluator(
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
+        targets, config_opt,
+        device=device,
+        base_seed=42,
+        adaptive_step=True,
+        adaptive_config=adaptive_config,
+        verbose=True
+    )
+
+    start = time.time()
+    loss_opt, details_opt = evaluator_opt.evaluate_parameter_batch(
+        [param_set], mec_current, mec_current_std
+    )
+    time_opt = time.time() - start
+
+    print(f"\n  Evaluation time: {time_opt:.3f}s")
+    print(f"  Total loss: {loss_opt[0].item():.6f}")
+    print(f"  Baseline loss: {details_opt['baseline_losses'][0].item():.6f}")
+    print(f"  Opto loss: {details_opt['opto_losses'][0].item():.6f}")
+
+    # Extract firing rates
+    opt_baseline_rates = {}
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        if pop in details_opt['baseline_rates']:
+            opt_baseline_rates[pop] = details_opt['baseline_rates'][pop][0].item()
+
+    print(f"\n  Baseline firing rates:")
+    for pop, rate in opt_baseline_rates.items():
+        print(f"    {pop.upper()}: {rate:.2f} Hz")
+
+    # Extract optogenetic effects
+    opt_opto_effects = {}
+    if target_pop in details_opt['opto_details']:
+        for affected_pop in details_opt['opto_details'][target_pop]:
+            if affected_pop != target_pop:
+                data = details_opt['opto_details'][target_pop][affected_pop]
+                opt_opto_effects[affected_pop] = {
+                    'mean_change': data['mean_change'][0].item(),
+                    'activated_fraction': data['activated_fraction'][0].item()
+                }
+
+    print(f"\n  Optogenetic effects ({target_pop.upper()} stimulation):")
+    for pop, effects in opt_opto_effects.items():
+        print(f"    {pop.upper()}: Δrate={effects['mean_change']:.2f} Hz, "
+              f"activated={effects['activated_fraction']:.1%}")
+
+    # Check for adaptive stats
+    if hasattr(evaluator_opt, '_last_adaptive_stats'):
+        opt_adaptive_stats = evaluator_opt._last_adaptive_stats
+        if opt_adaptive_stats:
+            print(f"\n  Adaptive statistics:")
+            if 'n_steps_mean' in opt_adaptive_stats:
+                print(f"    Steps: {opt_adaptive_stats['n_steps_mean']:.0f}")
+                print(f"    Avg dt: {opt_adaptive_stats['avg_dt_mean']:.3f} ms")
+            elif 'n_steps' in opt_adaptive_stats:
+                print(f"    Steps: {opt_adaptive_stats['n_steps']:.0f}")
+                print(f"    Avg dt: {opt_adaptive_stats['avg_dt']:.3f} ms")
+    
+    # ========================================================================
+    # PATH 2: Protocol Evaluator (OptogeneticExperiment)
+    # ========================================================================
+    
+    print("\n" + "-"*80)
+    print("PATH 2: Protocol Evaluator (OptogeneticExperiment)")
+    print("-"*80)
+    
+    from DG_protocol import OptogeneticExperiment
+    
+    experiment = OptogeneticExperiment(
+        circuit_params,
+        synaptic_params,
+        opsin_params,
+        device=device,
+        base_seed=42,
+        adaptive_config=adaptive_config
+    )
+    
+    start = time.time()
+    result_protocol = experiment.simulate_stimulation(
+        target_pop,
+        light_intensity,
+        stim_start=stim_start,
+        stim_duration=stim_duration,
+        post_duration=0.0,
+        mec_current=mec_current,
+        mec_current_std=mec_current_std,
+        opsin_current=opsin_current,
+        plot_activity=False,
+        n_trials=1,
+        regenerate_connectivity_per_trial=False,
+        adaptive_step=True
+    )
+    time_protocol = time.time() - start
+    
+    print(f"\n  Evaluation time: {time_protocol:.3f}s")
+    
+    # Extract firing rates from protocol
+    time_vec = result_protocol['time']
+    activity_mean = result_protocol['activity_trace_mean']
+
+    baseline_mask = (time_vec >= warmup) & (time_vec < stim_start)
+    stim_mask = (time_vec >= stim_start) & (time_vec <= (stim_start + stim_duration))
+    
+    protocol_baseline_rates = {}
+    protocol_opto_effects = {}
+    
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        if pop == target_pop:
+            continue
+            
+        baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+        stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+        rate_change = stim_rate - baseline_rate
+        baseline_std = torch.std(baseline_rate, unbiased=False)
+        
+        protocol_baseline_rates[pop] = torch.mean(baseline_rate).item()
+        
+        activated_fraction = torch.mean((rate_change > baseline_std).float()).item()
+        mean_change = torch.mean(rate_change).item()
+        
+        protocol_opto_effects[pop] = {
+            'mean_change': mean_change,
+            'activated_fraction': activated_fraction
+        }
+    
+    print(f"\n  Baseline firing rates:")
+    for pop, rate in protocol_baseline_rates.items():
+        print(f"    {pop.upper()}: {rate:.2f} Hz")
+    
+    print(f"\n  Optogenetic effects ({target_pop.upper()} stimulation):")
+    for pop, effects in protocol_opto_effects.items():
+        print(f"    {pop.upper()}: Δrate={effects['mean_change']:.2f} Hz, "
+              f"activated={effects['activated_fraction']:.1%}")
+    
+    # Check for adaptive stats
+    if 'adaptive_stats' in result_protocol:
+        protocol_adaptive_stats = result_protocol['adaptive_stats']
+        print(f"\n  Adaptive statistics:")
+        if 'n_steps_mean' in protocol_adaptive_stats:
+            print(f"    Steps: {protocol_adaptive_stats['n_steps_mean']:.0f}")
+            print(f"    Avg dt: {protocol_adaptive_stats['avg_dt_mean']:.3f} ms")
+        elif 'n_steps' in protocol_adaptive_stats:
+            print(f"    Steps: {protocol_adaptive_stats['n_steps']:.0f}")
+            print(f"    Avg dt: {protocol_adaptive_stats['avg_dt']:.3f} ms")
+    
+    # ========================================================================
+    # COMPARISON
+    # ========================================================================
+    
+    print("\n" + "="*80)
+    print("COMPARISON")
+    print("="*80)
+    
+    print(f"\n{'Metric':<40} {'Optimization':<20} {'Protocol':<20} {'Diff':<15}")
+    print("-"*95)
+    
+    # Compare timing
+    time_diff_pct = abs(time_opt - time_protocol) / time_protocol * 100
+    print(f"{'Evaluation time (s)':<40} {time_opt:<20.3f} {time_protocol:<20.3f} {time_diff_pct:<15.1f}%")
+    
+    # Compare baseline rates
+    print(f"\n{'Baseline Firing Rates (Hz)':<40}")
+    print("-"*95)
+    
+    max_rate_diff_pct = 0
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        if pop in opt_baseline_rates and pop in protocol_baseline_rates:
+            opt_rate = opt_baseline_rates[pop]
+            protocol_rate = protocol_baseline_rates[pop]
+            diff = abs(opt_rate - protocol_rate)
+            diff_pct = (diff / protocol_rate * 100) if protocol_rate > 0 else 0
+            max_rate_diff_pct = max(max_rate_diff_pct, diff_pct)
+            
+            print(f"  {pop.upper():<38} {opt_rate:<20.2f} {protocol_rate:<20.2f} {diff_pct:<15.1f}%")
+    
+    # Compare optogenetic effects
+    print(f"\n{'Optogenetic Effects':<40}")
+    print("-"*95)
+    
+    max_effect_diff_pct = 0
+    for pop in opt_opto_effects:
+        if pop in protocol_opto_effects:
+            opt_effect = opt_opto_effects[pop]['activated_fraction']
+            protocol_effect = protocol_opto_effects[pop]['activated_fraction']
+            diff = abs(opt_effect - protocol_effect)
+            diff_pct = (diff / protocol_effect * 100) if protocol_effect > 0 else 0
+            max_effect_diff_pct = max(max_effect_diff_pct, diff_pct)
+            
+            print(f"  {pop.upper()} activated fraction: {opt_effect:<20.1%} "
+                  f"{protocol_effect:<20.1%} {diff_pct:<15.1f}%")
+    
+    # ========================================================================
+    # RESULT
+    # ========================================================================
+    
+    print("\n" + "="*80)
+    print("RESULT")
+    print("="*80)
+    
+    # Tolerance thresholds
+    RATE_TOLERANCE = 10.0  # 10% difference in firing rates
+    EFFECT_TOLERANCE = 15.0  # 15% difference in optogenetic effects
+    
+    issues = []
+    
+    if max_rate_diff_pct > RATE_TOLERANCE:
+        issues.append(f"Baseline rates differ by up to {max_rate_diff_pct:.1f}% (threshold: {RATE_TOLERANCE}%)")
+    
+    if max_effect_diff_pct > EFFECT_TOLERANCE:
+        issues.append(f"Opto effects differ by up to {max_effect_diff_pct:.1f}% (threshold: {EFFECT_TOLERANCE}%)")
+    
+    if not issues:
+        print("\nO PASSED: Optimization and Protocol evaluators produce consistent results")
+        print(f"  Max rate difference: {max_rate_diff_pct:.1f}%")
+        print(f"  Max effect difference: {max_effect_diff_pct:.1f}%")
+        passed = True
+    else:
+        print("\nX FAILED: Significant discrepancies detected:")
+        for issue in issues:
+            print(f"  - {issue}")
+        
+        passed = False
+    
+    return passed
+
+
 
 def test_performance_benchmark():
     """Performance benchmark - fixed vs adaptive"""
@@ -537,19 +840,21 @@ def run_all_tests():
         ("Multi-trial Consistency", test_multi_trial_consistency),
         ("Reproducibility", test_reproducibility),
         ("Optimizer Integration", test_optimizer_integration),
+        ("Optimization-Protocol Consistency", test_optimization_protocol_consistency),
+        ("Time-Varying MEC Consistency", test_with_time_varying_mec),
         ("Performance Benchmark", test_performance_benchmark),
     ]
     
     results = {}
     
     for test_name, test_func in tests:
-#        try:
-        passed = test_func()
-        results[test_name] = "PASSED" if passed else "FAILED"
-#        except Exception as e:
-#            print(f"\nX {test_name} FAILED with exception:")
-#            print(f"  {type(e).__name__}: {e}")
-#            results[test_name] = "ERROR"
+        try:
+            passed = test_func()
+            results[test_name] = "PASSED" if passed else "FAILED"
+        except Exception as e:
+            print(f"\nX {test_name} FAILED with exception:")
+            print(f"  {type(e).__name__}: {e}")
+            results[test_name] = "ERROR"
     
     # Summary
     print("\n" + "="*80)
@@ -586,6 +891,7 @@ if __name__ == "__main__":
             "repro": test_reproducibility,
             "optimizer": test_optimizer_integration,
             "benchmark": test_performance_benchmark,
+            "consistency": test_optimization_protocol_consistency,
         }
         
         if test_name in test_map:

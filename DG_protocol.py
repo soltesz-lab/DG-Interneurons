@@ -630,7 +630,7 @@ class OptogeneticExperiment:
                 del self.circuit
                 if self.device.type == 'cuda':
                     torch.cuda.empty_cache()
-        
+
         # Aggregate results across trials
         aggregated_results = self._aggregate_trial_results(all_trial_results, n_trials)
 
@@ -1045,12 +1045,22 @@ class OptogeneticExperiment:
             # Stack: [n_trials, n_neurons, n_steps]
             stacked = torch.stack(activity_traces_all[pop], dim=0)
             activity_trace_mean[pop] = torch.mean(stacked, dim=0)  # [n_neurons, n_steps]
-            activity_trace_std[pop] = torch.std(stacked, dim=0)    # [n_neurons, n_steps]
-        
+            if n_trials == 1:
+                # For single trial, std is 0 (no variance across trials)
+                activity_trace_std[pop] = torch.zeros_like(activity_trace_mean[pop])
+            else:
+                # For multiple trials, use unbiased=False for numerical stability
+                # (unbiased=True would divide by n-1, causing issues with small n)
+                activity_trace_std[pop] = torch.std(stacked, dim=0, unbiased=False)
+
+            
         # Opsin expression (may vary slightly per trial due to stochastic generation)
         opsin_expression_stacked = torch.stack(opsin_expressions_all, dim=0)
         opsin_expression_mean = torch.mean(opsin_expression_stacked, dim=0)
-        opsin_expression_std = torch.std(opsin_expression_stacked, dim=0)
+        if n_trials == 1:
+            opsin_expression_std = torch.zeros_like(opsin_expression_mean)
+        else:
+            opsin_expression_std = torch.std(opsin_expression_stacked, dim=0, unbiased=False)
 
         # Aggregate adaptive stats if present
         adaptive_stats_aggregated = None
