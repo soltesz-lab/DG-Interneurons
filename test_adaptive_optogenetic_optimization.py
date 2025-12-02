@@ -319,7 +319,8 @@ def test_reproducibility():
     
     print("\n4a. First run (seed=42)...")
     evaluator1 = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
         targets, config, device=device, base_seed=42,
         adaptive_step=True,
         adaptive_config=config.adaptive_config
@@ -331,7 +332,8 @@ def test_reproducibility():
     
     print("\n4b. Second run (seed=42)...")
     evaluator2 = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
         targets, config, device=device, base_seed=42,
         adaptive_step=True,
         adaptive_config=config.adaptive_config
@@ -387,7 +389,8 @@ def test_optimizer_integration():
     )
     
     optimizer = OptogeneticCircuitOptimizer(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
         targets, config, device=device, base_seed=42
     )
     
@@ -396,6 +399,7 @@ def test_optimizer_integration():
     results = optimizer.optimize(
         method='particle_swarm',
         n_particles=8,  # Small for quick test
+        n_workers=8,
         max_iterations=2,  # Just 2 iterations
         diagnostic_frequency=1,
         use_time_varying_mec=True,
@@ -454,7 +458,8 @@ def test_performance_benchmark():
     )
     
     evaluator_fixed = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
         targets, config_fixed, device=device, base_seed=42,
         adaptive_step=False
     )
@@ -486,7 +491,8 @@ def test_performance_benchmark():
     )
     
     evaluator_adaptive = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
         targets, config_adaptive, device=device, base_seed=42,
         adaptive_step=True,
         adaptive_config=config_adaptive.adaptive_config
