@@ -141,6 +141,7 @@ class OptimizationTargets:
         'mc_sst': (0.1, 2.0),    # MC to SST
         'pv_pv': (0.1, 5.0),     # Lateral PV inhibition
         'sst_pv': (0.1, 3.0),    # SST disinhibition
+        'pv_sst': (0.1, 2.0),    # PV-SST disinhibition
         'sst_sst': (0.1, 5.0),   # SST lateral inhibition
         'sst_mc': (0.1, 3.0),    # Moderate dendritic inhibition
         'pv_mc': (0.1, 5.0),     # Moderate inhibition of MC

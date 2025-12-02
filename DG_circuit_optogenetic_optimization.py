@@ -52,6 +52,14 @@ from gradient_adaptive_stepper import (
     update_circuit_with_adaptive_dt
 )
 
+# Store numpy.ndarray as JSON
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+    
 # ============================================================================
 # Random Seed Management
 # ============================================================================
@@ -164,6 +172,7 @@ class BatchOptogeneticEvaluator:
                  circuit_params: CircuitParams,
                  base_synaptic_params: PerConnectionSynapticParams,
                  opsin_params: OpsinParams,
+                 opsin_current: float,
                  targets: CombinedOptimizationTargets,
                  config: OptimizationConfig,
                  device: Optional[torch.device] = None,
@@ -190,6 +199,7 @@ class BatchOptogeneticEvaluator:
             circuit_params: CircuitParams instance
             base_synaptic_params: PerConnectionSynapticParams instance
             opsin_params: OpsinParams instance
+            opsin_current: Maximum optogenetic current (pA)
             targets: CombinedOptimizationTargets instance
             config: OptimizationConfig instance
             device: Device to run simulations on
@@ -211,6 +221,7 @@ class BatchOptogeneticEvaluator:
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
+        self.opsin_current = opsin_current
         self.targets = targets
         self.config = config
         self.device = device if device is not None else get_default_device()
@@ -253,12 +264,12 @@ class BatchOptogeneticEvaluator:
 
 
     def _generate_mec_input(self,
-                           batch_size: int,
-                           duration: float,
-                           dt: float,
-                           mec_current: float,
-                           mec_current_std: float,
-                           trial_index: int) -> torch.Tensor:
+                            batch_size: int,
+                            duration: float,
+                            dt: float,
+                            mec_current: float,
+                            mec_current_std: float,
+                            trial_index: int) -> torch.Tensor:
         """
         Generate MEC input pattern for a trial
 
@@ -317,9 +328,8 @@ class BatchOptogeneticEvaluator:
             return mec_input
 
     def _create_opsin_activation(self, 
-                                target_pop: str,
-                                layout,
-                                opsin_current: float) -> torch.Tensor:
+                                 target_pop: str,
+                                 layout) -> torch.Tensor:
         """
         Create opsin activation currents for target population
 
@@ -329,7 +339,6 @@ class BatchOptogeneticEvaluator:
         Args:
             target_pop: Target population name ('pv', 'sst', etc.)
             layout: SpatialLayout instance with cell positions
-            opsin_current: Maximum optogenetic current (pA)
 
         Returns:
             Activation currents for target population [n_cells]
@@ -350,7 +359,7 @@ class BatchOptogeneticEvaluator:
         activation_prob = opsin_expression.calculate_activation(target_positions, light_intensity)
 
         # Convert activation probability to optogenetic current
-        target_opto_current = activation_prob * opsin_current
+        target_opto_current = activation_prob * self.opsin_current
 
         return target_opto_current
     
@@ -387,7 +396,7 @@ class BatchOptogeneticEvaluator:
         
         # === COMBINE LOSSES ===
         total_losses = (self.targets.baseline_weight * baseline_losses + 
-                       self.targets.optogenetic_weight * opto_losses)
+                        self.targets.optogenetic_weight * opto_losses)
         
         return total_losses, {
             'baseline_losses': baseline_losses,
@@ -432,7 +441,6 @@ class BatchOptogeneticEvaluator:
         duration = self.config.warmup_duration + self.config.simulation_duration
         dt = self.circuit_params.dt
         n_steps = int(duration / dt)
-        
         for trial in range(self.config.n_trials):
             # Set seed for this trial (base_seed + trial_index)
             trial_seed = self.base_seed + trial
@@ -602,7 +610,7 @@ class BatchOptogeneticEvaluator:
         
         # Accumulate results over trials
         accumulated_details = {'pv': {}, 'sst': {}}
-        
+
         # Run multiple trials with different connectivity
         for trial in range(self.config.n_trials):
             # Set seed for this trial
@@ -670,9 +678,8 @@ class BatchOptogeneticEvaluator:
         batch_size = len(parameter_batch)
 
         # Optogenetic protocols to test
-        protocols = []
-        protocols.append(('pv', 200.0))
-        protocols.append(('sst', 200.0))
+        target_pops = ['pv', 'sst']
+
 
         # Storage for results
         total_opto_losses = torch.zeros(batch_size, device=self.device)
@@ -691,7 +698,7 @@ class BatchOptogeneticEvaluator:
 
             self.logger.info(f"  Opto trial {trial + 1}/{self.config.n_trials} (adaptive): seed {trial_seed}...")
 
-            for stim_pop, stim_intensity in protocols:
+            for stim_pop in target_pops:
                 # Create circuit WITHOUT compilation for adaptive stepping
                 circuit = BatchDentateCircuit(
                     batch_size=batch_size,
@@ -718,7 +725,7 @@ class BatchOptogeneticEvaluator:
                 # 3. Stimulation
 
                 stim_results = self._run_adaptive_optogenetic_simulation(
-                    circuit, mec_input, stim_pop, stim_intensity
+                    circuit, mec_input, stim_pop
                 )
 
                 opto_adaptive_stats.append(stim_results['adaptive_stats'])
@@ -727,7 +734,7 @@ class BatchOptogeneticEvaluator:
                 pop_losses = self._calculate_optogenetic_losses_batch(
                     stim_results['population_features'], stim_pop
                 )
-                
+
                 trial_losses += pop_losses
 
                 # Accumulate results for averaging
@@ -751,8 +758,8 @@ class BatchOptogeneticEvaluator:
                     torch.cuda.empty_cache()
 
             total_opto_losses += trial_losses
-                    
-         # Average over trials
+
+        # Average over trials
         total_opto_losses /= self.config.n_trials
         
         # Average accumulated details
@@ -773,7 +780,7 @@ class BatchOptogeneticEvaluator:
         return total_opto_losses, accumulated_details
 
 
-    def _run_adaptive_optogenetic_simulation(self, circuit, mec_input, target_pop, opsin_current=200.0):
+    def _run_adaptive_optogenetic_simulation(self, circuit, mec_input, target_pop):
         """
         Run optogenetic simulation with adaptive stepping
 
@@ -828,8 +835,7 @@ class BatchOptogeneticEvaluator:
         # Create opsin activation using shared helper method
         target_opto_current = self._create_opsin_activation(
             target_pop,
-            circuit.layout,
-            opsin_current
+            circuit.layout
         )
 
         # Adaptive simulation loop
@@ -878,22 +884,25 @@ class BatchOptogeneticEvaluator:
                 circuit, direct_activation, external_drive, dt_adaptive
             )
 
+            # Calculate interval end time for overlap detection
+            interval_end = state.current_time + dt_adaptive
+        
             # Interpolate to fixed grids for pre-stim and stim phases
             if state.step_index > 0:
                 # Check if we're in pre-stim phase
                 if state.current_time >= warmup_end and state.current_time <= pre_stim_end:
-                    self._interpolate_batch_to_grid_phase(
+                    self._interpolate_batch_to_grid(
                         activity_current, state.activity_prev,
-                        state.current_time, state.current_time + dt_adaptive,
-                        pre_stim_grid, pre_stim_storage, warmup_end
+                        state.current_time, interval_end,
+                        pre_stim_grid, pre_stim_storage
                     )
 
                 # Check if we're in stim phase
                 if state.current_time >= pre_stim_end and state.current_time <= stim_end:
-                    self._interpolate_batch_to_grid_phase(
+                    self._interpolate_batch_to_grid(
                         activity_current, state.activity_prev,
-                        state.current_time, state.current_time + dt_adaptive,
-                        stim_grid, stim_storage, pre_stim_end
+                        state.current_time, interval_end,
+                        stim_grid, stim_storage
                     )
             elif state.step_index == 0:
                 # First step: store initial condition if in recorded phase
@@ -974,49 +983,6 @@ class BatchOptogeneticEvaluator:
 
         return {'population_features': pop_features,
                 'adaptive_stats': state.get_statistics()}
-    
-    def _interpolate_batch_to_grid_phase(self, activity_current, activity_prev,
-                                         time_prev, time_current, time_grid, storage, phase_start):
-        """
-        Linear interpolation for batch data to fixed time grid for a specific phase
-
-        Similar to _interpolate_batch_to_grid but accounts for phase start time offset.
-
-        Args:
-            activity_current: Current activities
-            activity_prev: Previous activities
-            time_prev: Previous absolute time
-            time_current: Current absolute time
-            time_grid: Time grid for this phase (relative to phase start)
-            storage: Storage dict for this phase
-            phase_start: Absolute time when this phase starts
-        """
-        # Convert grid times to absolute times
-        absolute_grid = time_grid + phase_start
-
-        mask = (absolute_grid > time_prev) & (absolute_grid <= time_current)
-        grid_indices = torch.where(mask)[0]
-
-        if len(grid_indices) == 0:
-            return
-
-        dt_step = time_current - time_prev
-
-        for grid_idx in grid_indices:
-            grid_idx_item = grid_idx.item()
-            grid_time = absolute_grid[grid_idx_item].item()
-
-            if dt_step > 1e-9:
-                alpha = (grid_time - time_prev) / dt_step
-            else:
-                alpha = 1.0
-
-            # Interpolate for batch: [batch, neurons]
-            for pop_name in activity_current.keys():
-                if pop_name in storage and pop_name in activity_prev:
-                    interpolated = ((1.0 - alpha) * activity_prev[pop_name] + 
-                                   alpha * activity_current[pop_name])
-                    storage[pop_name][:, :, grid_idx_item] = interpolated    
 
 
     def _simulate_batch_optogenetic_stimulation(self,
@@ -1028,8 +994,7 @@ class BatchOptogeneticEvaluator:
                                                 stim_start: float = 1000.0,
                                                 stim_duration: float = 2000.0,
                                                 post_duration: float = 250.0,
-                                                warmup: float = 500.0,
-                                                opsin_current: float = 200.0) -> Dict[str, torch.Tensor]:
+                                                warmup: float = 500.0) -> Dict[str, torch.Tensor]:
         """
         Run optogenetic stimulation for a batch of parameter sets
 
@@ -1045,7 +1010,6 @@ class BatchOptogeneticEvaluator:
             stim_duration: Stimulation duration (ms)
             post_duration: Post-stimulation period (ms)
             warmup: Pre-stimulation warmup (ms)
-            opsin_current: Optogenetic current amplitude (pA)
 
         Returns:
             Dict with baseline and stimulation statistics for each population
@@ -1072,8 +1036,7 @@ class BatchOptogeneticEvaluator:
         # Create opsin activation using shared helper method
         target_opto_current = self._create_opsin_activation(
             target_pop, 
-            circuit.layout, 
-            opsin_current
+            circuit.layout
         )
 
         # Generate MEC input pattern
@@ -1224,7 +1187,7 @@ class BatchOptogeneticEvaluator:
         losses = torch.zeros(batch_size, device=self.device)
         
         opto_targets = self.targets.optogenetic_targets
-        
+
         # Target rate increases
         if target_pop in opto_targets.target_rate_increases:
             for affected_pop, target_fraction in opto_targets.target_rate_increases[target_pop].items():
@@ -1652,7 +1615,8 @@ class OptogeneticEvaluationStrategy(ABC):
 class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
     """Sequential evaluation for gradient-based or single evaluations"""
     
-    def __init__(self, circuit_params, base_synaptic_params, opsin_params,
+    def __init__(self, circuit_params, base_synaptic_params,
+                 opsin_params, opsin_current,
                  targets, config, device, base_seed=42,
                  adaptive_step=False, adaptive_config=None,
                  verbose=False,
@@ -1670,6 +1634,7 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
+        self.opsin_current = opsin_current
         self.targets = targets
         self.config = config
         self.device = device
@@ -1697,7 +1662,8 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
         for params in parameter_sets:
             # Use batch evaluator with batch_size=1
             evaluator = BatchOptogeneticEvaluator(
-                self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                self.circuit_params, self.base_synaptic_params,
+                self.opsin_params, self.opsin_current,
                 self.targets, self.config, device=self.device, base_seed=self.base_seed,
                 adaptive_step=self.adaptive_step,
                 adaptive_config=self.adaptive_config,
@@ -1771,7 +1737,8 @@ class OptogeneticSequentialStrategy(OptogeneticEvaluationStrategy):
 class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
     """Batch GPU evaluation for population-based optimization"""
     
-    def __init__(self, circuit_params, base_synaptic_params, opsin_params,
+    def __init__(self, circuit_params, base_synaptic_params,
+                 opsin_params, opsin_current,
                  targets, config, device, base_seed=42, verbose=False,
                  use_time_varying_mec=False,
                  mec_pattern_type='oscillatory',
@@ -1788,6 +1755,7 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
+        self.opsin_currenet = opsin_current
         self.targets = targets
         self.config = config
         self.device = device
@@ -1796,7 +1764,8 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
         
         # Create evaluator
         self.evaluator = BatchOptogeneticEvaluator(
-            circuit_params, base_synaptic_params, opsin_params,
+            circuit_params, base_synaptic_params,
+            opsin_params, opsin_current,
             targets, config, device=device, base_seed=base_seed,
             verbose=self.verbose,
             # Pass MEC pattern parameters
@@ -1882,7 +1851,8 @@ class OptogeneticBatchGPUStrategy(OptogeneticEvaluationStrategy):
 class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
     """Multiprocess CPU evaluation for population-based optimization"""
     
-    def __init__(self, circuit_params, base_synaptic_params, opsin_params,
+    def __init__(self, circuit_params, base_synaptic_params,
+                 opsin_params, opsin_current,
                  targets, config, device, n_workers=None, n_threads_per_worker=1,
                  base_seed=42, adaptive_step=False, adaptive_config=False, verbose=False,
                  use_time_varying_mec=False,
@@ -1899,6 +1869,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
+        self.opsin_current = opsin_current
         self.targets = targets
         self.config = config
         self.device = device
@@ -1939,6 +1910,7 @@ class OptogeneticMultiprocessCPUStrategy(OptogeneticEvaluationStrategy):
                 'distribution': base_synaptic_params.distribution,
             },
             opsin_params,
+            opsin_current,
             # MEC pattern parameters
             {
                 'use_time_varying_mec': use_time_varying_mec,
@@ -1996,7 +1968,7 @@ def _optogenetic_worker_evaluate(args):
      targets, config, base_seed, adaptive_step, adaptive_config, verbose) = args
     
     device = torch.device('cpu')
-    circuit_params, base_synaptic_params_dict, opsin_params, mec_pattern_params = worker_data
+    circuit_params, base_synaptic_params_dict, opsin_params, opsin_current, mec_pattern_params = worker_data
     
     # Create synaptic params
     synaptic_params = PerConnectionSynapticParams(
@@ -2010,7 +1982,8 @@ def _optogenetic_worker_evaluate(args):
     
     # Create evaluator with base seed
     evaluator = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params,
+        opsin_params, opsin_current,
         targets, config, device=device, base_seed=base_seed,
         adaptive_step=adaptive_step,
         adaptive_config=adaptive_config,
@@ -2059,6 +2032,7 @@ class OptogeneticCircuitOptimizer:
                  circuit_params: CircuitParams,
                  base_synaptic_params: PerConnectionSynapticParams,
                  opsin_params: OpsinParams,
+                 opsin_current: float,
                  targets: CombinedOptimizationTargets,
                  config: OptimizationConfig,
                  device: Optional[torch.device] = None,
@@ -2067,6 +2041,7 @@ class OptogeneticCircuitOptimizer:
         self.circuit_params = circuit_params
         self.base_synaptic_params = base_synaptic_params
         self.opsin_params = opsin_params
+        self.opsin_current = opsin_current
         self.targets = targets
         self.config = config
         self.base_seed = base_seed
@@ -2131,7 +2106,8 @@ class OptogeneticCircuitOptimizer:
 
         if method == 'gradient':
             strategy = OptogeneticSequentialStrategy(
-                self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                self.circuit_params, self.base_synaptic_params,
+                self.opsin_params, self.opsin_current,
                 self.targets, self.config, self.device, base_seed=self.base_seed,
                 adaptive_step=adaptive_step,
                 adaptive_config=adaptive_config,
@@ -2142,14 +2118,16 @@ class OptogeneticCircuitOptimizer:
         elif method in ['particle_swarm', 'genetic_algorithm']:
             if self.device.type == 'cuda':
                 strategy = OptogeneticBatchGPUStrategy(
-                    self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                    self.circuit_params, self.base_synaptic_params,
+                    self.opsin_params, self.opsin_current,
                     self.targets, self.config, self.device, base_seed=self.base_seed,
                     verbose=True,
                     **mec_params
                 )
             else:
                 strategy = OptogeneticMultiprocessCPUStrategy(
-                    self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                    self.circuit_params, self.base_synaptic_params,
+                    self.opsin_params, self.opsin_current,
                     self.targets, self.config, self.device,
                     n_workers=kwargs.get('n_workers', None),
                     n_threads_per_worker=kwargs.get('n_threads_per_worker', 1),
@@ -2167,7 +2145,8 @@ class OptogeneticCircuitOptimizer:
                     "Use CPU or try 'particle_swarm' for GPU optimization."
                 )
             strategy = OptogeneticMultiprocessCPUStrategy(
-                self.circuit_params, self.base_synaptic_params, self.opsin_params,
+                self.circuit_params, self.base_synaptic_params,
+                self.opsin_params, self.opsin_current,
                 self.targets, self.config, self.device,
                 n_workers=kwargs.get('n_workers', None),
                 n_threads_per_worker=kwargs.get('n_threads_per_worker', 1),
@@ -2412,7 +2391,8 @@ class OptogeneticCircuitOptimizer:
         
         # Create evaluator for detailed diagnostics
         evaluator = BatchOptogeneticEvaluator(
-            self.circuit_params, self.base_synaptic_params, self.opsin_params,
+            self.circuit_params, self.base_synaptic_params,
+            self.opsin_params, self.opsin_current,
             self.targets, self.config, device=self.device, base_seed=self.base_seed,
             verbose=True
         )
@@ -2521,7 +2501,10 @@ class OptogeneticCircuitOptimizer:
                 'base_seed': self.base_seed,
                 'baseline_weight': self.targets.baseline_weight,
                 'optogenetic_weight': self.targets.optogenetic_weight,
-                'n_trials': self.config.n_trials
+                'n_trials': self.config.n_trials,
+                'mec_current': self.config.mec_drive_levels[0],
+                'mec_current_std': self.config.mec_drive_std
+                
             },
             'targets': {
                 'baseline_rates': self.targets.target_rates,
@@ -2532,14 +2515,25 @@ class OptogeneticCircuitOptimizer:
                 }
             },
             'optimized_parameters': {
-                'connection_modulation': self.best_params
+                'connection_modulation': self.best_params,
+                'base_conductances': {
+                    'ampa_g_mean': self.base_synaptic_params.ampa_g_mean,
+                    'ampa_g_std': self.base_synaptic_params.ampa_g_std,
+                    'ampa_g_min': self.base_synaptic_params.ampa_g_min,
+                    'ampa_g_max': self.base_synaptic_params.ampa_g_max,
+                    
+                    'gaba_g_mean': self.base_synaptic_params.gaba_g_mean,
+                    'gaba_g_std': self.base_synaptic_params.gaba_g_std,
+                    'gaba_g_min': self.base_synaptic_params.gaba_g_min,
+                    'gaba_g_max': self.base_synaptic_params.gaba_g_max
+                }
             },
             'best_configuration_metadata': self.best_metadata,  # Include metadata
             'history': self.history
         }
         
         with open(filename, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=NumpyEncoder)
         
         self.logger.info(f"\nResults saved to {filename}")
 
@@ -2560,6 +2554,7 @@ def run_global_optimization(optimization_config,
                             output_file="DG_optogenetic_optimization_results.json",
                             adaptive_step: bool = False,
                             adaptive_config: Optional[GradientAdaptiveStepConfig] = None,
+                            opsin_current: float = 150.0,
                             # MEC pattern parameters
                             use_time_varying_mec: bool = False,
                             mec_pattern_type: str = 'oscillatory',
@@ -2653,7 +2648,7 @@ def run_global_optimization(optimization_config,
     
     # Create optimizer
     optimizer = OptogeneticCircuitOptimizer(
-        circuit_params, base_synaptic_params, opsin_params,
+        circuit_params, base_synaptic_params, opsin_params, opsin_current,
         targets, optimization_config, device=device, base_seed=base_seed
     )
     

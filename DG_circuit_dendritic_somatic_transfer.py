@@ -90,12 +90,24 @@ class SynapticStateManager:
             
             if synapse_type == 'excitatory':
 
+                #if pre_pop == 'gc' and post_pop == 'mc':
+                #    print(f"{pre_pop} -> {post_pop} pre rates range: {torch.min(pre_rates)} {torch.max(pre_rates)}")
+                #    print(f"{pre_pop} -> {post_pop} synaptic input shape: {synaptic_input.shape}")
+                #    print(f"{pre_pop} -> {post_pop} synaptic input range: {torch.min(synaptic_input)} {torch.max(synaptic_input)}")
+                #    for i in range(synaptic_input.shape[1]):
+                #        print(f"{pre_pop} -> {post_pop} {i} synaptic input: {synaptic_input[:,i][torch.nonzero(synaptic_input[:,i])]}")
+                        
+                        
                 # Update AMPA conductances
                 states['ampa_conductance'] = (
                     ampa_decay * states['ampa_conductance'] + 
                     (1 - ampa_decay) * synaptic_input * (1 - self.synaptic_params.nmda_fraction)
                 )
-                
+
+                #if pre_pop == 'gc' and post_pop == 'mc':
+                #    print(f"{pre_pop} -> {post_pop} ampa conductance shape: {states['ampa_conductance'].shape}")
+                #    print(f"{pre_pop} -> {post_pop} ampa conductance: {states['ampa_conductance']}")
+
                 # Update NMDA conductances 
                 states['nmda_conductance'] = (
                     nmda_decay * states['nmda_conductance'] + 
@@ -248,11 +260,14 @@ def generate_conductance_distribution(n_connections: int,
         conductances = torch.normal(modulated_mean, modulated_std, (n_connections,), device=device)
         
     elif distribution == 'lognormal':
-        mean_log = math.log(modulated_mean**2 / math.sqrt(modulated_mean**2 + modulated_std**2))
-        std_log = math.sqrt(math.log(1 + (modulated_std/modulated_mean)**2))
+        if modulated_mean > 0.0:
+            mean_log = math.log(modulated_mean**2 / math.sqrt(modulated_mean**2 + modulated_std**2))
+            std_log = math.sqrt(math.log(1 + (modulated_std/modulated_mean)**2))
         
-        log_conductances = torch.normal(mean_log, std_log, (n_connections,), device=device)
-        conductances = torch.exp(log_conductances)
+            log_conductances = torch.normal(mean_log, std_log, (n_connections,), device=device)
+            conductances = torch.exp(log_conductances)
+        else:
+            conductances = torch.zeros((n_connections,))
         
     elif distribution == 'gamma':
         scale = modulated_std**2 / modulated_mean
@@ -267,7 +282,7 @@ def generate_conductance_distribution(n_connections: int,
     
     # Clamp to physiologically reasonable bounds
     conductances = torch.clamp(conductances, min_conductance, max_conductance)
-    
+
     return conductances
 
 
@@ -285,7 +300,7 @@ class CircuitParams:
     
     # Local connection probabilities (GC -> local targets)
     p_gc_mc_local: float = 0.04    # GC to nearby MC
-    p_gc_pv_local: float = 0.15    # GC to nearby PV
+    p_gc_pv_local: float = 0.18    # GC to nearby PV
     p_gc_sst_local: float = 0.06   # GC to nearby SST
     
     # MC connection probabilities
@@ -296,7 +311,7 @@ class CircuitParams:
     p_mc_mc_distant: float = 0.02    # MC to distant MC
     
     # MEC connection probabilities (from Hainmueller et al.)
-    p_mec_gc: float = 0.025         # Perforant path to GC
+    p_mec_gc: float = 0.125         # Perforant path to GC
     p_mec_mc: float = 0.0          # Assuming no direct MEC -> MC
     p_mec_pv: float = 0.019        # Direct MEC -> PV (1.91% from paper)
     p_mec_sst: float = 0.0         # NO direct MEC -> SST (key asymmetry!)
@@ -305,11 +320,11 @@ class CircuitParams:
     p_pv_gc: float = 0.05          # PV feedback inhibition
     p_pv_mc: float = 0.1           # PV to MC inhibition
     p_pv_pv: float = 0.11          # PV lateral inhibition
-    p_pv_sst: float = 0.02          
+    p_pv_sst: float = 0.025          
     p_sst_gc: float = 0.04         # SST dendritic inhibition
     p_sst_mc: float = 0.3          # SST to MC inhibition
-    p_sst_pv: float = 0.05         # SST to PV feedback
-    p_sst_sst: float = 0.0         # SST to SST feedback
+    p_sst_pv: float = 0.12         # SST to PV feedback
+    p_sst_sst: float = 0.05        # SST to SST feedback
     
     # Population heterogeneity for competition
     pv_subpop_ratio: float = 0.6   # Fraction in "fast" PV subpopulation
@@ -479,6 +494,10 @@ class ConnectivityMatrix:
                         self.synaptic_params.connection_modulation.get(conn_name, 1.0),
                         device=self.device
                     )
+
+                #if pre_pop == 'gc' and post_pop == 'mc':
+                #    print(f"{pre_pop} -> {post_pop} connectivity shape: {connectivity.shape}")
+                #    print(f"{pre_pop} -> {post_pop} conductance range: {torch.min(base_conductances)} / {torch.max(base_conductances)}")
                 
                 # Map conductances back to full matrix
                 conductances = torch.zeros_like(connectivity)
@@ -585,7 +604,7 @@ class DentateCircuit(nn.Module):
         self.circuit_params = circuit_params
         self.synaptic_params = synaptic_params
         self.opsin_params = opsin_params
-
+        
         # Create spatial layout and connectivity
         self.layout = SpatialLayout(circuit_params, device=self.device)
         self.connectivity = ConnectivityMatrix(
@@ -765,11 +784,18 @@ class DentateCircuit(nn.Module):
                     total_ampa += conductances['ampa']
                     total_gaba += conductances['gaba']
                     total_nmda += conductances['nmda']
+                    #print(f"{conn_name}: sum(conductances['ampa']) = {torch.sum(conductances['ampa'], axis=1)}")
+                    #if pop == 'sst':
+                    #    print(f"{conn_name}: sum(conductances['gaba']) = {torch.sum(conductances['gaba'])}")
 
-           # Add direct activation as additional AMPA-like conductance
+            # Add direct activation as additional AMPA-like conductance
             direct_current = direct_activation.get(pop, torch.zeros_like(current_activity))
             direct_conductance = torch.clamp(direct_current / 70.0, min=0.0)
             total_ampa += direct_conductance
+
+            #if pop == 'sst':
+            #    print(f"{pop}: total_ampa = {torch.round(total_ampa, decimals=1)}")
+            #    print(f"{pop}: total_gaba = {torch.round(total_gaba, decimals=1)}")
             
             # Apply conductance-based dendritic-somatic transfer
             params = self.dendritic_params[pop]
@@ -777,7 +803,12 @@ class DentateCircuit(nn.Module):
                 self._dendritic_somatic_transfer(
                     total_ampa, total_gaba, total_nmda, params, adaptation_state
                 )
-
+            #if pop == 'sst':
+            #    print(f"{pop}: mean activity = {torch.mean(new_activity_tensor)}")
+            #else:
+            #if pop == 'sst':
+            #    print(f"{pop}: activity = {new_activity_tensor}")
+                
             # Update state variables
             if pop == 'gc':
                 self.gc_activity = new_activity_tensor
@@ -1139,7 +1170,7 @@ def test_circuit(device: Optional[torch.device] = None,
     }
     
     external_drive = {
-        'mec': torch.randn(circuit_params.n_mec, device=device) * 100.0
+        'mec': torch.randn(circuit_params.n_mec, device=device) * 28.0
     }
     
     # Run simulation
