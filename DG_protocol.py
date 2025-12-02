@@ -451,7 +451,6 @@ class OptogeneticExperiment:
 
             # Create modified synaptic parameters
             self.synaptic_params = self._create_optimized_synaptic_params()
-
             return True
 
         except FileNotFoundError:
@@ -480,12 +479,12 @@ class OptogeneticExperiment:
 
         # Create synaptic parameters with optimized values
         optimized_params = PerConnectionSynapticParams(
-            ampa_g_mean=base_conductances.get('ampa_g_mean', 0.15),
-            ampa_g_std=base_conductances.get('ampa_g_std', 0.05),
+            ampa_g_mean=base_conductances.get('ampa_g_mean', 0.2),
+            ampa_g_std=base_conductances.get('ampa_g_std', 0.04),
             ampa_g_min=base_conductances.get('ampa_g_min', 0.01),
             ampa_g_max=base_conductances.get('ampa_g_max', 1.5),
             gaba_g_mean=base_conductances.get('gaba_g_mean', 0.25),
-            gaba_g_std=base_conductances.get('gaba_g_std', 0.08),
+            gaba_g_std=base_conductances.get('gaba_g_std', 0.04),
             gaba_g_min=base_conductances.get('gaba_g_min', 0.01),
             gaba_g_max=base_conductances.get('gaba_g_max', 1.5),
             distribution=base_conductances.get('distribution', 'lognormal'),
@@ -1578,7 +1577,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                                         n_trials, base_seed)
         save_path = Path("protocol") / default_filename
         save_experiment_results(results, conn_analysis, conductance_analysis,
-                               str(save_path), metadata)
+                                str(save_path), metadata)
     
     return results, conn_analysis, conductance_analysis
 

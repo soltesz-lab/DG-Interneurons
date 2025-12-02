@@ -40,6 +40,7 @@ def setup_test_environment():
     circuit_params = CircuitParams()
     synaptic_params = PerConnectionSynapticParams()
     opsin_params = OpsinParams()
+    opsin_current = 100.0
     
     # Create combined targets
     base_targets = create_default_targets()
@@ -52,7 +53,7 @@ def setup_test_environment():
         optogenetic_weight=2.0
     )
     
-    return device, circuit_params, synaptic_params, opsin_params, targets
+    return device, circuit_params, synaptic_params, opsin_params, opsin_current, targets
 
 
 def test_sequential_strategy_adaptive():
@@ -61,7 +62,7 @@ def test_sequential_strategy_adaptive():
     print("Sequential Strategy with Adaptive Stepping")
     print("="*80)
     
-    device, circuit_params, synaptic_params, opsin_params, targets = setup_test_environment()
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
     
     # Create parameter set
     param_set = [synaptic_params.connection_modulation]
@@ -76,9 +77,9 @@ def test_sequential_strategy_adaptive():
         mec_drive_std=1.0,
         adaptive_step=False
     )
-    
+
     evaluator_fixed = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params, opsin_params, opsin_current,
         targets, config_fixed, device=device, base_seed=42,
         adaptive_step=False
     )
@@ -112,7 +113,7 @@ def test_sequential_strategy_adaptive():
     )
     
     evaluator_adaptive = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params, opsin_params, opsin_current,
         targets, config_adaptive, device=device, base_seed=42,
         adaptive_step=True,
         adaptive_config=config_adaptive.adaptive_config
@@ -157,7 +158,7 @@ def test_batch_strategies_adaptive():
     print("Batch Strategies with Adaptive Stepping")
     print("="*80)
     
-    device, circuit_params, synaptic_params, opsin_params, targets = setup_test_environment()
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
     
     # Create parameter batch
     param_batch = [
@@ -181,7 +182,7 @@ def test_batch_strategies_adaptive():
     )
     
     evaluator_fixed = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params, opsin_params, opsin_current,
         targets, config_fixed, device=device, base_seed=42,
         adaptive_step=False
     )
@@ -213,7 +214,7 @@ def test_batch_strategies_adaptive():
     )
     
     evaluator_adaptive = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params, opsin_params, opsin_current,
         targets, config_adaptive, device=device, base_seed=42,
         adaptive_step=True,
         adaptive_config=config_adaptive.adaptive_config
@@ -248,7 +249,7 @@ def test_multi_trial_consistency():
     print("Multi-trial Consistency")
     print("="*80)
     
-    device, circuit_params, synaptic_params, opsin_params, targets = setup_test_environment()
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
     
     param_set = [synaptic_params.connection_modulation]
     
@@ -268,7 +269,7 @@ def test_multi_trial_consistency():
     )
     
     evaluator = BatchOptogeneticEvaluator(
-        circuit_params, synaptic_params, opsin_params,
+        circuit_params, synaptic_params, opsin_params, opsin_current,
         targets, config, device=device, base_seed=42,
         adaptive_step=True,
         adaptive_config=config.adaptive_config
@@ -299,7 +300,7 @@ def test_reproducibility():
     print("Reproducibility Test")
     print("="*80)
     
-    device, circuit_params, synaptic_params, opsin_params, targets = setup_test_environment()
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
     
     param_set = [synaptic_params.connection_modulation]
     
@@ -367,7 +368,7 @@ def test_optimizer_integration():
     print("Full Optimizer Integration")
     print("="*80)
     
-    device, circuit_params, synaptic_params, opsin_params, targets = setup_test_environment()
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
     
     print("\nRunning mini-optimization with adaptive stepping...")
     print("(This tests the full optimizer pipeline)")
@@ -429,7 +430,7 @@ def test_performance_benchmark():
     print("Performance Benchmark")
     print("="*80)
     
-    device, circuit_params, synaptic_params, opsin_params, targets = setup_test_environment()
+    device, circuit_params, synaptic_params, opsin_params, opsin_current, targets = setup_test_environment()
     
     param_batch = [
         synaptic_params.connection_modulation,
