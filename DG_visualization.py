@@ -10,14 +10,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import seaborn as sns
 from matplotlib.collections import LineCollection
 from matplotlib.patches import FancyBboxPatch
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 import networkx as nx
 from typing import Dict, Tuple, List, Optional, Union
 import torch
 from dataclasses import dataclass
-#import colorcet as cc
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -581,17 +583,18 @@ class DGCircuitVisualization:
 
         return fig, activity_history
 
+    
     def plot_activity_raster(self, activity_trace, vmin=0, vmax=None, 
                              mean_linewidth=2.5, cmap='coolwarm', save_path=None,
                              split_populations=None, direct_activation=None,
-                             activation_cmap='plasma', activation_width=0.015):
+                             activation_cmap='plasma', activation_bar_width=None):
         """
         Plot circuit activity as raster plots with neurons sorted by mean firing rate
 
         Each neuron's activity is shown as a row in a heatmap, with color indicating
         firing rate. Neurons are ordered by mean firing rate (highest at top).
         Population mean firing rate is superimposed as a line trace.
-        Optionally shows direct current injection as a color-coded vertical bar.
+        Optionally shows direct current injection as color-coded rectangles.
 
         Args:
             activity_trace: Dictionary with population keys, each containing array of shape (n_cells, timesteps)
@@ -606,7 +609,7 @@ class DGCircuitVisualization:
             direct_activation: Dict mapping population names to arrays of current injection values (n_cells,).
                                Only populations with direct activation need to be included.
             activation_cmap: Colormap name for direct activation visualization (default: 'plasma')
-            activation_width: Width of activation bar as fraction of figure width (default: 0.08)
+            activation_bar_width: Width of activation bar in time units (default: 5% of time range)
         """
         # Determine number of timesteps
         timesteps = None
@@ -673,7 +676,7 @@ class DGCircuitVisualization:
                                             title_suffix=f' - {part1_label}',
                                             direct_activation=activation_part1,
                                             activation_cmap=activation_cmap,
-                                            activation_width=activation_width)
+                                            activation_bar_width=activation_bar_width)
                     panel_idx += 1
 
                 # Plot Part 2
@@ -686,7 +689,7 @@ class DGCircuitVisualization:
                                              title_suffix=f' - {part2_label}',
                                              direct_activation=activation_part2,
                                              activation_cmap=activation_cmap,
-                                             activation_width=activation_width)
+                                             activation_bar_width=activation_bar_width)
                     panel_idx += 1
 
                 # Store combined mean activity
@@ -698,7 +701,7 @@ class DGCircuitVisualization:
                                          vmin, vmax, cmap, mean_linewidth,
                                          direct_activation=activation_data,
                                          activation_cmap=activation_cmap,
-                                         activation_width=activation_width)
+                                         activation_bar_width=activation_bar_width)
                 activity_history[pop] = np.mean(activity_data, axis=0).tolist()
                 panel_idx += 1
 
@@ -715,13 +718,12 @@ class DGCircuitVisualization:
 
         return fig, activity_history
 
-
     def _plot_single_raster(self, ax, activity_data, time_axis, pop, 
                             vmin, vmax, cmap, mean_linewidth, title_suffix='',
                             direct_activation=None, activation_cmap='plasma',
-                            activation_width=0.015, sort_by_activity=False):
+                            activation_bar_width=None, sort_by_activity=False):
         """
-        Helper method to plot a single raster panel
+        Helper method to plot a single raster panel with Rectangle patches for activation
 
         Args:
             ax: Matplotlib axis to plot on
@@ -734,7 +736,8 @@ class DGCircuitVisualization:
             title_suffix: Optional suffix for title (e.g., ' - Stimulated')
             direct_activation: Optional array of current injection values (n_cells,)
             activation_cmap: Colormap name for activation visualization
-            activation_width: Width of activation bar as fraction of axis width
+            activation_bar_width: Width of activation bar in time units (None for auto)
+            sort_by_activity: Whether to sort neurons by mean activity
         """
         n_cells = activity_data.shape[0]
 
@@ -756,59 +759,67 @@ class DGCircuitVisualization:
                 sorted_activation = direct_activation[sorted_indices]
             else:
                 sorted_activation = direct_activation
-            
 
         # Determine colormap range for activity
         vmax_pop = vmax if vmax is not None else np.percentile(sorted_activity, 99)
 
-        # Create activation bar axis if needed
+        # Calculate activation bar parameters
+        time_range = time_axis[-1] - time_axis[0]
+        if activation_bar_width is None:
+            bar_width = time_range * 0.05  # 5% of time range
+        else:
+            bar_width = activation_bar_width
+        
+        bar_gap = time_range * 0.01  # 1% gap between bar and raster
+        bar_x_start = time_axis[0] - bar_width - bar_gap
+
+        # Draw activation rectangles if provided
         if sorted_activation is not None:
-            # Get current axis position
-            pos = ax.get_position()
-
-            # Create narrow axis for activation bar immediately to the left of main axis
-            spacing = 0.0025  # Minimal spacing between activation bar and main plot
-            activation_ax = ax.figure.add_axes([pos.x0 - activation_width - spacing, 
-                                               pos.y0, 
-                                               activation_width, 
-                                               pos.height])
-
-            # Determine activation colormap range
+            # Normalize activation values for colormap
             activation_vmin = np.min(sorted_activation)
             activation_vmax = np.max(sorted_activation)
+            
+            if activation_vmax > activation_vmin:
+                norm = Normalize(vmin=activation_vmin, vmax=activation_vmax)
+                cmap_obj = plt.get_cmap(activation_cmap)
+                
+                # Draw one rectangle per neuron
+                for i in range(n_cells):
+                    activation_value = sorted_activation[i]
+                    color = cmap_obj(norm(activation_value))
+                    
+                    # Rectangle positioned at y=i with height=1.0 to match raster row
+                    rect = Rectangle(xy=(bar_x_start, i), 
+                                   width=bar_width, 
+                                   height=1.0,
+                                   facecolor=color, 
+                                   edgecolor='none',
+                                   zorder=10)
+                    ax.add_patch(rect)
+                
+                # Add colorbar for activation using ScalarMappable
+                sm = ScalarMappable(cmap=cmap_obj, norm=norm)
+                sm.set_array([])
+                
+                # Create inset axis for activation colorbar (positioned outside main plot)
+                cbar_ax = inset_axes(ax, 
+                                    width="2%",  
+                                    height="30%",
+                                    loc='upper left',
+                                    bbox_to_anchor=(-0.25, 0.05, 1, 1),  # Negative x moves it outside
+                                    bbox_transform=ax.transAxes,
+                                    borderpad=0)
 
-            # Plot activation as vertical bar (2D heatmap with single column)
-            activation_2d = sorted_activation.reshape(-1, 1)
+                cbar_activation = plt.colorbar(sm, cax=cbar_ax, orientation='vertical')
+                cbar_activation.set_label('Input\nCurrent\n(nA)', 
+                                        fontsize=8, 
+                                        rotation=0,
+                                        ha='center',
+                                        va='bottom',
+                                        labelpad=10)
+                cbar_activation.ax.tick_params(labelsize=7)
 
-            im_activation = activation_ax.imshow(activation_2d,
-                                                 aspect='auto',
-                                                 cmap=activation_cmap,
-                                                 vmin=activation_vmin,
-                                                 vmax=activation_vmax,
-                                                 interpolation='nearest',
-                                                 extent=[0, 1, n_cells, 0])
-
-            # Configure activation axis
-            activation_ax.set_ylabel('')
-            activation_ax.set_xlabel('')
-            activation_ax.set_xticks([])
-            activation_ax.set_yticks([])
-            activation_ax.set_title('Activation\nCurrent', fontsize=8, pad=2)
-
-            # Add horizontal colorbar below the activation bar
-            cbar_height = 0.02  # Height of colorbar
-            cbar_bottom_offset = 0.03  # Space below activation axis
-
-            cbar_ax = ax.figure.add_axes([pos.x0 - activation_width - spacing,
-                                          pos.y0 - cbar_bottom_offset - cbar_height,
-                                          activation_width,
-                                          cbar_height])
-
-            cbar_activation = plt.colorbar(im_activation, cax=cbar_ax, 
-                                           orientation='horizontal')
-            cbar_activation.set_label('nA', fontsize=8, labelpad=2)
-            cbar_activation.ax.tick_params(labelsize=7)
-
+                
         # Plot raster as heatmap on main axis
         im = ax.imshow(sorted_activity, 
                        aspect='auto',
@@ -820,10 +831,15 @@ class DGCircuitVisualization:
                        alpha=0.6,
                        zorder=1)
 
+        # Adjust x-limits to show activation bar
+        if sorted_activation is not None:
+            ax.set_xlim([bar_x_start, time_axis[-1]])
+        else:
+            ax.set_xlim([time_axis[0], time_axis[-1]])
+
         # Configure primary axis (raster)
         ax.set_xlabel('Time (ms)')
-        if sorted_activation is None:
-            ax.set_ylabel('Neuron Index\n(sorted by activity)')
+        ax.set_ylabel('Neuron Index\n(sorted by activity)')
 
         # Add activation indicator to title if present
         title_prefix = f'{pop.upper()} Activity Raster'
@@ -831,7 +847,7 @@ class DGCircuitVisualization:
             title_prefix += ' [with input current]'
         ax.set_title(f'{title_prefix}{title_suffix}\n({n_cells} cells)')
 
-        # Add colorbar with proper spacing
+        # Add colorbar for activity with proper spacing
         cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.08)
         cbar.set_label('Firing Rate (Hz)', rotation=270, labelpad=20)
 
@@ -864,7 +880,7 @@ class DGCircuitVisualization:
         ax2.set_yticks([])
 
         # Add grid on primary axis
-        ax.grid(False)    
+        ax.grid(False)
     
     def plot_network_graph(self, connection_types=None, layout_type='spring',
                           node_size_scale=1.0, save_path=None):
