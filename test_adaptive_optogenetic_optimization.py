@@ -351,10 +351,10 @@ def test_reproducibility():
     # Allow small numerical differences due to floating point
     tolerance = 1e-4
     if diff < tolerance:
-        print(f"  O Results are reproducible (diff < {tolerance})")
+        print(f"  Results are reproducible (diff < {tolerance})")
         passed = True
     else:
-        print(f"  X Results differ by more than tolerance {tolerance}")
+        print(f"  Results differ by more than tolerance {tolerance}")
         passed = False
     
     if passed:
@@ -716,12 +716,12 @@ def test_optimization_protocol_consistency():
         issues.append(f"Opto effects differ by up to {max_effect_diff_pct:.1f}% (threshold: {EFFECT_TOLERANCE}%)")
     
     if not issues:
-        print("\nO PASSED: Optimization and Protocol evaluators produce consistent results")
+        print("\n Optimization and Protocol evaluators produce consistent results")
         print(f"  Max rate difference: {max_rate_diff_pct:.1f}%")
         print(f"  Max effect difference: {max_effect_diff_pct:.1f}%")
         passed = True
     else:
-        print("\nX FAILED: Significant discrepancies detected:")
+        print("\nSignificant discrepancies detected:")
         for issue in issues:
             print(f"  - {issue}")
         

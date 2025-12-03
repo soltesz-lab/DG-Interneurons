@@ -415,6 +415,7 @@ class OptogeneticExperiment:
         # Create initial circuit (will be recreated for each trial if regenerate_connectivity is True)
         self.circuit = self._create_circuit(base_seed)
         self.opsin_expression = {}
+        self.mec_input = None
  
         print(f"OptogeneticExperiment initialized on device: {self.device}")
         print(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
@@ -540,7 +541,7 @@ class OptogeneticExperiment:
         """
         Simulate optogenetic stimulation experiment with MEC drive
         
-        Now supports multi-trial averaging with different connectivity
+        Supports multi-trial averaging with different connectivity.
         
         Args:
             target_population: Population to stimulate ('pv', 'sst', etc.)
@@ -591,7 +592,32 @@ class OptogeneticExperiment:
                 print(f"  Creating opsin expression...")
                 self.opsin_expression[target_population] = self.create_opsin_expression(target_population)
 
-                
+            duration = stim_start + stim_duration + post_duration
+            storage_dt = self.circuit_params.dt
+
+            if self.use_time_varying_mec:
+                mec_input = generate_time_varying_mec_pattern(
+                    n_mec=self.circuit_params.n_mec,
+                    duration=duration,
+                    dt=storage_dt,  # Generate at storage resolution
+                    base_current=mec_current,
+                    trial_index=trial,
+                    pattern_type=self.mec_pattern_type,
+                    theta_freq=self.mec_theta_freq,
+                    theta_amplitude=self.mec_theta_amplitude,
+                    gamma_freq=self.mec_gamma_freq,
+                    gamma_amplitude=self.mec_gamma_amplitude,
+                    gamma_coupling_strength=self.mec_gamma_coupling_strength,
+                    gamma_preferred_phase=self.mec_gamma_preferred_phase,
+                    drift_timescale=self.mec_drift_timescale,
+                    drift_amplitude=self.mec_drift_amplitude,
+                    rotation_groups=self.mec_rotation_groups,
+                    device=self.device
+                )  # [n_mec, n_steps]
+            else:
+                mec_input = mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std
+            print(f"  MEC input: mean={mec_input.mean().item():.4f}, std={mec_input.std().item():.4f}")
+            
             # Run single trial
             if adaptive_step:
                 trial_result = self._simulate_single_trial_adaptive(
@@ -600,7 +626,7 @@ class OptogeneticExperiment:
                     stim_duration=stim_duration,
                     stim_start=stim_start,
                     post_duration=post_duration,
-                    mec_current=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
+                    mec_input=mec_input,
                     opsin_current=opsin_current,
                     include_dentate_spikes=include_dentate_spikes,
                     ds_times=ds_times,
@@ -615,7 +641,7 @@ class OptogeneticExperiment:
                     stim_duration=stim_duration,
                     stim_start=stim_start,
                     post_duration=post_duration,
-                    mec_current=mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std,
+                    mec_input=mec_input,
                     opsin_current=opsin_current,
                     include_dentate_spikes=include_dentate_spikes,
                     ds_times=ds_times,
@@ -648,7 +674,7 @@ class OptogeneticExperiment:
                                         stim_start: float,
                                         stim_duration: float,
                                         post_duration: float,
-                                        mec_current: float,
+                                        mec_input: torch.Tensor,
                                         opsin_current: float,
                                         include_dentate_spikes: bool,
                                         ds_times: Optional[List[float]],
@@ -718,28 +744,6 @@ class OptogeneticExperiment:
         time_grid = torch.linspace(0, duration, n_steps, device=self.device)
         activity_storage = initialize_activity_storage(self.circuit, time_grid)
 
-        if self.use_time_varying_mec:
-            mec_pattern = generate_time_varying_mec_pattern(
-                n_mec=self.circuit_params.n_mec,
-                duration=duration,
-                dt=storage_dt,  # Generate at storage resolution
-                base_current=mec_current,
-                trial_index=trial_index,
-                pattern_type=self.mec_pattern_type,
-                theta_freq=self.mec_theta_freq,
-                theta_amplitude=self.mec_theta_amplitude,
-                gamma_freq=self.mec_gamma_freq,
-                gamma_amplitude=self.mec_gamma_amplitude,
-                gamma_coupling_strength=self.mec_gamma_coupling_strength,
-                gamma_preferred_phase=self.mec_gamma_preferred_phase,
-                drift_timescale=self.mec_drift_timescale,
-                drift_amplitude=self.mec_drift_amplitude,
-                rotation_groups=self.mec_rotation_groups,
-                device=self.device
-            )  # [n_mec, n_steps]
-        else:
-            # Fall back to constant MEC input with noise
-            mec_pattern = None
         
         # Generate dentate spike times (unchanged)
         if include_dentate_spikes:
@@ -747,6 +751,10 @@ class OptogeneticExperiment:
                 ds_times = self._generate_dentate_spike_times(duration, baseline_rate=0.5)
         else:
             ds_times = []
+
+        target_opto_current = activation_prob * opsin_current
+        print(f"  Opsin activation: mean={target_opto_current.mean().item():.4f}, "
+              f"n_activated={(target_opto_current > 0.1).sum().item()}")
 
         # Adaptive simulation loop
         while state.current_time < duration:
@@ -775,13 +783,13 @@ class OptogeneticExperiment:
             if self.use_time_varying_mec:
                 # Interpolate MEC pattern to current time
                 time_idx = int(state.current_time / storage_dt)
-                if time_idx < mec_pattern.shape[1]:
-                    mec_drive = mec_pattern[:, time_idx]
+                if time_idx < mec_input.shape[1]:
+                    mec_drive = mec_input[:, time_idx]
                 else:
-                    mec_drive = mec_pattern[:, -1]
+                    mec_drive = mec_input[:, -1]
             else:
                 # Original constant drive
-                mec_drive = mec_current
+                mec_drive = mec_input
 
             # Add dentate spike drive
             for ds_time in ds_times:
@@ -866,7 +874,7 @@ class OptogeneticExperiment:
                               stim_start: float,
                               stim_duration: float,
                               post_duration: float,
-                              mec_current: float,
+                              mec_input: torch.Tensor,
                               opsin_current: float,
                               include_dentate_spikes: bool,
                               ds_times: Optional[List[float]],
@@ -914,26 +922,6 @@ class OptogeneticExperiment:
             'mec': torch.zeros(self.circuit_params.n_mec, n_steps, device=self.device)
         }
 
-        # Generate time-varying MEC pattern
-        if self.use_time_varying_mec:
-            mec_pattern = generate_time_varying_mec_pattern(
-                n_mec=self.circuit_params.n_mec,
-                duration=duration,
-                dt=dt,
-                base_current=mec_current,
-                trial_index=trial_index,
-                pattern_type=self.mec_pattern_type,
-                theta_freq=self.mec_theta_freq,
-                theta_amplitude=self.mec_theta_amplitude,
-                gamma_freq=self.mec_gamma_freq,
-                gamma_amplitude=self.mec_gamma_amplitude,
-                drift_timescale=self.mec_drift_timescale,
-                drift_amplitude=self.mec_drift_amplitude,
-                rotation_groups=self.mec_rotation_groups,
-                device=self.device
-            )  # [n_mec, n_steps]
-        else:
-            mec_pattern = None
         
         # Generate dentate spike times (random occurrences)
         if include_dentate_spikes:
@@ -959,10 +947,10 @@ class OptogeneticExperiment:
             # Calculate MEC external drive from time-varying pattern
             external_drive = {}
             if self.use_time_varying_mec:
-                mec_drive = mec_pattern[:, t]
+                mec_drive = mec_input[:, t]
             else:
                 # Original constant drive with noise
-                mec_drive = mec_current
+                mec_drive = mec_input
 
             
             # Add dentate spike drive

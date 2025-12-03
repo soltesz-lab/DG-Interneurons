@@ -384,17 +384,30 @@ class BatchOptogeneticEvaluator:
         """
         batch_size = len(parameter_batch)
         
-        # === BASELINE EVALUATION ===
-        baseline_losses, baseline_rates = self._evaluate_baseline_batch(
-            parameter_batch, mec_current, mec_current_std
-        )
         
-        # === OPTOGENETIC EVALUATION ===
+        # Optogenetic evaluation
         opto_losses, opto_details = self._evaluate_optogenetic_batch(
             parameter_batch, mec_current, mec_current_std
         )
-        
-        # === COMBINE LOSSES ===
+
+        # Average baseline rates from PV and SST experiments
+        baseline_rates = {}
+        for pop in ['gc', 'mc', 'pv', 'sst']:
+            pv_baseline = opto_details['pv'].get(pop, {}).get('baseline_mean', None)
+            sst_baseline = opto_details['sst'].get(pop, {}).get('baseline_mean', None)
+            print(f"population {pop}: pv_baseline = {pv_baseline} sst_baseline = {sst_baseline}")
+            # Average the two baselines if both available
+            if pv_baseline is not None and sst_baseline is not None:
+                baseline_rates[pop] = (pv_baseline + sst_baseline) / 2.0
+            elif pv_baseline is not None:
+                baseline_rates[pop] = pv_baseline
+            elif sst_baseline is not None:
+                baseline_rates[pop] = sst_baseline
+
+        # Calculate baseline loss
+        baseline_losses = self._calculate_baseline_loss_from_rates(baseline_rates)
+
+        # Combine losses
         total_losses = (self.targets.baseline_weight * baseline_losses + 
                         self.targets.optogenetic_weight * opto_losses)
         
@@ -405,6 +418,57 @@ class BatchOptogeneticEvaluator:
             'opto_details': opto_details
         }
 
+    def _calculate_baseline_loss_from_rates(self, 
+                                            baseline_rates: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Calculate baseline loss from firing rates
+
+        Args:
+            baseline_rates: Dict mapping pop -> rates [batch_size]
+
+        Returns:
+            losses: Tensor [batch_size]
+        """
+        batch_size = list(baseline_rates.values())[0].shape[0]
+        losses = torch.zeros(batch_size, device=self.device)
+
+        # Rate loss
+        for pop, rates in baseline_rates.items():
+            if pop in self.targets.target_rates:
+                target_rate = self.targets.target_rates[pop]
+                tolerance = self.targets.rate_tolerance[pop]
+
+                errors = torch.abs(rates - target_rate)
+
+                # Huber loss with tolerance
+                rate_losses = torch.where(
+                    errors <= tolerance,
+                    0.5 * errors ** 2,
+                    tolerance * errors - 0.5 * tolerance ** 2
+                )
+
+                # Zero rate penalty
+                zero_mask = torch.isclose(rates, 
+                                          torch.tensor(0.0, device=self.device),
+                                          atol=1e-2, rtol=1e-2)
+                rate_losses = torch.where(zero_mask, 
+                                          torch.tensor(1e2, device=self.device),
+                                          rate_losses)
+
+                losses += rate_losses
+
+        # Add constraint violations
+        for b in range(batch_size):
+            firing_rates_dict = {pop: baseline_rates[pop][b].item()
+                               for pop in baseline_rates}
+            constraint_violation, _ = evaluate_rate_ordering_constraints(
+                firing_rates_dict,
+                self.targets.rate_ordering_constraints
+            )
+            losses[b] += self.targets.constraint_violation_weight * constraint_violation
+
+        return losses    
+    
     def _evaluate_baseline_batch(self,
                                  parameter_batch: List[Dict[str, float]],
                                  mec_current: float,
@@ -459,6 +523,8 @@ class BatchOptogeneticEvaluator:
             
             # Set per-batch connection modulation
             circuit.set_connection_modulation_batch(parameter_batch)
+
+            print(f"Circuit connectivity hash: {hash(circuit.connectivity.conductance_matrices['gc_mc'].connectivity.cpu().numpy().tobytes())}")
             
             # Reset state (activities, but connectivity is already new)
             circuit.reset_state()
@@ -680,7 +746,6 @@ class BatchOptogeneticEvaluator:
         # Optogenetic protocols to test
         target_pops = ['pv', 'sst']
 
-
         # Storage for results
         total_opto_losses = torch.zeros(batch_size, device=self.device)
 
@@ -690,15 +755,19 @@ class BatchOptogeneticEvaluator:
         opto_adaptive_stats = []
 
         for trial in range(self.config.n_trials):
+            
             # Set seed for this trial
             trial_seed = self.base_seed + trial
-            set_random_seed(trial_seed, self.device)
-
+            set_random_seed(trial_seed, self.device)  # Reset seed for each target
+            
             trial_losses = torch.zeros(batch_size, device=self.device)
 
             self.logger.info(f"  Opto trial {trial + 1}/{self.config.n_trials} (adaptive): seed {trial_seed}...")
 
-            for stim_pop in target_pops:
+            for target_pop in target_pops:
+
+                set_random_seed(trial_seed, self.device)  # Reset seed for each target
+                
                 # Create circuit without compilation for adaptive stepping
                 circuit = BatchDentateCircuit(
                     batch_size=batch_size,
@@ -710,8 +779,9 @@ class BatchOptogeneticEvaluator:
                 )
 
                 circuit.set_connection_modulation_batch(parameter_batch)
-                circuit.reset_state()
 
+                circuit.reset_state()
+                
                 # MEC input (either constant or time-varying)
                 stim_start = self.targets.optogenetic_targets.pre_stim_duration
                 stim_duration = self.targets.optogenetic_targets.stim_duration
@@ -750,20 +820,26 @@ class BatchOptogeneticEvaluator:
                         device=self.device
                     ) * mec_current_std
 
+                # Create opsin activation using shared helper method
+                target_opto_current = self._create_opsin_activation(
+                    target_pop,
+                    circuit.layout
+                )
+                
                 # Run adaptive simulation with three phases:
                 # 1. Warmup
                 # 2. Pre-stimulation baseline
                 # 3. Stimulation
 
                 stim_results = self._run_adaptive_optogenetic_simulation(
-                    circuit, mec_input, stim_pop
+                    circuit, mec_input, target_pop, target_opto_current
                 )
 
                 opto_adaptive_stats.append(stim_results['adaptive_stats'])
 
                 # Calculate losses
                 pop_losses = self._calculate_optogenetic_losses_batch(
-                    stim_results['population_features'], stim_pop
+                    stim_results['population_features'], target_pop
                 )
 
                 trial_losses += pop_losses
@@ -771,7 +847,7 @@ class BatchOptogeneticEvaluator:
                 # Accumulate results for averaging
                 if trial == 0:
                     # Initialize accumulators on first trial
-                    accumulated_details[stim_pop] = {
+                    accumulated_details[target_pop] = {
                         pop: {k: v.clone() if isinstance(v, torch.Tensor) else v 
                               for k, v in pop_data.items()}
                         for pop, pop_data in stim_results['population_features'].items()
@@ -781,7 +857,7 @@ class BatchOptogeneticEvaluator:
                     for pop in stim_results['population_features']:
                         for key, value in stim_results['population_features'][pop].items():
                             if isinstance(value, torch.Tensor):
-                                accumulated_details[stim_pop][pop][key] += value
+                                accumulated_details[target_pop][pop][key] += value
                 
                 # Clean up
                 del circuit
@@ -811,7 +887,7 @@ class BatchOptogeneticEvaluator:
         return total_opto_losses, accumulated_details
 
 
-    def _run_adaptive_optogenetic_simulation(self, circuit, mec_input, target_pop):
+    def _run_adaptive_optogenetic_simulation(self, circuit, mec_input, target_pop, target_opto_current):
         """
         Run optogenetic simulation with adaptive stepping
 
@@ -866,11 +942,6 @@ class BatchOptogeneticEvaluator:
         pre_stim_grid = torch.arange(pre_stim_steps, device=self.device) * storage_dt + warmup_end
         stim_grid = torch.arange(stim_steps, device=self.device) * storage_dt + pre_stim_end
 
-        # Create opsin activation using shared helper method
-        target_opto_current = self._create_opsin_activation(
-            target_pop,
-            circuit.layout
-        )
 
         # Adaptive simulation loop
         activity_current = None
@@ -923,7 +994,7 @@ class BatchOptogeneticEvaluator:
             else:
                 # Constant: use as-is
                 mec_drive = mec_input  # [batch, n_mec]
-            
+
             # Update circuit
             external_drive = {'mec': mec_drive}
             activity_current = update_batch_circuit_with_adaptive_dt(
@@ -1078,7 +1149,9 @@ class BatchOptogeneticEvaluator:
         )
 
         circuit.set_connection_modulation_batch(parameter_batch)
+        print(f"Circuit connectivity hash: {hash(circuit.connectivity.conductance_matrices['gc_mc'].connectivity.cpu().numpy().tobytes())}")
 
+        
         # Create opsin activation using shared helper method
         target_opto_current = self._create_opsin_activation(
             target_pop, 
@@ -1299,8 +1372,13 @@ class BatchOptogeneticEvaluator:
             )
 
             circuit.set_connection_modulation_batch(parameter_batch)
+            
             circuit.reset_state()
 
+            # NEW: Consume RNG for opsin expression to match protocol path
+            # This advances RNG state but we don't use the activation
+            _ = self._create_opsin_activation('pv', circuit.layout) 
+            
             duration = self.config.warmup_duration + self.config.simulation_duration
             dt = self.circuit_params.dt
 
@@ -1482,7 +1560,7 @@ class BatchOptogeneticEvaluator:
                 mec_drive = mec_input  # [batch, n_mec]
                 
             # Update circuit
-            external_drive = {'mec': mec_input}
+            external_drive = {'mec': mec_drive}
             activity_current = update_batch_circuit_with_adaptive_dt(
                 circuit, {}, external_drive, dt_adaptive
             )
