@@ -106,7 +106,7 @@ class OptimizationTargets:
     # Weight factors for different loss components
     loss_weights: Dict[str, float] = field(default_factory=lambda: {
         'firing_rate': 1.0,
-        'sparsity': 0.5,
+        'sparsity': 2.0,
         'smoothness': 0.01,      # Regularization
         'bounds': 0.1,         # Constraint violations
     })
@@ -121,7 +121,7 @@ class OptimizationTargets:
     ])
     
     # Weight for constraint violations
-    constraint_violation_weight: float = 10.0
+    constraint_violation_weight: float = 2.0
     
     # Constraint enforcement method: 'soft_penalty', 'barrier', 'augmented_lagrangian'
     constraint_method: str = 'soft_penalty'
@@ -129,7 +129,7 @@ class OptimizationTargets:
     # Connection strength bounds (multipliers)
     connection_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         'mec_gc': (0.1, 2.0),    # Perforant path can vary widely
-        'mec_pv': (0.1, 2.0),    # Perforant path can vary widely
+        'mec_pv': (0.1, 3.0),    # Perforant path can vary widely
         'gc_mc': (0.1, 2.0),     # Mossy fiber strength
         'mc_gc': (0.1, 2.0),     # Associational pathway  
         'mc_mc': (0.5, 2.0),     # MC-MC excitation  
@@ -137,7 +137,7 @@ class OptimizationTargets:
         'sst_gc': (0.1, 3.0),    # Moderate dendritic inhibition
         'gc_pv': (0.1, 2.0),     # Feedforward excitation
         'gc_sst': (0.1, 2.0),    # Weaker SST drive
-        'mc_pv': (0.1, 3.0),     # Strong MC to PV
+        'mc_pv': (0.1, 4.0),     # Strong MC to PV
         'mc_sst': (0.1, 3.0),    # MC to SST
         'pv_pv': (0.1, 4.0),     # Lateral PV inhibition
         'sst_pv': (0.1, 3.0),    # SST disinhibition
