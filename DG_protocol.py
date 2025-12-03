@@ -221,8 +221,10 @@ def generate_time_varying_mec_pattern(n_mec: int,
                                       gamma_coupling_strength: float = 0.8,
                                       gamma_preferred_phase: float = 0.0,
                                       drift_timescale: float = 200.0,
-                                      drift_amplitude: float = 0.4,
+                                      drift_amplitude: float = 0.1,
                                       rotation_groups: int = 3,
+                                      spatial_noise_std: float = 0.2,
+                                      temporal_noise_std: float = 0.05,
                                       device: Optional[torch.device] = None) -> torch.Tensor:
     """
     Generate time-varying MEC firing pattern with trial rotation
@@ -237,14 +239,18 @@ def generate_time_varying_mec_pattern(n_mec: int,
         dt: Time step in ms
         base_current: Base current level (pA)
         trial_index: Current trial index for rotation
-        pattern_type: 'oscillatory', 'drift', or 'constant'
+        pattern_type: 'oscillatory', 'drift', 'noisy', or 'constant'
         theta_freq: Theta oscillation frequency (Hz)
         theta_amplitude: Relative theta modulation depth (0-1)
         gamma_freq: Gamma oscillation frequency (Hz)  
         gamma_amplitude: Relative gamma modulation depth (0-1)
+        gamma_coupling_strength: Theta-gamma coupling strength (0=independent, 1=fully coupled)
+        gamma_preferred_phase: Preferred theta phase for gamma peak (radians)
         drift_timescale: Correlation time for drift pattern (ms)
         drift_amplitude: Relative drift amplitude (0-1)
         rotation_groups: Number of groups for trial rotation
+        spatial_noise_std: Spatial heterogeneity (fraction of base_current, for 'noisy' pattern)
+        temporal_noise_std: Temporal noise level (fraction of base_current, for 'noisy' pattern)
         device: Device to create tensors on
         
     Returns:
@@ -283,15 +289,7 @@ def generate_time_varying_mec_pattern(n_mec: int,
         )
 
         # Theta-modulated gamma envelope
-        # Gamma amplitude peaks at specific theta phase
-        # gamma_coupling_strength controls coupling (0=independent, 1=fully coupled)
-        # gamma_preferred_phase controls which theta phase gamma peaks at
-
-        # Compute theta phase at each time point for each neuron
         theta_phase_matrix = 2 * np.pi * theta_freq * time_sec.unsqueeze(0) + theta_phases.unsqueeze(1)
-    
-        # Gamma envelope: varies from (1 - coupling_strength) to (1 + coupling_strength)
-        # Peaks when theta is at preferred phase
         gamma_envelope = 1.0 + gamma_coupling_strength * torch.sin(
             theta_phase_matrix + gamma_preferred_phase
         )
@@ -309,7 +307,6 @@ def generate_time_varying_mec_pattern(n_mec: int,
     elif pattern_type == 'drift':
         # Ornstein-Uhlenbeck process for slow drift
         
-        # OU parameters
         tau = drift_timescale  # correlation time in ms
         sigma = drift_amplitude * base_current  # noise amplitude
         
@@ -320,7 +317,6 @@ def generate_time_varying_mec_pattern(n_mec: int,
         # Generate OU process for each neuron
         sqrt_dt = np.sqrt(dt)
         for t in range(1, n_steps):
-            # OU dynamics: dx = -(x - mu)/tau * dt + sigma * sqrt(dt) * dW
             drift_term = -(mec_pattern[:, t-1] - base_rates) / tau * dt
             noise_term = sigma * sqrt_dt * torch.randn(n_mec, device=device)
             mec_pattern[:, t] = mec_pattern[:, t-1] + drift_term + noise_term
@@ -330,10 +326,33 @@ def generate_time_varying_mec_pattern(n_mec: int,
                                            min=base_current * 0.2,
                                            max=base_current * 2.0)
     
-    else:
-        raise ValueError(f"Unknown pattern_type: {pattern_type}. Use 'oscillatory', 'drift', or 'constant'")
+    elif pattern_type == 'noisy':
+        # Spatially heterogeneous baseline + temporal noise
+        
+        # Generate spatially heterogeneous baseline currents
+        spatial_std = spatial_noise_std * base_current
+        baseline_currents = np.random.normal(base_current, spatial_std, n_mec)
+        baseline_currents = np.clip(baseline_currents, 0.0, None)  # No negative currents
+        
+        # Apply trial rotation to heterogeneous baselines
+        base_rates_hetero = get_mec_rotation_pattern(
+            n_mec, trial_index, baseline_currents, rotation_groups, device
+        )  # [n_mec]
+        
+        # Add temporal noise at each time step
+        temporal_std = temporal_noise_std * base_current
+        temporal_noise = torch.randn(n_mec, n_steps, device=device) * temporal_std
+        
+        # Combine: heterogeneous baseline + temporal noise
+        mec_pattern = base_rates_hetero.unsqueeze(1) + temporal_noise
+        
+        # Ensure no negative currents
+        mec_pattern = torch.clamp(mec_pattern, min=0.0)
     
-    # Ensure no negative currents
+    else:
+        raise ValueError(f"Unknown pattern_type: {pattern_type}. Use 'oscillatory', 'drift', 'noisy', or 'constant'")
+    
+    # Ensure no negative currents (final check for all pattern types)
     mec_pattern = torch.clamp(mec_pattern, min=0.0)
     
     return mec_pattern
@@ -363,7 +382,7 @@ class OptogeneticExperiment:
                  mec_gamma_coupling_strength: float = 0.8,
                  mec_gamma_preferred_phase: float = 0.0,
                  mec_drift_timescale: float = 200.0,
-                 mec_drift_amplitude: float = 0.4,
+                 mec_drift_amplitude: float = 0.1,
                  mec_rotation_groups: int = 3):
         """
         Initialize optogenetic experiment
@@ -376,13 +395,13 @@ class OptogeneticExperiment:
             device: Device to run on
             base_seed: Base random seed for reproducibility (default: 42)
             use_time_varying_mec: Whether to use time-varying MEC input (default: True)
-            mec_pattern_type: Type of temporal pattern ('oscillatory', 'drift', 'constant')
+            mec_pattern_type: Type of temporal pattern ('oscillatory', 'drift', 'noisy', 'constant')
             mec_theta_freq: Theta oscillation frequency in Hz (default: 5.0)
             mec_theta_amplitude: Theta modulation depth 0-1 (default: 0.3)
             mec_gamma_freq: Gamma oscillation frequency in Hz (default: 20.0)
             mec_gamma_amplitude: Gamma modulation depth 0-1 (default: 0.15)
             mec_drift_timescale: Correlation time for drift pattern in ms (default: 200.0)
-            mec_drift_amplitude: Drift amplitude relative to base (default: 0.4)
+            mec_drift_amplitude: Drift amplitude relative to base (default: 0.1)
             mec_rotation_groups: Number of groups for spatial rotation (default: 3)
         """
         self.circuit_params = circuit_params
@@ -611,12 +630,12 @@ class OptogeneticExperiment:
                     gamma_preferred_phase=self.mec_gamma_preferred_phase,
                     drift_timescale=self.mec_drift_timescale,
                     drift_amplitude=self.mec_drift_amplitude,
+                    spatial_noise_std=mec_current_std,
                     rotation_groups=self.mec_rotation_groups,
                     device=self.device
                 )  # [n_mec, n_steps]
             else:
                 mec_input = mec_current + torch.randn(self.circuit_params.n_mec, device=self.device) * mec_current_std
-            print(f"  MEC input: mean={mec_input.mean().item():.4f}, std={mec_input.std().item():.4f}")
             
             # Run single trial
             if adaptive_step:
@@ -753,8 +772,6 @@ class OptogeneticExperiment:
             ds_times = []
 
         target_opto_current = activation_prob * opsin_current
-        print(f"  Opsin activation: mean={target_opto_current.mean().item():.4f}, "
-              f"n_activated={(target_opto_current > 0.1).sum().item()}")
 
         # Adaptive simulation loop
         while state.current_time < duration:
@@ -1318,7 +1335,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                mec_gamma_coupling_strength: float = 0.8,
                                mec_gamma_preferred_phase: float = 0.0,
                                mec_drift_timescale: float = 200.0,
-                               mec_drift_amplitude: float = 0.4,
+                               mec_drift_amplitude: float = 0.1,
                                mec_rotation_groups: int = 3,
                                validate_input_balance: bool = True):
     """
@@ -3283,8 +3300,8 @@ if __name__ == "__main__":
                         help='High gradient threshold (Hz/ms)')
     parser.add_argument('--time-varying-mec', action='store_true',
                        help='Enable time-varying MEC input')
-    parser.add_argument('--mec-pattern-type', type=str, default='constant',
-                       choices=['oscillatory', 'drift', 'constant'],
+    parser.add_argument('--mec-pattern-type', type=str, default='oscillatory',
+                       choices=['oscillatory', 'drift', 'noisy', 'constant'],
                        help='Type of temporal pattern for MEC input')
     parser.add_argument('--mec-theta-freq', type=float, default=5.0,
                        help='Theta oscillation frequency (Hz)')

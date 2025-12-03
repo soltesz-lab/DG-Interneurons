@@ -186,11 +186,11 @@ class PerConnectionSynapticParams:
     # Connection-type specific modulation factors
     connection_modulation: Dict[str, float] = field(default_factory=lambda: {
         # Excitatory connections
-        'mec_gc': 1.0,       # Perforant path to GC
-        'mec_pv': 0.125,         # Perforant path to PV
-        'gc_mc': 0.5,          # Mossy fiber collaterals
+        'mec_gc': 0.25,       # Perforant path to GC
+        'mec_pv': 0.125,      # Perforant path to PV
+        'gc_mc': 0.5,         # Mossy fiber collaterals
         'gc_pv': 0.07,          # Excitation to PV
-        'gc_sst': 0.05,        # Excitation to SST
+        'gc_sst': 0.1,        # Excitation to SST
         'mc_gc': 1.0,         # Associational
         'mc_mc': 0.25, #4.825,  # MC recurrent
         'mc_pv': 0.75,         # Excitation to PV
@@ -200,7 +200,7 @@ class PerConnectionSynapticParams:
         'pv_gc': 3.5, #3.662,       # Perisomatic inhibition
         'pv_mc': 0.5,               # Inhibition of MC
         'pv_pv': 0.15, #1.875,       # PV lateral inhibition
-        'sst_gc': 1.0, #1.22        # GC dendritic inhibition
+        'sst_gc': 2.0, #1.22        # GC dendritic inhibition
         'sst_mc': 0.5,              # Inhibition of MC
         'sst_pv': 0.5, #1.51,       # IN disinhibition
         
@@ -297,18 +297,18 @@ class CircuitParams:
     n_pv: int = 30
     n_sst: int = 20
     n_mec: int = 60  # MEC layer 2 principal cells
-    
+
     # Local connection probabilities (GC -> local targets)
     p_gc_mc_local: float = 0.04    # GC to nearby MC
     p_gc_pv_local: float = 0.18    # GC to nearby PV
     p_gc_sst_local: float = 0.06   # GC to nearby SST
     
     # MC connection probabilities
-    p_mc_gc_local: float = 0.005      # MC to local GC
-    p_mc_gc_distant: float = 0.01    # MC to distant GC
-    p_mc_pv_distant: float = 0.08    # MC to distant PV
-    p_mc_sst: float = 0.1           # MC to local SST (molecular layer)
-    p_mc_mc_distant: float = 0.02    # MC to distant MC
+    p_mc_gc_local: float = 0.01      # MC to local GC
+    p_mc_gc_distant: float = 0.03    # MC to distant GC
+    p_mc_pv_distant: float = 0.1     # MC to distant PV
+    p_mc_sst: float = 0.1            # MC to local SST (molecular layer)
+    p_mc_mc_local: float = 0.05      # MC to local MC
     
     # MEC connection probabilities (from Hainmueller et al.)
     p_mec_gc: float = 0.125         # Perforant path to GC
@@ -327,15 +327,14 @@ class CircuitParams:
     p_sst_sst: float = 0.05        # SST to SST feedback
     
     # Population heterogeneity for competition
-    pv_subpop_ratio: float = 0.6   # Fraction in "fast" PV subpopulation
-    sst_subpop_ratio: float = 0.5  # Fraction in "proximal" SST subpopulation
+    pv_subpop_ratio: float = 0.4   # Fraction in "fast" PV subpopulation
     
     # Spatial parameters (mm)
     gc_layer_thickness: float = 0.05   # Thin granule cell layer
     hilar_thickness: float = 0.3       # Hilar region thickness
     ml_thickness: float = 0.4          # Molecular layer thickness
-    local_radius: float = 0.9          # Local connection radius
-    distant_min: float = 0.9           # Minimum distance for "distant"
+    local_radius: float = 1.1          # Local connection radius
+    distant_min: float = 1.1           # Minimum distance for "distant"
     mec_distance: float = 2.0          # Distance from MEC to DG
     
     # Synaptic parameters
@@ -443,19 +442,19 @@ class ConnectivityMatrix:
             'gc_pv': ('gc', 'pv', 'excitatory', self.circuit_params.p_gc_pv_local, 'local'),
             'gc_sst': ('gc', 'sst', 'excitatory', self.circuit_params.p_gc_sst_local, 'local'),
             'mc_gc': ('mc', 'gc', 'excitatory', (self.circuit_params.p_mc_gc_local, self.circuit_params.p_mc_gc_distant), 'mixed'),
-            'mc_pv': ('mc', 'pv', 'excitatory', self.circuit_params.p_mc_pv_distant, 'random'),
+            'mc_pv': ('mc', 'pv', 'excitatory', self.circuit_params.p_mc_pv_distant, 'distant'),
             'mc_sst': ('mc', 'sst', 'excitatory', self.circuit_params.p_mc_sst, 'local'),
-            'mc_mc': ('mc', 'mc', 'excitatory', self.circuit_params.p_mc_mc_distant, 'distant'),
+            'mc_mc': ('mc', 'mc', 'excitatory', self.circuit_params.p_mc_mc_local, 'local'),
             'mec_gc': ('mec', 'gc', 'excitatory', self.circuit_params.p_mec_gc, 'random'),
             'mec_pv': ('mec', 'pv', 'excitatory', self.circuit_params.p_mec_pv, 'random'),
             
             # Inhibitory connections
             'pv_gc': ('pv', 'gc', 'inhibitory', self.circuit_params.p_pv_gc, 'random'),
-            'pv_mc': ('pv', 'mc', 'inhibitory', self.circuit_params.p_pv_mc, 'random'),
+            'pv_mc': ('pv', 'mc', 'inhibitory', self.circuit_params.p_pv_mc, 'local'),
             'pv_pv': ('pv', 'pv', 'inhibitory', self.circuit_params.p_pv_pv, 'competitive'),
-            'pv_sst': ('pv', 'sst', 'inhibitory', self.circuit_params.p_pv_sst, 'random'),
+            'pv_sst': ('pv', 'sst', 'inhibitory', self.circuit_params.p_pv_sst, 'local'),
             'sst_gc': ('sst', 'gc', 'inhibitory', self.circuit_params.p_sst_gc, 'random'),
-            'sst_mc': ('sst', 'mc', 'inhibitory', self.circuit_params.p_sst_mc, 'random'),
+            'sst_mc': ('sst', 'mc', 'inhibitory', self.circuit_params.p_sst_mc, 'local'),
             'sst_pv': ('sst', 'pv', 'inhibitory', self.circuit_params.p_sst_pv, 'random'),
             'sst_sst': ('sst', 'sst', 'inhibitory', self.circuit_params.p_sst_sst, 'random'),
         }

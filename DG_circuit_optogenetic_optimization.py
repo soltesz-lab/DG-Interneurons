@@ -2560,7 +2560,8 @@ class OptogeneticCircuitOptimizer:
         evaluator = BatchOptogeneticEvaluator(
             self.circuit_params, self.base_synaptic_params,
             self.opsin_params, self.opsin_current,
-            self.targets, self.config, device=self.device, base_seed=self.base_seed,
+            self.targets, self.config, device=self.device,
+            base_seed=self.base_seed,
             verbose=True
         )
         
