@@ -199,10 +199,12 @@ class PerConnectionSynapticParams:
         # Inhibitory connections  
         'pv_gc': 3.5, #3.662,       # Perisomatic inhibition
         'pv_mc': 0.5,               # Inhibition of MC
-        'pv_pv': 0.15, #1.875,       # PV lateral inhibition
+        'pv_pv': 0.15, #1.875,      # PV lateral inhibition
+        'pv_sst': 0.1, #1.51,       # IN disinhibition
         'sst_gc': 2.0, #1.22        # GC dendritic inhibition
         'sst_mc': 0.5,              # Inhibition of MC
         'sst_pv': 0.5, #1.51,       # IN disinhibition
+        'sst_sst': 0.5, #1.51,      # IN disinhibition
         
     })
     
@@ -456,7 +458,7 @@ class ConnectivityMatrix:
             'sst_gc': ('sst', 'gc', 'inhibitory', self.circuit_params.p_sst_gc, 'random'),
             'sst_mc': ('sst', 'mc', 'inhibitory', self.circuit_params.p_sst_mc, 'local'),
             'sst_pv': ('sst', 'pv', 'inhibitory', self.circuit_params.p_sst_pv, 'random'),
-            'sst_sst': ('sst', 'sst', 'inhibitory', self.circuit_params.p_sst_sst, 'random'),
+            'sst_sst': ('sst', 'sst', 'inhibitory', self.circuit_params.p_sst_sst, 'local'),
         }
         
         for conn_name, (pre_pop, post_pop, syn_type, prob, conn_type) in connections.items():

@@ -48,8 +48,7 @@ from DG_circuit_dendritic_somatic_transfer import (
 from gradient_adaptive_stepper import (
     GradientAdaptiveStepConfig,
     GradientAdaptiveStepper,
-    AdaptiveSimulationState,
-    update_circuit_with_adaptive_dt
+    AdaptiveSimulationState
 )
 
 # Store numpy.ndarray as JSON
@@ -319,17 +318,26 @@ class BatchOptogeneticEvaluator:
             # Stack: [batch_size, n_mec, n_steps]
             return torch.stack(mec_patterns, dim=0)
         else:
-            # Original constant + noise approach
-            mec_input = mec_current + torch.randn(
+            trial_seed = self.base_seed + trial_index
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(trial_seed)
+
+            # Generate noise using seeded generator
+            noise = torch.randn(
                 batch_size, 
                 self.circuit_params.n_mec,
-                device=self.device
+                device=self.device,
+                generator=generator
             ) * mec_current_std
+
+            mec_input = mec_current + noise
             return mec_input
+            
 
     def _create_opsin_activation(self, 
                                  target_pop: str,
-                                 layout) -> torch.Tensor:
+                                 layout,
+                                 trial_seed: int) -> torch.Tensor:
         """
         Create opsin activation currents for target population
 
@@ -343,6 +351,9 @@ class BatchOptogeneticEvaluator:
         Returns:
             Activation currents for target population [n_cells]
         """
+        # Seed the RNG before creating OpsinExpression
+        set_random_seed(trial_seed, self.device)
+        
         # Create opsin expression for target population
         n_target_cells = getattr(self.circuit_params, f'n_{target_pop}')
         opsin_expression = OpsinExpression(
@@ -524,8 +535,6 @@ class BatchOptogeneticEvaluator:
             # Set per-batch connection modulation
             circuit.set_connection_modulation_batch(parameter_batch)
 
-            print(f"Circuit connectivity hash: {hash(circuit.connectivity.conductance_matrices['gc_mc'].connectivity.cpu().numpy().tobytes())}")
-            
             # Reset state (activities, but connectivity is already new)
             circuit.reset_state()
 
@@ -766,8 +775,6 @@ class BatchOptogeneticEvaluator:
 
             for target_pop in target_pops:
 
-                set_random_seed(trial_seed, self.device)  # Reset seed for each target
-                
                 # Create circuit without compilation for adaptive stepping
                 circuit = BatchDentateCircuit(
                     batch_size=batch_size,
@@ -823,7 +830,8 @@ class BatchOptogeneticEvaluator:
                 # Create opsin activation using shared helper method
                 target_opto_current = self._create_opsin_activation(
                     target_pop,
-                    circuit.layout
+                    circuit.layout,
+                    trial_seed
                 )
                 
                 # Run adaptive simulation with three phases:
@@ -1007,7 +1015,7 @@ class BatchOptogeneticEvaluator:
             # Interpolate to fixed grids for pre-stim and stim phases
             if state.step_index > 0:
                 # Check if we're in pre-stim phase
-                if state.current_time >= warmup_end and state.current_time <= pre_stim_end:
+                if state.current_time >= warmup_end and state.current_time < pre_stim_end:
                     self._interpolate_batch_to_grid(
                         activity_current, state.activity_prev,
                         state.current_time, interval_end,
@@ -1015,7 +1023,7 @@ class BatchOptogeneticEvaluator:
                     )
 
                 # Check if we're in stim phase
-                if state.current_time >= pre_stim_end and state.current_time <= stim_end:
+                if state.current_time >= pre_stim_end and state.current_time < stim_end:
                     self._interpolate_batch_to_grid(
                         activity_current, state.activity_prev,
                         state.current_time, interval_end,
@@ -1149,13 +1157,12 @@ class BatchOptogeneticEvaluator:
         )
 
         circuit.set_connection_modulation_batch(parameter_batch)
-        print(f"Circuit connectivity hash: {hash(circuit.connectivity.conductance_matrices['gc_mc'].connectivity.cpu().numpy().tobytes())}")
-
         
         # Create opsin activation using shared helper method
         target_opto_current = self._create_opsin_activation(
             target_pop, 
-            circuit.layout
+            circuit.layout,
+            trial_seed
         )
 
         # Generate MEC input pattern
@@ -1375,13 +1382,12 @@ class BatchOptogeneticEvaluator:
             
             circuit.reset_state()
 
-            # NEW: Consume RNG for opsin expression to match protocol path
+            # Consume RNG for opsin expression to match protocol path
             # This advances RNG state but we don't use the activation
-            _ = self._create_opsin_activation('pv', circuit.layout) 
+            trial_seed = self.base_seed + trial
             
             duration = self.config.warmup_duration + self.config.simulation_duration
             dt = self.circuit_params.dt
-
 
             if self.use_time_varying_mec:
                 # Time-varying: [batch_size, n_mec, n_steps]

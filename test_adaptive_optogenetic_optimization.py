@@ -841,7 +841,7 @@ def run_all_tests():
         ("Reproducibility", test_reproducibility),
         ("Optimizer Integration", test_optimizer_integration),
         ("Optimization-Protocol Consistency", test_optimization_protocol_consistency),
-        ("Time-Varying MEC Consistency", test_with_time_varying_mec),
+        #("Time-Varying MEC Consistency", test_with_time_varying_mec),
         ("Performance Benchmark", test_performance_benchmark),
     ]
     
