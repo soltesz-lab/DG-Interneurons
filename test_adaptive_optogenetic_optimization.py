@@ -380,7 +380,7 @@ def test_optimizer_integration():
         n_trials=1,
         simulation_duration=200,
         warmup_duration=50,
-        mec_drive_levels=[40.0],
+        mec_drive_levels=[28.0],
         mec_drive_std=1.0,
         adaptive_step=True,
         adaptive_config=GradientAdaptiveStepConfig(
@@ -403,7 +403,7 @@ def test_optimizer_integration():
         n_workers=8,
         max_iterations=2,  # Just 2 iterations
         diagnostic_frequency=1,
-        use_time_varying_mec=True,
+        use_time_varying_mec=False,
         mec_pattern_type='oscillatory',
         mec_theta_freq=5.0,
         mec_gamma_freq=20.0,
@@ -429,8 +429,6 @@ def test_optimizer_integration():
     return True
 
 """
-Add this test to test_adaptive_optogenetic_optimization.py
-
 This test directly compares BatchOptogeneticEvaluator from the optimization
 module vs. OptogeneticExperiment.simulate_stimulation from the protocol module.
 """

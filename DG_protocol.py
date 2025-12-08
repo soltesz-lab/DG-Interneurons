@@ -866,6 +866,7 @@ class OptogeneticExperiment:
                 activity_trace_cpu,
                 split_populations=split_populations,
                 direct_activation=plot_direct_activation,
+                sort_by_activity=True,
                 save_path=f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}_trial{trial_index}.png"
             )
             plt.close(fig)
@@ -1814,7 +1815,7 @@ def plot_adaptive_stepping_analysis(adaptive_stats: Dict,
     
     ax1.set_ylabel(r'Time Step $\Delta t$ (ms)', fontsize=11)
     ax1.set_title('Adaptive Time Step Evolution (Sample Trial)', fontsize=12, fontweight='bold')
-    ax1.legend(loc='best', fontsize=9)
+    ax1.legend(loc='best', fontsize=10)
     ax1.grid(True, alpha=0.3)
     
     # Panel 2: Gradient magnitude over time
@@ -1825,7 +1826,7 @@ def plot_adaptive_stepping_analysis(adaptive_stats: Dict,
     ax2.set_ylabel('Gradient Magnitude (Hz/ms)', fontsize=11)
     ax2.set_title('Activity Gradient Over Time', fontsize=12, fontweight='bold')
     ax2.set_yscale('log')
-    ax2.legend(loc='best', fontsize=9)
+    ax2.legend(loc='best', fontsize=10)
     ax2.grid(True, alpha=0.3, which='both')
     
     # Panel 3: Cumulative time vs steps
@@ -1852,7 +1853,7 @@ def plot_adaptive_stepping_analysis(adaptive_stats: Dict,
     ax3.set_title(f'Computational Efficiency: {efficiency:.1f}% Reduction '
                  f'({n_steps_adaptive} vs {n_steps_fixed} steps)', 
                  fontsize=12, fontweight='bold')
-    ax3.legend(loc='best', fontsize=9)
+    ax3.legend(loc='best', fontsize=10)
     ax3.grid(True, alpha=0.3)
     
     # Overall title with multi-trial info
@@ -1905,7 +1906,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     populations = ['gc', 'mc', 'pv', 'sst']
     
     bar_data = []
-    bar_errors = []  # NEW: Error bars for multi-trial
+    bar_errors = []  # Error bars for multi-trial
     bar_labels = []
     bar_colors = []
     
@@ -1918,7 +1919,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                 if baseline_rate > 0:
                     ratio = np.log2(stim_rate / baseline_rate)
                     bar_data.append(ratio)
-                    bar_labels.append(f'{target.upper()}→{pop.upper()}')
+                    bar_labels.append(f'{target.upper()}->{pop.upper()}')
                     bar_colors.append(colors[pop])
                     
                     # Add error bars if multi-trial
@@ -1942,11 +1943,11 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
             ax1.text(bar.get_x() + bar.get_width()/2., height,
                     f'{value:.2f}', ha='center', 
                     va='bottom' if height > 0 else 'top',
-                    fontsize=9, fontweight='bold')
+                    fontsize=12, fontweight='bold')
     
     ax1.set_xticks(x_pos)
     ax1.set_xticklabels(bar_labels, rotation=45, ha='right', fontsize=10)
-    ax1.set_ylabel(r'Modulation Ratio ($\log_2$)', fontsize=11)
+    ax1.set_ylabel(r'Modulation Ratio ($\log_2$)', fontsize=12)
     title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
     ax1.set_title(f'Firing Rate Modulation{title_suffix}', fontsize=12, fontweight='bold')
     ax1.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=2)
@@ -1969,7 +1970,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                     inhibited_frac = results[target][stimulation_level][f'{pop}_inhibited']
                     
                     effect_data.append([excited_frac, inhibited_frac])
-                    effect_labels.append(f'{target.upper()}→{pop.upper()}')
+                    effect_labels.append(f'{target.upper()}->{pop.upper()}')
                     
                     # Add error bars if available
                     if has_multitrial and f'{pop}_excited_std' in results[target][stimulation_level]:
@@ -1998,51 +1999,19 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                 height = bar.get_height()
                 ax2.text(bar.get_x() + bar.get_width()/2., height,
                         f'{height:.2f}', ha='center', va='bottom',
-                        fontsize=8)
+                        fontsize=10)
         
         ax2.set_xticks(x_pos)
         ax2.set_xticklabels(effect_labels, rotation=45, ha='right', fontsize=10)
-        ax2.set_ylabel('Fraction of Cells', fontsize=11)
+        ax2.set_ylabel('Fraction of Cells', fontsize=12)
         title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
         ax2.set_title(f'Network Effects{title_suffix}', fontsize=12, fontweight='bold')
-        ax2.legend(fontsize=10)
+        ax2.legend(fontsize=12)
         ax2.grid(True, alpha=0.3, axis='y')
         ax2.set_axisbelow(True)
     
-    # Panel C: Connectivity analysis (unchanged)
-    ax3 = plt.subplot(3, 4, (5, 6))
-    
-    mec_conn = conn_analysis['mec_connectivity']
-    conn_data = [
-        mec_conn['mec_to_pv'],
-        mec_conn['mec_to_gc'], 
-        mec_conn['mec_to_sst']
-    ]
-    conn_labels = ['MEC -> PV', 'MEC -> GC', 'MEC -> SST']
-    conn_colors = [colors['pv'], colors['gc'], colors['sst']]
-    
-    bars = ax3.bar(conn_labels, conn_data, color=conn_colors, alpha=0.7, 
-                  edgecolor='black', linewidth=1.5)
-    ax3.set_ylabel('Number of Connections', fontsize=11)
-    ax3.set_title('MEC Connectivity Asymmetry', fontsize=12, fontweight='bold')
-    ax3.grid(True, alpha=0.3, axis='y')
-    ax3.set_axisbelow(True)
-    
-    # Add fraction labels on bars
-    for i, (bar, label) in enumerate(zip(bars, conn_labels)):
-        height = bar.get_height()
-        if 'PV' in label:
-            frac = mec_conn['pv_fraction']
-        elif 'GC' in label:
-            frac = mec_conn['gc_fraction']
-        else:
-            frac = 0.0
-        
-        ax3.text(bar.get_x() + bar.get_width()/2., height + max(conn_data)*0.02,
-                f'{frac:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-
-    # Panel D: Firing rate changes bar plot with error bars
-    ax4 = plt.subplot(3, 4, (7, 8))
+    # Panel C: Firing rate changes bar plot with error bars
+    ax4 = plt.subplot(3, 4, (5, 6))
     
     change_data = []
     change_errors = []
@@ -2055,7 +2024,7 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                 mean_change = results[target][stimulation_level][f'{pop}_mean_change']
                 
                 change_data.append(mean_change)
-                change_labels.append(f'{target.upper()}→{pop.upper()}')
+                change_labels.append(f'{target.upper()}->{pop.upper()}')
                 change_colors.append(colors['pv'] if target == 'pv' else colors['sst'])
                 
                 # Add error bars if available
@@ -2077,20 +2046,20 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
             ax4.text(bar.get_x() + bar.get_width()/2., height,
                     f'{value:.2f}', ha='center', 
                     va='bottom' if height > 0 else 'top',
-                    fontsize=9, fontweight='bold')
+                    fontsize=12, fontweight='bold')
         
         ax4.set_xticks(range(len(change_labels)))
         ax4.set_xticklabels(change_labels, fontsize=10)
-        ax4.set_ylabel(r'$\Delta$ Firing Rate (Hz)', fontsize=11)
+        ax4.set_ylabel(r'$\Delta$ Firing Rate (Hz)', fontsize=12)
         title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
         ax4.set_title(f'Mean Rate Changes{title_suffix}', fontsize=12, fontweight='bold')
         ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=2)
         ax4.grid(True, alpha=0.3, axis='y')
         ax4.set_axisbelow(True)
 
-    # Panel E: Scatter plots showing correlation
+    # Panel D: Scatter plots showing correlation
     for i, target in enumerate(targets):
-        ax = plt.subplot(3, 4, 9 + i * 2)
+        ax = plt.subplot(3, 4, 7 + i)
         
         opsin_expression = results[target][stimulation_level]['opsin_expression_mean']
         
@@ -2126,9 +2095,9 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax.set_ylabel('Stimulation Rate (Hz)', fontsize=10)
         title_suffix = f'\n(n={n_trials} trials)' if has_multitrial else '\n(Single Trial)'
         ax.set_title(f'{target.upper()} Stimulation{title_suffix}\n(Non-expressing cells)', 
-                    fontsize=11, fontweight='bold')
+                    fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=10)
         ax.set_axisbelow(True)
 
     # Panel F: Summary text
@@ -2138,11 +2107,6 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     trial_text = f'{n_trials} Trial Average' if has_multitrial else 'Single Trial'
     summary_text = f"{trial_text} Summary\n"
     summary_text += "=" * 30 + "\n\n"
-    
-    # MEC asymmetry
-    summary_text += "MEC Connectivity:\n"
-    summary_text += f"  MEC -> PV: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.1%})\n"
-    summary_text += f"  MEC -> SST: {mec_conn['mec_to_sst']} (none)\n\n"
     
     # Network effects
     summary_text += "Optogenetic Effects:\n"
@@ -2159,10 +2123,10 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         summary_text += "\n"
     
     ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes, va='top', ha='left',
-            fontsize=9, fontfamily='monospace',
+            fontsize=10, fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
         
-    main_title = 'Dentate Gyrus Interneuron Effects'
+    main_title = 'Dentate Gyrus Interneuron Stimulation Effects'
     if has_multitrial:
         main_title += f' (Average of {n_trials} Trials)'
     else:
@@ -2557,9 +2521,12 @@ def test_interneuron_interactions(
             stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
             
             analysis = {}
+            
+            # First, analyze ALL non-target populations (including non-target interneurons)
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 if pop == target:
-                    continue
+                    continue  # Will handle target population separately below
+                
                 baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
                 stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
                 rate_change = stim_rate - baseline_rate
@@ -2569,6 +2536,72 @@ def test_interneuron_interactions(
                 
                 analysis[f'{pop}_excited'] = excited_fraction.item()
                 analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+                # Get trial-to-trial variability
+                if n_trials > 1:
+                    excited_fractions = []
+                    for trial_result in result['trial_results']:
+                        trial_activity = trial_result['activity_trace'][pop]
+                        trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                        trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                        trial_change = trial_stim - trial_baseline
+                        trial_baseline_std = torch.std(trial_baseline)
+                        trial_excited = torch.mean((trial_change > trial_baseline_std).float()).item()
+                        excited_fractions.append(trial_excited)
+                    
+                    analysis[f'{pop}_excited_std'] = np.std(excited_fractions)
+            
+            # Second, analyze NON-EXPRESSING cells from the TARGET population
+            # These are cells that failed to express opsin and were not directly stimulated
+            target_baseline = torch.mean(activity_mean[target][:, baseline_mask], dim=1)
+            target_stim = torch.mean(activity_mean[target][:, stim_mask], dim=1)
+            target_change = target_stim - target_baseline
+            target_baseline_std = torch.std(target_baseline)
+            
+            # Get non-stimulated indices from the first trial (same across trials if not regenerating opsin)
+            non_stimulated_indices = result['trial_results'][0]['non_stimulated_indices']
+            n_non_expressing = len(non_stimulated_indices)
+            
+            if n_non_expressing > 0:
+                # Analyze only non-expressing cells
+                non_expr_change = target_change[non_stimulated_indices]
+                non_expr_excited = torch.mean((non_expr_change > target_baseline_std).float())
+                
+                analysis[f'{target}_nonexpr_excited'] = non_expr_excited.item()
+                analysis[f'{target}_nonexpr_mean_change'] = torch.mean(non_expr_change).item()
+                analysis[f'{target}_nonexpr_count'] = n_non_expressing
+                
+                # Get trial-to-trial variability for non-expressing target cells
+                if n_trials > 1:
+                    non_expr_excited_fractions = []
+                    for trial_result in result['trial_results']:
+                        trial_activity = trial_result['activity_trace'][target]
+                        trial_non_stim_idx = trial_result['non_stimulated_indices']
+                        
+                        trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                        trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                        trial_change = trial_stim - trial_baseline
+                        trial_baseline_std = torch.std(trial_baseline)
+                        
+                        if len(trial_non_stim_idx) > 0:
+                            trial_non_expr_change = trial_change[trial_non_stim_idx]
+                            trial_excited = torch.mean((trial_non_expr_change > trial_baseline_std).float()).item()
+                            non_expr_excited_fractions.append(trial_excited)
+                    
+                    analysis[f'{target}_nonexpr_excited_std'] = np.std(non_expr_excited_fractions)
+            else:
+                # All cells express opsin - no non-expressing cells
+                analysis[f'{target}_nonexpr_excited'] = 0.0
+                analysis[f'{target}_nonexpr_mean_change'] = 0.0
+                analysis[f'{target}_nonexpr_count'] = 0
+                if n_trials > 1:
+                    analysis[f'{target}_nonexpr_excited_std'] = 0.0
+            
+            # Store opsin expression statistics
+            opsin_expr = result['opsin_expression_mean']
+            expressing_mask = opsin_expr >= 0.2  # Same threshold as in code
+            analysis[f'{target}_expression_fraction'] = torch.mean(expressing_mask.float()).item()
+            analysis[f'{target}_mean_expression'] = torch.mean(opsin_expr).item()
                 
             full_results[intensity] = analysis
         
@@ -2780,7 +2813,8 @@ def test_excitation_to_interneurons(
             analysis = {}
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 if pop == target:
-                    continue
+                    continue  # Skip the directly stimulated population
+                
                 baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
                 stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
                 rate_change = stim_rate - baseline_rate
@@ -2790,6 +2824,20 @@ def test_excitation_to_interneurons(
                 
                 analysis[f'{pop}_excited'] = excited_fraction.item()
                 analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+                # Get trial-to-trial variability
+                if n_trials > 1:
+                    excited_fractions = []
+                    for trial_result in result['trial_results']:
+                        trial_activity = trial_result['activity_trace'][pop]
+                        trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                        trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                        trial_change = trial_stim - trial_baseline
+                        trial_baseline_std = torch.std(trial_baseline)
+                        trial_excited = torch.mean((trial_change > trial_baseline_std).float()).item()
+                        excited_fractions.append(trial_excited)
+                    
+                    analysis[f'{pop}_excited_std'] = np.std(excited_fractions)
                 
             full_results[intensity] = analysis
         
@@ -2858,7 +2906,7 @@ def test_excitation_to_interneurons(
             print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
             
             if abs(change) > 0.05:  # Significant reduction
-                print(f"             → {'STRONG' if abs(change) > 0.15 else 'MODERATE'} reduction suggests disinhibition mechanism")
+                print(f"             -> {'STRONG' if abs(change) > 0.15 else 'MODERATE'} reduction suggests disinhibition mechanism")
     
     if save_results_file:
         import pickle
@@ -2995,7 +3043,8 @@ def test_recurrent_excitation(
             analysis = {}
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 if pop == target:
-                    continue
+                    continue  # Skip the directly stimulated population
+                
                 baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
                 stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
                 rate_change = stim_rate - baseline_rate
@@ -3005,6 +3054,20 @@ def test_recurrent_excitation(
                 
                 analysis[f'{pop}_excited'] = excited_fraction.item()
                 analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                
+                # Get trial-to-trial variability
+                if n_trials > 1:
+                    excited_fractions = []
+                    for trial_result in result['trial_results']:
+                        trial_activity = trial_result['activity_trace'][pop]
+                        trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                        trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                        trial_change = trial_stim - trial_baseline
+                        trial_baseline_std = torch.std(trial_baseline)
+                        trial_excited = torch.mean((trial_change > trial_baseline_std).float()).item()
+                        excited_fractions.append(trial_excited)
+                    
+                    analysis[f'{pop}_excited_std'] = np.std(excited_fractions)
                 
             full_results[intensity] = analysis
         
@@ -3071,7 +3134,7 @@ def test_recurrent_excitation(
             print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
             
             if abs(change) > 0.05:
-                print(f"             → Recurrent excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
+                print(f"             -> Recurrent excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
     
     if save_results_file:
         import pickle
@@ -3234,13 +3297,13 @@ def run_all_ablation_tests(
         print("\nInterpretation:")
         avg_change2 = (change2_gc + change2_mc) / 2
         if avg_change2 < -0.5:
-            print("  ✓ STRONG support for disinhibition hypothesis")
-            print("    (>50% reduction when blocking exc. to interneurons)")
+            print("  STRONG support for disinhibition hypothesis")
+            print("  (>50% reduction when blocking exc. to interneurons)")
         elif avg_change2 < -0.3:
-            print("  ✓ MODERATE support for disinhibition hypothesis")
+            print("  MODERATE support for disinhibition hypothesis")
             print("    (30-50% reduction when blocking exc. to interneurons)")
         else:
-            print("  ✗ WEAK support for disinhibition hypothesis")
+            print("  WEAK support for disinhibition hypothesis")
             print("    (<30% reduction suggests other mechanisms)")
     
     # Save combined results
@@ -3252,42 +3315,735 @@ def run_all_ablation_tests(
     
     return all_results
 
+def plot_ablation_test_results(all_results: Dict,
+                               intensity: float = 1.0,
+                               save_path: Optional[str] = None) -> None:
+    """
+    Plot comprehensive ablation test results including non-target interneurons
+    
+    Creates a multi-panel figure showing:
+    - Bar plots comparing % excited cells across ablation conditions
+    - Separate panels for PV and SST stimulation
+    - All populations: GC, MC, and the non-target interneuron
+    - Error bars for multi-trial experiments
+    
+    Args:
+        all_results: Dictionary from run_all_ablation_tests()
+        intensity: Light intensity to plot (default: 1.0)
+        save_path: Optional directory to save figure
+    """
+    
+    # Extract test results
+    results_int_int = all_results['interneuron_interactions']
+    results_exc_int = all_results['excitation_to_interneurons']
+    results_recurrent = all_results['recurrent_excitation']
+    
+    # Create figure with subplots - 2 rows x 4 columns
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    
+    # Define colors
+    colors = {
+        'full': '#2ecc71',  # Green
+        'int_int': '#e74c3c',  # Red
+        'exc_int': '#e67e22',  # Orange
+        'recurrent': '#3498db'  # Blue
+    }
+    
+    conditions = ['Full\nNetwork', 'Block\nInt-Int', 'Block\nExc->Int', 'Block\nRecurrent']
+    
+    # Define populations to plot for each target
+    pop_map = {
+        'pv': ['gc', 'mc', 'pv_nonexpr', 'sst'],  # When stimulating PV, show GC, MC, PV-non-expressing, SST
+        'sst': ['gc', 'mc', 'pv', 'sst_nonexpr']   # When stimulating SST, show GC, MC, PV, SST-non-expressing
+    }
+    
+    for target_idx, target in enumerate(['pv', 'sst']):
+        populations = pop_map[target]
+        
+        for pop_idx, pop in enumerate(populations):
+            ax = axes[target_idx, pop_idx]
+            
+            # Handle non-expressing target cells specially
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                full_excited = results_exc_int['full_network'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                int_int_excited = results_int_int['blocked_int_int'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                exc_int_excited = results_exc_int['blocked_exc_to_int'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                recurrent_excited = results_recurrent['blocked_recurrent'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                
+                # Get error bars
+                errors = []
+                for result_dict, condition in [(results_exc_int, 'full_network'),
+                                               (results_int_int, 'blocked_int_int'),
+                                               (results_exc_int, 'blocked_exc_to_int'),
+                                               (results_recurrent, 'blocked_recurrent')]:
+                    std_key = f'{base_pop}_nonexpr_excited_std'
+                    if condition in result_dict and std_key in result_dict[condition][target][intensity]:
+                        errors.append(result_dict[condition][target][intensity][std_key])
+                    else:
+                        errors.append(0)
+            else:
+                # Normal populations
+                full_excited = results_exc_int['full_network'][target][intensity][f'{pop}_excited']
+                int_int_excited = results_int_int['blocked_int_int'][target][intensity][f'{pop}_excited']
+                exc_int_excited = results_exc_int['blocked_exc_to_int'][target][intensity][f'{pop}_excited']
+                recurrent_excited = results_recurrent['blocked_recurrent'][target][intensity][f'{pop}_excited']
+                
+                # Get error bars
+                errors = []
+                for result_dict, condition in [(results_exc_int, 'full_network'),
+                                               (results_int_int, 'blocked_int_int'),
+                                               (results_exc_int, 'blocked_exc_to_int'),
+                                               (results_recurrent, 'blocked_recurrent')]:
+                    std_key = f'{pop}_excited_std'
+                    if condition in result_dict and std_key in result_dict[condition][target][intensity]:
+                        errors.append(result_dict[condition][target][intensity][std_key])
+                    else:
+                        errors.append(0)
 
+            data = [full_excited, int_int_excited, exc_int_excited, recurrent_excited]
+                        
+            # Create bar plot
+            x_pos = np.arange(len(conditions))
+            bars = ax.bar(x_pos, data, yerr=errors if any(errors) else None,
+                         color=[colors['full'], colors['int_int'], 
+                               colors['exc_int'], colors['recurrent']],
+                         alpha=0.7, edgecolor='black', linewidth=1.5,
+                         capsize=5)
+            
+            # Add value labels on bars
+            for bar, value in zip(bars, data):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{value*100:.1f}%',
+                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+            
+            # Add percentage change labels for ablations
+            for i, (bar, value) in enumerate(zip(bars[1:], data[1:]), 1):
+                change = (value - data[0]) / (data[0] + 1e-6) * 100
+                height = bar.get_height()
+                color = 'red' if change < -10 else 'orange' if change < 0 else 'black'
+                ax.text(bar.get_x() + bar.get_width()/2., height * 0.5,
+                       f'{change:+.0f}%',
+                       ha='center', va='center', fontsize=10, 
+                       fontweight='bold', color=color,
+                       bbox=dict(boxstyle='round,pad=0.3', 
+                                facecolor='white', alpha=0.7))
+            
+            # Formatting
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(conditions, fontsize=10)
+            ax.set_ylabel('Fraction Excited', fontsize=10)
+            ax.set_ylim(0, max(data) * 1.2)
+            
+            # Format title based on population type
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                # Get count of non-expressing cells for subtitle
+                n_nonexpr = results_exc_int['full_network'][target][intensity].get(f'{base_pop}_nonexpr_count', 0)
+                ax.set_title(f'{target.upper()} Stim -> {target.upper()} (non-expr)\n({n_nonexpr} cells)', 
+                            fontsize=11, fontweight='bold', color='purple')
+            elif pop in ['pv', 'sst']:
+                ax.set_title(f'{target.upper()} Stim -> {pop.upper()} (non-target IN)', 
+                            fontsize=11, fontweight='bold', color='darkred')
+            else:
+                ax.set_title(f'{target.upper()} Stim -> {pop.upper()}', 
+                            fontsize=11, fontweight='bold')
+            
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_axisbelow(True)
+    
+    # Overall title
+    fig.suptitle(f'Ablation Test Results: Paradoxical Excitation\n'
+                f'(Intensity = {intensity})',
+                fontsize=14, fontweight='bold')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        plt.savefig(save_dir / f'ablation_results_intensity_{intensity}.pdf', 
+                   dpi=300, bbox_inches='tight')
+        plt.savefig(save_dir / f'ablation_results_intensity_{intensity}.png', 
+                   dpi=300, bbox_inches='tight')
+        print(f"\nSaved ablation plots to {save_dir}")
+    
+    plt.show()
+
+
+def test_opsin_expression_levels(
+    optimization_json_file: Optional[str] = None,
+    target_populations: List[str] = ['pv', 'sst'],
+    expression_levels: List[float] = [0.2, 0.4, 0.6, 0.8, 1.0],
+    intensity: float = 1.0,
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    stim_start: float = 1500.0,
+    stim_duration: float = 1000.0,
+    warmup: float = 500.0,
+    device: Optional[torch.device] = None,
+    n_trials: int = 3,
+    base_seed: int = 42,
+    include_ablations: bool = True,
+    save_results_file: Optional[str] = None
+) -> Dict:
+    """
+    Test how paradoxical excitation varies with opsin expression level
+    
+    This test varies the mean opsin expression level and measures how
+    paradoxical excitation changes. Optionally includes key ablation
+    conditions to test mechanism robustness.
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        target_populations: List of populations to stimulate
+        expression_levels: List of mean expression levels to test (0-1)
+        intensity: Light intensity for stimulation
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average per condition
+        base_seed: Base random seed
+        include_ablations: Whether to test ablation conditions
+        save_results_file: If provided, save results to this file
+        
+    Returns:
+        Dictionary with results for each expression level and condition
+    """
+    
+    if device is None:
+        from dendritic_somatic_transfer import get_default_device
+        device = get_default_device()
+    
+    print("\n" + "="*80)
+    print("TEST: Opsin Expression Level Dependence")
+    print("="*80)
+    print(f"\nTesting {len(expression_levels)} expression levels:")
+    print(f"  Expression levels: {expression_levels}")
+    print(f"  Trials per condition: {n_trials}")
+    if include_ablations:
+        print(f"  Including key ablation conditions")
+    print("="*80 + "\n")
+    
+    from DG_circuit_dendritic_somatic_transfer import (
+        CircuitParams, PerConnectionSynapticParams, OpsinParams
+    )
+    
+    circuit_params = CircuitParams()
+    base_synaptic_params = PerConnectionSynapticParams()
+    
+    # Define ablation conditions if requested
+    ablation_configs = {'full_network': base_synaptic_params}
+    
+    if include_ablations:
+        # Key ablation: Block excitation to interneurons (disinhibition test)
+        ablation_configs['blocked_exc_to_int'] = PerConnectionSynapticParams(
+            **{k: v for k, v in base_synaptic_params.__dict__.items() 
+               if k != 'connection_modulation'},
+            connection_modulation={
+                **base_synaptic_params.connection_modulation,
+                'mec_pv': 0.01,
+                'gc_pv': 0.01,
+                'mc_pv': 0.01,
+                'gc_sst': 0.01,
+                'mc_sst': 0.01,
+            }
+        )
+    
+    results = {config_name: {target: {} for target in target_populations}
+              for config_name in ablation_configs.keys()}
+    
+    for target in target_populations:
+        print(f"\n{'='*60}")
+        print(f"Testing {target.upper()} stimulation")
+        print('='*60)
+        
+        for config_name, synaptic_params in ablation_configs.items():
+            print(f"\n{config_name.replace('_', ' ').title()}")
+            print('-'*60)
+            
+            for expr_level in expression_levels:
+                print(f"  Expression level: {expr_level:.1f}")
+                
+                # Create opsin parameters with this expression level
+                opsin_params = OpsinParams(
+                    expression_mean=expr_level,
+                    expression_std=0.05,
+                    failure_rate=0.5,
+                    light_decay=0.4,
+                    hill_coeff=2.5,
+                    half_sat=0.4
+                )
+                
+                # Create experiment
+                experiment = OptogeneticExperiment(
+                    circuit_params, synaptic_params, opsin_params,
+                    optimization_json_file=optimization_json_file,
+                    device=device,
+                    base_seed=base_seed + int(expr_level * 1000)
+                )
+                
+                # Run stimulation
+                result = experiment.simulate_stimulation(
+                    target, intensity,
+                    stim_start=stim_start,
+                    stim_duration=stim_duration,
+                    plot_activity=False,
+                    mec_current=mec_current,
+                    opsin_current=opsin_current,
+                    n_trials=n_trials
+                )
+                
+                # Analyze results
+                time = result['time']
+                activity_mean = result['activity_trace_mean']
+                baseline_mask = (time >= warmup) & (time < stim_start)
+                stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+                
+                analysis = {'expression_level': expr_level}
+                
+                for pop in ['gc', 'mc', 'pv', 'sst']:
+                    if pop == target:
+                        continue
+                    
+                    baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+                    stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+                    rate_change = stim_rate - baseline_rate
+                    baseline_std = torch.std(baseline_rate)
+                    
+                    excited_fraction = torch.mean((rate_change > baseline_std).float())
+                    
+                    analysis[f'{pop}_excited'] = excited_fraction.item()
+                    analysis[f'{pop}_mean_change'] = torch.mean(rate_change).item()
+                    
+                    # Get trial-to-trial variability
+                    if n_trials > 1:
+                        excited_fractions = []
+                        for trial_result in result['trial_results']:
+                            trial_activity = trial_result['activity_trace'][pop]
+                            trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                            trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                            trial_change = trial_stim - trial_baseline
+                            trial_baseline_std = torch.std(trial_baseline)
+                            trial_excited = torch.mean((trial_change > trial_baseline_std).float()).item()
+                            excited_fractions.append(trial_excited)
+                        
+                        analysis[f'{pop}_excited_std'] = np.std(excited_fractions)
+                
+                results[config_name][target][expr_level] = analysis
+    
+    # Save results if requested
+    if save_results_file:
+        import pickle
+        with open(save_results_file, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"\nResults saved to: {save_results_file}")
+    
+    return results
+
+
+def plot_expression_level_results(
+    results: Dict,
+    save_path: Optional[str] = None
+) -> None:
+    """
+    Plot how paradoxical excitation varies with opsin expression level
+    
+    Creates plots showing:
+    - Expression level dependence for full network
+    - Comparison with ablation conditions (if available)
+    - Separate panels for PV and SST stimulation
+    - All populations including non-target interneurons
+    
+    Args:
+        results: Dictionary from test_opsin_expression_levels()
+        save_path: Optional directory to save figure
+    """
+    
+    # Extract configuration names and expression levels
+    config_names = list(results.keys())
+    targets = list(results[config_names[0]].keys())
+    
+    # Get expression levels from first config/target
+    expression_levels = sorted(results[config_names[0]][targets[0]].keys())
+    
+    # Create figure - 2 rows x 4 columns
+    n_configs = len(config_names)
+    fig, axes = plt.subplots(2, 4, figsize=(18, 10))
+    
+    # Define colors and markers
+    colors = {
+        'full_network': '#2ecc71',
+        'blocked_exc_to_int': '#e67e22',
+        'blocked_int_int': '#e74c3c',
+        'blocked_recurrent': '#3498db'
+    }
+    markers = {
+        'full_network': 'o',
+        'blocked_exc_to_int': 's',
+        'blocked_int_int': '^',
+        'blocked_recurrent': 'D'
+    }
+    labels = {
+        'full_network': 'Full Network',
+        'blocked_exc_to_int': 'Block Exc->Int',
+        'blocked_int_int': 'Block Int-Int',
+        'blocked_recurrent': 'Block Recurrent'
+    }
+    
+    # Define populations to plot for each target
+    pop_map = {
+        'pv': ['gc', 'mc', 'pv_nonexpr', 'sst'],
+        'sst': ['gc', 'mc', 'pv', 'sst_nonexpr']
+    }
+    
+    for target_idx, target in enumerate(targets):
+        populations = pop_map[target]
+        
+        for pop_idx, pop in enumerate(populations):
+            ax = axes[target_idx, pop_idx]
+            
+            for config_name in config_names:
+                excited_fractions = []
+                excited_errors = []
+                
+                for expr_level in expression_levels:
+                    data = results[config_name][target][expr_level]
+                    
+                    # Handle non-expressing target cells
+                    if pop.endswith('_nonexpr'):
+                        base_pop = pop.replace('_nonexpr', '')
+                        excited_fractions.append(data.get(f'{base_pop}_nonexpr_excited', 0.0) * 100)
+                        
+                        if f'{base_pop}_nonexpr_excited_std' in data:
+                            excited_errors.append(data[f'{base_pop}_nonexpr_excited_std'] * 100)
+                        else:
+                            excited_errors.append(0)
+                    else:
+                        # Normal populations
+                        excited_fractions.append(data[f'{pop}_excited'] * 100)
+                        
+                        if f'{pop}_excited_std' in data:
+                            excited_errors.append(data[f'{pop}_excited_std'] * 100)
+                        else:
+                            excited_errors.append(0)
+                
+                # Plot with error bars
+                ax.errorbar(expression_levels, excited_fractions,
+                           yerr=excited_errors if any(excited_errors) else None,
+                           marker=markers.get(config_name, 'o'),
+                           color=colors.get(config_name, 'gray'),
+                           label=labels.get(config_name, config_name),
+                           linewidth=2, markersize=8, capsize=5,
+                           alpha=0.8)
+            
+            # Formatting
+            ax.set_xlabel('Mean Opsin Expression Level', fontsize=10)
+            ax.set_ylabel('% Cells Paradoxically Excited', fontsize=10)
+            
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                ax.set_title(f'{target.upper()} Stim -> {target.upper()} (non-expr)',
+                            fontsize=11, fontweight='bold', color='purple')
+            elif pop in ['pv', 'sst']:
+                ax.set_title(f'{target.upper()} Stim -> {pop.upper()} (non-target IN)',
+                            fontsize=11, fontweight='bold', color='darkred')
+            else:
+                ax.set_title(f'{target.upper()} Stim -> {pop.upper()}',
+                            fontsize=11, fontweight='bold')
+            
+            ax.grid(True, alpha=0.3)
+            ax.set_axisbelow(True)
+            ax.legend(fontsize=10, loc='best')
+            
+            # Set x-axis limits
+            ax.set_xlim(min(expression_levels) - 0.05, max(expression_levels) + 0.05)
+    
+    # Overall title
+    fig.suptitle('Opsin Expression Level Dependence',
+                 fontsize=14, fontweight='bold')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        plt.savefig(save_dir / 'expression_level_results.pdf',
+                   dpi=300, bbox_inches='tight')
+        plt.savefig(save_dir / 'expression_level_results.png',
+                   dpi=300, bbox_inches='tight')
+        print(f"\nSaved expression level plots to {save_dir}")
+    
+    plt.show()
+
+    
+
+def plot_combined_ablation_and_expression(
+    ablation_results: Dict,
+    expression_results: Dict,
+    intensity: float = 1.0,
+    save_path: Optional[str] = None
+) -> None:
+    """
+    Create comprehensive figure combining ablation and expression level results
+    
+    Args:
+        ablation_results: Results from run_all_ablation_tests()
+        expression_results: Results from test_opsin_expression_levels()
+        intensity: Light intensity for ablation results
+        save_path: Optional directory to save figure
+    """
+    
+    fig = plt.figure(figsize=(18, 8))
+    gs = fig.add_gridspec(2, 8, hspace=0.35, wspace=0.35)
+    
+    # Top row: Ablation test bar plots
+    ablation_axes = [fig.add_subplot(gs[0, i]) for i in range(8)]
+    
+    # Extract ablation data
+    results_int_int = ablation_results['interneuron_interactions']
+    results_exc_int = ablation_results['excitation_to_interneurons']
+    results_recurrent = ablation_results['recurrent_excitation']
+    
+    colors = {
+        'full': '#2ecc71',
+        'int_int': '#e74c3c',
+        'exc_int': '#e67e22',
+        'recurrent': '#3498db'
+    }
+    
+    conditions = ['Full', 'Int-Int', 'Exc->Int', 'MC<->GC']
+    
+    pop_map = {
+        'pv': ['gc', 'mc', 'pv_nonexpr', 'sst'],
+        'sst': ['gc', 'mc', 'pv', 'sst_nonexpr']
+    }
+
+    y_label_set = False
+    ax_idx = 0
+    for target in ['pv', 'sst']:
+        populations = pop_map[target]
+        for pop in populations:
+            ax = ablation_axes[ax_idx]
+            
+            # Handle non-expressing target cells
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                full_excited = results_exc_int['full_network'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                int_int_excited = results_int_int['blocked_int_int'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                exc_int_excited = results_exc_int['blocked_exc_to_int'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+                recurrent_excited = results_recurrent['blocked_recurrent'][target][intensity].get(f'{base_pop}_nonexpr_excited', 0.0)
+            else:
+                full_excited = results_exc_int['full_network'][target][intensity][f'{pop}_excited']
+                int_int_excited = results_int_int['blocked_int_int'][target][intensity][f'{pop}_excited']
+                exc_int_excited = results_exc_int['blocked_exc_to_int'][target][intensity][f'{pop}_excited']
+                recurrent_excited = results_recurrent['blocked_recurrent'][target][intensity][f'{pop}_excited']
+            
+            data = [full_excited, int_int_excited, exc_int_excited, recurrent_excited]
+            
+            x_pos = np.arange(len(conditions))
+            bars = ax.bar(x_pos, [d * 100 for d in data],
+                         color=[colors['full'], colors['int_int'],
+                               colors['exc_int'], colors['recurrent']],
+                         alpha=0.7, edgecolor='black', linewidth=1.5)
+            
+            # Value labels
+            for bar, value in zip(bars, data):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{value*100:.0f}%',
+                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+            
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(conditions, fontsize=10, rotation=45, ha='right')
+            if not y_label_set:
+                ax.set_ylabel('% Excited', fontsize=10)
+                y_label_set = True
+            
+            # Color interneuron titles differently
+            # Color interneuron titles differently
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                ax.set_title(f'{target.upper()}→{target.upper()}†', fontsize=10, 
+                           fontweight='bold', color='purple')
+            elif pop in ['pv', 'sst']:
+                ax.set_title(f'{target.upper()}→{pop.upper()}*', fontsize=10, 
+                           fontweight='bold', color='darkred')
+            else:
+                ax.set_title(f'{target.upper()}→{pop.upper()}', fontsize=10, 
+                           fontweight='bold')
+            
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_ylim(0, max([d * 100 for d in data]) * 1.2)
+            
+            ax_idx += 1
+    
+    # Middle and bottom rows: Expression level line plots (12 panels)
+    expression_axes = [fig.add_subplot(gs[1, col]) 
+                       for col in range(8)]
+    
+    # Get expression levels
+    config_names = list(expression_results.keys())
+    targets = list(expression_results[config_names[0]].keys())
+    expression_levels = sorted(expression_results[config_names[0]][targets[0]].keys())
+    
+    expression_colors = {
+        'full_network': '#2ecc71',
+        'blocked_exc_to_int': '#e67e22',
+        'blocked_int_int': '#e74c3c',
+        'blocked_recurrent': '#3498db'
+    }
+    markers = {
+        'full_network': 'o',
+        'blocked_exc_to_int': 's'
+    }
+    labels = {
+        'full_network': 'Full Network',
+        'blocked_exc_to_int': 'Block Exc->Int'
+    }
+
+    y_label_set = False
+    ax_idx = 0
+    for target in targets:
+        populations = pop_map[target]
+        for pop in populations:
+            ax = expression_axes[ax_idx]
+            
+            for config_name in config_names:
+                excited_fractions = []
+                
+                for expr_level in expression_levels:
+                    data = expression_results[config_name][target][expr_level]
+                    
+                    # Handle non-expressing target cells
+                    if pop.endswith('_nonexpr'):
+                        base_pop = pop.replace('_nonexpr', '')
+                        excited_fractions.append(data.get(f'{base_pop}_nonexpr_excited', 0.0) * 100)
+                    else:
+                        excited_fractions.append(data[f'{pop}_excited'] * 100)
+                
+                ax.plot(expression_levels, excited_fractions,
+                        marker=markers.get(config_name, 'o'),
+                        color=expression_colors.get(config_name, 'gray'),
+                        label=labels.get(config_name, config_name),
+                        linewidth=1.5, markersize=5, alpha=0.8)
+            
+            ax.set_xlabel('Opsin Expression', fontsize=10)
+            if not y_label_set:
+                ax.set_ylabel('% Excited', fontsize=10)
+                y_label_set = True
+            
+            # Color interneuron titles differently
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                ax.set_title(f'{target.upper()}→{target.upper()}†', fontsize=10, 
+                           fontweight='bold', color='purple')
+            elif pop in ['pv', 'sst']:
+                ax.set_title(f'{target.upper()}→{pop.upper()}*', fontsize=10, 
+                           fontweight='bold', color='darkred')
+            else:
+                ax.set_title(f'{target.upper()}→{pop.upper()}', fontsize=10, 
+                           fontweight='bold')
+            
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=10, loc='best')
+            
+            ax_idx += 1
+    
+    # Add section labels
+    fig.text(0.02, 0.95, 'A. Ablation Tests (* = non-target IN, † = non-expr target)', 
+             fontsize=11, fontweight='bold')
+    fig.text(0.02, 0.475, 'B. Expression Level Dependence', 
+             fontsize=11, fontweight='bold')
+    
+    fig.suptitle('Dependence of Paradoxical Excitation on\n'
+                 'Mechanisms and Expression Level\n',
+                fontsize=13, fontweight='bold', y=0.98)
+    
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        plt.savefig(save_dir / 'combined_ablation_expression.pdf',
+                   dpi=300, bbox_inches='tight')
+        plt.savefig(save_dir / 'combined_ablation_expression.png',
+                   dpi=300, bbox_inches='tight')
+        print(f"\nSaved combined plot to {save_dir}")
+    
+    plt.show()
+
+    
+"""
+Updated main block for DG_protocol.py that includes ablation and expression level analysis.
+Replace the existing if __name__ == "__main__": block with this version.
+"""
 
 if __name__ == "__main__":
-    print("PyTorch Dentate Gyrus Circuit with Anatomical Connectivity")
+    print("Dentate Gyrus Circuit with Anatomical Connectivity")
     print("=========================================================")
     
     # Parse command line arguments
     import argparse
-    parser = argparse.ArgumentParser(description='DG Optogenetic Protocol with Multi-Trial Support')
+    parser = argparse.ArgumentParser(
+        description='DG Optogenetic Protocol with Multi-Trial Support',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run all experiments (default):
+  python DG_protocol.py --n-trials 3
+  
+  # Plot previously saved results:
+  python DG_protocol.py --plot-only --load-comparative-results results.pkl
+  
+  # Plot all results:
+  python DG_protocol.py --plot-only \\
+      --load-comparative-results protocol/results.pkl \\
+      --load-ablation-results protocol/ablation_tests/all_ablation_tests.pkl \\
+      --load-expression-results protocol/expression_tests/expression_results.pkl
+        """)
+    
+    # Execution mode
+    parser.add_argument('--plot-only', action='store_true',
+                        help='Only plot results (requires at least one --load-* option)')
+    
+    # Loading options (for plot-only mode)
+    parser.add_argument('--load-comparative-results', type=str, default=None,
+                        metavar='FILE',
+                        help='Load comparative experiment results from FILE')
+    parser.add_argument('--load-ablation-results', type=str, default=None,
+                        metavar='FILE',
+                        help='Load ablation test results from FILE')
+    parser.add_argument('--load-expression-results', type=str, default=None,
+                        metavar='FILE',
+                        help='Load expression level test results from FILE')
+    
+    # Circuit and simulation parameters
     parser.add_argument('--optimization-file', type=str, default=None,
-                       help='Path to optimization JSON file')
+                        help='Path to optimization JSON file')
     parser.add_argument('--device', type=str, default=None,
-                       choices=['cpu', 'cuda', None],
-                       help='Device to run on (default: auto-detect)')
+                        choices=['cpu', 'cuda', None],
+                        help='Device to run on (default: auto-detect)')
     parser.add_argument('--n-trials', type=int, default=3,
-                       help='Number of trials to average (default: 3)')
+                        help='Number of trials to average (default: 3)')
     parser.add_argument('--regenerate-connectivity', action='store_true',
-                        help='Regenerate circuit connectivity for each trial (default: False, reuse same circuit)')
+                        help='Regenerate circuit connectivity for each trial')
     parser.add_argument('--base-seed', type=int, default=42,
-                       help='Base random seed (default: 42)')
+                        help='Base random seed (default: 42)')
     parser.add_argument('--mec-current', type=float, default=40.0,
                         help='MEC drive current in pA (default: 40.0)')
     parser.add_argument('--opsin-current', type=float, default=200.0,
-                       help='Optogenetic current in pA (default: 200.0)')
+                        help='Optogenetic current in pA (default: 200.0)')
     parser.add_argument('--stim-start', type=float, default=1500.0,
                         help='Optogenetic stimulus start time [ms] (default: 1500.0)')
     parser.add_argument('--stim-duration', type=float, default=1000.0,
                         help='Optogenetic stimulus duration [ms] (default: 1000.0)')
-    parser.add_argument('--load-results', type=str, default=None,
-                       help='Load results from file instead of running experiment')
-    parser.add_argument('--save-results', type=str, default=None,
-                       help='Save results to specific file')
     parser.add_argument('--no-auto-save', action='store_true',
-                       help='Disable automatic saving of results')
-    parser.add_argument('--plot-only', action='store_true',
-                       help='Only plot results (requires --load-results)')
+                        help='Disable automatic saving of results')
+    
+    # Adaptive stepping
     parser.add_argument('--adaptive-step', action='store_true',
                         help='Use gradient-driven adaptive time stepping')
     parser.add_argument('--adaptive-dt-min', type=float, default=0.05,
@@ -3298,32 +4054,128 @@ if __name__ == "__main__":
                         help='Low gradient threshold (Hz/ms)')
     parser.add_argument('--adaptive-gradient-high', type=float, default=10.0,
                         help='High gradient threshold (Hz/ms)')
+    
+    # MEC input patterns
     parser.add_argument('--time-varying-mec', action='store_true',
-                       help='Enable time-varying MEC input')
+                        help='Enable time-varying MEC input')
     parser.add_argument('--mec-pattern-type', type=str, default='oscillatory',
-                       choices=['oscillatory', 'drift', 'noisy', 'constant'],
-                       help='Type of temporal pattern for MEC input')
+                        choices=['oscillatory', 'drift', 'noisy', 'constant'],
+                        help='Type of temporal pattern for MEC input')
     parser.add_argument('--mec-theta-freq', type=float, default=5.0,
-                       help='Theta oscillation frequency (Hz)')
+                        help='Theta oscillation frequency (Hz)')
     parser.add_argument('--mec-theta-amplitude', type=float, default=0.3,
-                       help='Theta modulation depth (0-1)')
+                        help='Theta modulation depth (0-1)')
     parser.add_argument('--mec-gamma-freq', type=float, default=20.0,
-                       help='Gamma oscillation frequency (Hz)')
+                        help='Gamma oscillation frequency (Hz)')
     parser.add_argument('--mec-gamma-amplitude', type=float, default=0.15,
-                       help='Gamma modulation depth (0-1)')
+                        help='Gamma modulation depth (0-1)')
     parser.add_argument('--mec-rotation-groups', type=int, default=3,
-                       help='Number of groups for spatial rotation')
+                        help='Number of groups for spatial rotation')
     parser.add_argument('--mec-gamma-coupling', type=float, default=0.8,
                         help='Gamma-theta coupling strength (0=independent, 1=fully coupled)')
     parser.add_argument('--mec-gamma-phase', type=float, default=0.0,
-                        help='Preferred theta phase for gamma peak (radians, 0=peak, pi=trough)')
+                        help='Preferred theta phase for gamma peak (radians)')
     
+    # Expression level test parameters
+    parser.add_argument('--expression-levels', type=float, nargs='+',
+                        default=[0.2, 0.4, 0.6, 0.8, 1.0],
+                        help='Expression levels to test (default: 0.2 0.4 0.6 0.8 1.0)')
     
     args = parser.parse_args()
 
     # Validate arguments
-    if args.plot_only and args.load_results is None:
-        parser.error("--plot-only requires --load-results")
+    if args.plot_only:
+        if not any([args.load_comparative_results, args.load_ablation_results, 
+                    args.load_expression_results]):
+            parser.error("--plot-only requires at least one of: --load-comparative-results, "
+                         "--load-ablation-results, --load-expression-results")
+            
+    output_dir = "protocol"
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    # =========================================================================
+    # PLOT-ONLY MODE: Load and plot results
+    # =========================================================================
+    
+    if args.plot_only:
+        
+        results = None
+        connectivity_analysis = None
+        conductance_analysis = None
+        ablation_results = None
+        expression_results = None
+        
+        # Load comparative results
+        if args.load_comparative_results:
+            print(f"\nLoading comparative results from: {args.load_comparative_results}")
+            results, connectivity_analysis, conductance_analysis, metadata = \
+                load_experiment_results(args.load_comparative_results)
+        
+        # Load ablation results
+        if args.load_ablation_results:
+            print(f"\nLoading ablation results from: {args.load_ablation_results}")
+            import pickle
+            with open(args.load_ablation_results, 'rb') as f:
+                ablation_results = pickle.load(f)
+        
+        # Load expression results
+        if args.load_expression_results:
+            print(f"\nLoading expression results from: {args.load_expression_results}")
+            import pickle
+            with open(args.load_expression_results, 'rb') as f:
+                expression_results = pickle.load(f)
+        
+        # Plot comparative results
+        if results is not None:
+            print("\nPlotting comparative experiment results...")
+            for intensity in [0.5, 1.0, 1.5]:
+                if intensity in results['pv']:
+                    plot_comparative_experiment_results(
+                        results, connectivity_analysis, 
+                        stimulation_level=intensity, 
+                        save_path=str(output_path)
+                    )
+        
+        # Plot ablation results
+        if ablation_results is not None:
+            print("\nPlotting ablation test results...")
+            for intensity in [0.5, 1.0, 1.5]:
+                # Check if this intensity was tested
+                try:
+                    test_intensity = list(ablation_results['excitation_to_interneurons']['full_network']['pv'].keys())[0]
+                    if intensity == test_intensity or intensity == 1.0:
+                        plot_ablation_test_results(
+                            ablation_results,
+                            intensity=intensity,
+                            save_path=str(output_path / "ablation_tests")
+                        )
+                except:
+                    pass
+        
+        # Plot expression results
+        if expression_results is not None:
+            print("\nPlotting expression level results...")
+            plot_expression_level_results(
+                expression_results,
+                save_path=str(output_path / "expression_tests")
+            )
+        
+        # Plot combined figure if we have both ablation and expression results
+        if ablation_results is not None and expression_results is not None:
+            print("\nPlotting combined ablation and expression analysis...")
+            plot_combined_ablation_and_expression(
+                ablation_results,
+                expression_results,
+                intensity=1.5,
+                save_path=str(output_path)
+            )
+        
+        sys.exit(0)
+    
+    print("\n" + "="*80)
+    print("Executing all experiments")
+    print("="*80)
     
     # Auto-detect device or use specified
     if args.device is None:
@@ -3347,12 +4199,13 @@ if __name__ == "__main__":
     
     print(f"Number of trials: {args.n_trials}")
     print(f"Base seed: {args.base_seed}")
+    print(f"Auto-save: {not args.no_auto_save}")
 
-    output_dir = "protocol"
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-
-    # Run comparative experiment with multi-trial averaging
+    # Run main comparative experiment
+    print("\n" + "#"*80)
+    print("# Comparative PV vs SST Stimulation")
+    print("#"*80)
+    
     results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
         optimization_json_file=args.optimization_file,
         intensities=[0.5, 1.0, 1.5],
@@ -3364,8 +4217,8 @@ if __name__ == "__main__":
         base_seed=args.base_seed,
         stim_start=args.stim_start,
         stim_duration=args.stim_duration,
-        load_results_file=args.load_results,
-        save_results_file=args.save_results,
+        load_results_file=args.load_comparative_results,
+        save_results_file=None,  # Let auto_save handle it
         auto_save=not args.no_auto_save,
         adaptive_step=args.adaptive_step,
         adaptive_config=adaptive_config,
@@ -3380,57 +4233,56 @@ if __name__ == "__main__":
         mec_rotation_groups=args.mec_rotation_groups
     )
 
-    # Print results with multi-trial statistics
-    if not args.plot_only:
-        mec_conn = connectivity_analysis['mec_connectivity']
-        print(f"\nMEC -> PV connections: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
-        print(f"MEC -> GC connections: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
-        print(f"MEC -> MC connections: {mec_conn['mec_to_mc']}")
-        print(f"MEC -> SST connections: {mec_conn['mec_to_sst']}")
+    # Print comparative results summary
+    mec_conn = connectivity_analysis['mec_connectivity']
+    print(f"\nMEC Connectivity Summary:")
+    print(f"  MEC -> PV: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
+    print(f"  MEC -> GC: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
+    print(f"  MEC -> MC: {mec_conn['mec_to_mc']}")
+    print(f"  MEC -> SST: {mec_conn['mec_to_sst']}")
 
-        for target in ['sst', 'pv']:
-            print(f"\n{target.upper()} Stimulation Results (Average of {args.n_trials} trials):")
-            print("-" * 50)
+    for target in ['pv', 'sst']:
+        print(f"\n{target.upper()} Stimulation Results (n={args.n_trials} trials):")
+        print("-" * 50)
 
-            for intensity in [0.5, 1.0, 1.5]:
-                analysis = results[target][intensity]
-                print(f"\nIntensity {intensity}:")
+        for intensity in [0.5, 1.0, 1.5]:
+            analysis = results[target][intensity]
+            print(f"\nIntensity {intensity}:")
 
-                for pop in ['gc', 'mc', 'pv', 'sst']:
-                    if f'{pop}_excited' in analysis:
-                        excited = analysis[f'{pop}_excited']
-                        excited_std = analysis.get(f'{pop}_excited_std', 0.0)
-                        inhibited = analysis[f'{pop}_inhibited'] 
-                        mean_change = analysis[f'{pop}_mean_change']
-                        mean_change_std = analysis.get(f'{pop}_mean_change_std', 0.0)
-                        mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
-                        mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                if f'{pop}_excited' in analysis:
+                    excited = analysis[f'{pop}_excited']
+                    excited_std = analysis.get(f'{pop}_excited_std', 0.0)
+                    inhibited = analysis[f'{pop}_inhibited'] 
+                    mean_change = analysis[f'{pop}_mean_change']
+                    mean_change_std = analysis.get(f'{pop}_mean_change_std', 0.0)
+                    mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
+                    mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
 
-                        print(f"  {pop.upper()}:")
-                        print(f"    Excited: {excited:.2f} +/- {excited_std:.2f}")
-                        print(f"    Inhibited: {inhibited:.2f}")
-                        print(f"    Rate: {mean_baseline_rate:.2f} -> {mean_stim_rate:.2f} Hz")
-                        print(f"    Change: {mean_change:.3f} +/- {mean_change_std:.3f} Hz")
+                    print(f"  {pop.upper()}:")
+                    print(f"    Excited: {excited:.2f} +/- {excited_std:.2f}")
+                    print(f"    Inhibited: {inhibited:.2f}")
+                    print(f"    Rate: {mean_baseline_rate:.1f} -> {mean_stim_rate:.1f} Hz")
+                    print(f"    Change: {mean_change:.2f} +/- {mean_change_std:.2f} Hz")
 
+    # Plot comparative results
+    print("\nGenerating comparative experiment plots...")
+    for intensity in [0.5, 1.0, 1.5]:
+        plot_comparative_experiment_results(
+            results, connectivity_analysis, 
+            stimulation_level=intensity, 
+            save_path=str(output_path)
+        )
 
-    # Plot adaptive stepping analysis if adaptive stepping was used
-    #if args.adaptive_step and 'adaptive_stats' in results['pv'][1.0]:
-    #    plot_adaptive_stepping_analysis(
-    #        results['pv'][1.0]['adaptive_stats'],
-    #        stim_start=args.stim_start,
-    #        stim_duration=args.stim_duration,
-    #        save_path="protocol/DG_adaptive_stepping_analysis.png"
-    #    )
-
-    # Plot results with multi-trial statistics
-    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=0.5, save_path="protocol")
-    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=1.0, save_path="protocol")
-    plot_comparative_experiment_results(results, connectivity_analysis, stimulation_level=1.5, save_path="protocol")
-
+    # Run ablation tests
+    print("\n" + "#"*80)
+    print("# Ablation Tests")
+    print("#"*80)
     
-    run_all_ablation_tests(
+    ablation_output = output_path / "ablation_tests"
+    ablation_results = run_all_ablation_tests(
         optimization_json_file=args.optimization_file,
-        intensities=[1.0],
+        intensities=[0.5, 1.0, 1.5],
         mec_current=args.mec_current,
         opsin_current=args.opsin_current,
         stim_start=args.stim_start,
@@ -3438,4 +4290,64 @@ if __name__ == "__main__":
         device=device,
         n_trials=args.n_trials,
         base_seed=args.base_seed,
-        output_dir="./ablation_tests")
+        output_dir=str(ablation_output)
+    )
+    
+    # Plot ablation results
+    print("\nGenerating ablation test plots...")
+    for intensity in [0.5, 1.0, 1.5]:
+        plot_ablation_test_results(
+            ablation_results,
+            intensity=intensity,
+            save_path=str(ablation_output)
+        )
+    
+    # Run expression level test
+    print("\n" + "#"*80)
+    print("# Opsin Expression Level Test")
+    print("#"*80)
+    
+    expression_output = output_path / "expression_tests"
+    expression_output.mkdir(exist_ok=True)
+    
+    expression_results = test_opsin_expression_levels(
+        optimization_json_file=args.optimization_file,
+        target_populations=['pv', 'sst'],
+        expression_levels=args.expression_levels,
+        intensity=1.5,
+        mec_current=args.mec_current,
+        opsin_current=args.opsin_current,
+        stim_start=args.stim_start,
+        stim_duration=args.stim_duration,
+        device=device,
+        n_trials=args.n_trials,
+        base_seed=args.base_seed,
+        include_ablations=True,
+        save_results_file=str(expression_output / "expression_results.pkl")
+    )
+    
+    # Plot expression level results
+    print("\nGenerating expression level plots...")
+    plot_expression_level_results(
+        expression_results,
+        save_path=str(expression_output)
+    )
+    
+    # Create combined analysis plot
+    print("\nGenerating combined analysis figure...")
+    plot_combined_ablation_and_expression(
+        ablation_results,
+        expression_results,
+        intensity=1.5,
+        save_path=str(output_path)
+    )
+    
+    # Final summary
+    print("\n" + "="*80)
+    print("EXPERIMENTS COMPLETE")
+    print("="*80)
+    print(f"\nResults saved to:")
+    print(f"  Comparative: {output_path}/")
+    print(f"  Ablation: {ablation_output}/")
+    print(f"  Expression: {expression_output}/")
+    print("="*80)

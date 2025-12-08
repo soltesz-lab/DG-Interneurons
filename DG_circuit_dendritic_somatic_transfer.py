@@ -197,12 +197,12 @@ class PerConnectionSynapticParams:
         'mc_sst': 0.5,        # Excitation to SST
         
         # Inhibitory connections  
-        'pv_gc': 3.5, #3.662,       # Perisomatic inhibition
+        'pv_gc': 4.0, #3.662,       # Perisomatic inhibition
         'pv_mc': 0.5,               # Inhibition of MC
         'pv_pv': 0.15, #1.875,      # PV lateral inhibition
         'pv_sst': 0.1, #1.51,       # IN disinhibition
-        'sst_gc': 2.0, #1.22        # GC dendritic inhibition
-        'sst_mc': 0.5,              # Inhibition of MC
+        'sst_gc': 2.5, #1.22        # GC dendritic inhibition
+        'sst_mc': 0.75,             # Inhibition of MC
         'sst_pv': 0.5, #1.51,       # IN disinhibition
         'sst_sst': 0.5, #1.51,      # IN disinhibition
         

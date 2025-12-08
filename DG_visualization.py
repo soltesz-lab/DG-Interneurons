@@ -586,7 +586,7 @@ class DGCircuitVisualization:
     
     def plot_activity_raster(self, activity_trace, vmin=0, vmax=None, 
                              mean_linewidth=2.5, cmap='coolwarm', save_path=None,
-                             split_populations=None, direct_activation=None,
+                             sort_by_activity=False, split_populations=None, direct_activation=None,
                              activation_cmap='plasma', activation_bar_width=None):
         """
         Plot circuit activity as raster plots with neurons sorted by mean firing rate
@@ -672,11 +672,11 @@ class DGCircuitVisualization:
                     activation_part1 = activation_data[unit_ids_part1] if activation_data is not None else None
 
                     self._plot_single_raster(ax, activity_part1, time_axis, pop, 
-                                            vmin, vmax, cmap, mean_linewidth,
-                                            title_suffix=f' - {part1_label}',
-                                            direct_activation=activation_part1,
-                                            activation_cmap=activation_cmap,
-                                            activation_bar_width=activation_bar_width)
+                                             vmin, vmax, cmap, mean_linewidth,
+                                             title_suffix=f' - {part1_label}',
+                                             direct_activation=activation_part1,
+                                             activation_cmap=activation_cmap,
+                                             activation_bar_width=activation_bar_width)
                     panel_idx += 1
 
                 # Plot Part 2
@@ -701,7 +701,8 @@ class DGCircuitVisualization:
                                          vmin, vmax, cmap, mean_linewidth,
                                          direct_activation=activation_data,
                                          activation_cmap=activation_cmap,
-                                         activation_bar_width=activation_bar_width)
+                                         activation_bar_width=activation_bar_width,
+                                         sort_by_activity=sort_by_activity)
                 activity_history[pop] = np.mean(activity_data, axis=0).tolist()
                 panel_idx += 1
 
@@ -790,11 +791,11 @@ class DGCircuitVisualization:
                     
                     # Rectangle positioned at y=i with height=1.0 to match raster row
                     rect = Rectangle(xy=(bar_x_start, i), 
-                                   width=bar_width, 
-                                   height=1.0,
-                                   facecolor=color, 
-                                   edgecolor='none',
-                                   zorder=10)
+                                     width=bar_width, 
+                                     height=1.0,
+                                     facecolor=color, 
+                                     edgecolor='none',
+                                     zorder=10)
                     ax.add_patch(rect)
                 
                 # Add colorbar for activation using ScalarMappable
@@ -803,20 +804,20 @@ class DGCircuitVisualization:
                 
                 # Create inset axis for activation colorbar (positioned outside main plot)
                 cbar_ax = inset_axes(ax, 
-                                    width="2%",  
-                                    height="30%",
-                                    loc='upper left',
-                                    bbox_to_anchor=(-0.25, 0.05, 1, 1),  # Negative x moves it outside
-                                    bbox_transform=ax.transAxes,
-                                    borderpad=0)
+                                     width="2%",  
+                                     height="30%",
+                                     loc='upper left',
+                                     bbox_to_anchor=(-0.25, 0.05, 1, 1),  # Negative x moves it outside
+                                     bbox_transform=ax.transAxes,
+                                     borderpad=0)
 
                 cbar_activation = plt.colorbar(sm, cax=cbar_ax, orientation='vertical')
                 cbar_activation.set_label('Input\nCurrent\n(nA)', 
-                                        fontsize=8, 
-                                        rotation=0,
-                                        ha='center',
-                                        va='bottom',
-                                        labelpad=10)
+                                          fontsize=8, 
+                                          rotation=0,
+                                          ha='center',
+                                          va='bottom',
+                                          labelpad=10)
                 cbar_activation.ax.tick_params(labelsize=7)
 
                 
