@@ -90,7 +90,8 @@ class SynapticStateManager:
             
             if synapse_type == 'excitatory':
 
-                #if pre_pop == 'gc' and post_pop == 'mc':
+                #if post_pop == 'mc':
+                #    print(f"{pre_pop} -> {post_pop} connectivity: {torch.sum(connectivity)}")
                 #    print(f"{pre_pop} -> {post_pop} pre rates range: {torch.min(pre_rates)} {torch.max(pre_rates)}")
                 #    print(f"{pre_pop} -> {post_pop} synaptic input shape: {synaptic_input.shape}")
                 #    print(f"{pre_pop} -> {post_pop} synaptic input range: {torch.min(synaptic_input)} {torch.max(synaptic_input)}")
@@ -165,6 +166,120 @@ class SynapticStateManager:
     
         return self._decay_cache[dt]
 
+    def get_synaptic_currents(self, conn_name: str, v_post: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Calculate synaptic currents for a specific connection
+
+        Args:
+            conn_name: Connection name (e.g., 'gc_mc', 'pv_gc')
+            v_post: Postsynaptic membrane potentials [n_post] in mV
+
+        Returns:
+            Dict with 'ampa', 'gaba', 'nmda' currents [n_post] in pA
+            Currents are total across all presynaptic cells for each postsynaptic cell
+        """
+        if conn_name not in self.synaptic_states:
+            n_post = len(v_post)
+            zero = torch.zeros(n_post, device=self.device)
+            return {'ampa': zero, 'gaba': zero, 'nmda': zero}
+
+        # Get conductances
+        conductances = self.get_total_conductances(conn_name)
+
+        # Calculate driving forces (mV)
+        v_post_expanded = v_post  # [n_post]
+
+        # AMPA and NMDA are excitatory (E_exc = 0 mV)
+        driving_force_exc = self.synaptic_params.e_exc - v_post_expanded
+
+        # GABA is inhibitory (E_inh = -70 mV)
+        driving_force_inh = self.synaptic_params.e_inh - v_post_expanded
+
+        # Calculate currents: I = g * (V - E)
+        # Conductances are in nS, driving forces in mV
+        # Current in pA: I(pA) = g(nS) * V(mV) = g(nS) * V(mV)
+        i_ampa = conductances['ampa'] * driving_force_exc  # [n_post]
+        i_gaba = conductances['gaba'] * driving_force_inh  # [n_post]
+
+        # NMDA with voltage-dependent Mg2+ block
+        v_shift = v_post_expanded + 80.0  # Shift for Mg2+ calculation
+        mg_block = 1.0 / (1.0 + 0.28 * torch.exp(-0.062 * v_shift))
+        i_nmda = conductances['nmda'] * driving_force_exc * mg_block  # [n_post]
+
+        return {
+            'ampa': i_ampa,
+            'gaba': i_gaba,
+            'nmda': i_nmda
+        }
+
+
+    def get_all_currents_by_source(self, population: str, 
+                                    v_post: torch.Tensor) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        Get synaptic currents from all presynaptic sources to a target population
+
+        Args:
+            population: Target population name (e.g., 'gc', 'pv')
+            v_post: Postsynaptic membrane potentials [n_post] in mV
+
+        Returns:
+            Dict mapping source populations to current components:
+            {
+                'mec': {'ampa': [...], 'gaba': [...], 'nmda': [...]},
+                'gc': {'ampa': [...], 'gaba': [...], 'nmda': [...]},
+                ...
+            }
+        """
+        currents_by_source = {}
+
+        # Find all connections targeting this population
+        for conn_name in self.synaptic_states.keys():
+            parts = conn_name.split('_')
+            if len(parts) >= 2 and parts[1] == population:
+                source_pop = parts[0]
+
+                # Get currents from this source
+                currents = self.get_synaptic_currents(conn_name, v_post)
+                currents_by_source[source_pop] = currents
+
+        return currents_by_source
+
+
+    def get_total_current_by_type(self, population: str,
+                                   v_post: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Get total synaptic currents by receptor type for a population
+
+        Args:
+            population: Target population name
+            v_post: Postsynaptic membrane potentials [n_post] in mV
+
+        Returns:
+            Dict with total 'ampa', 'gaba', 'nmda' currents [n_post] in pA
+        """
+        currents_by_source = self.get_all_currents_by_source(population, v_post)
+
+        # Initialize totals
+        n_post = len(v_post)
+        total_ampa = torch.zeros(n_post, device=self.device)
+        total_gaba = torch.zeros(n_post, device=self.device)
+        total_nmda = torch.zeros(n_post, device=self.device)
+
+        # Sum across all sources
+        for source_currents in currents_by_source.values():
+            total_ampa += source_currents['ampa']
+            total_gaba += source_currents['gaba']
+            total_nmda += source_currents['nmda']
+
+        return {
+            'ampa': total_ampa,
+            'gaba': total_gaba,
+            'nmda': total_nmda,
+            'total_exc': total_ampa + total_nmda,
+            'total_inh': total_gaba,
+            'net': total_ampa + total_nmda + total_gaba
+        }
+    
 @dataclass
 class PerConnectionSynapticParams:
     """Parameters for per-connection conductances"""
@@ -172,12 +287,12 @@ class PerConnectionSynapticParams:
     # Base conductance parameters (mean values)
     ampa_g_mean: float = 0.2      # AMPA conductance mean (nS per connection)
     ampa_g_std: float = 0.04      # AMPA conductance standard deviation
-    ampa_g_min: float = 0.01      # Minimum AMPA conductance
+    ampa_g_min: float = 0.001     # Minimum AMPA conductance
     ampa_g_max: float = 1.5       # Maximum AMPA conductance
     
     gaba_g_mean: float = 0.25     # GABA conductance mean (nS per connection)
-    gaba_g_std: float = 0.04       # GABA conductance standard deviation  
-    gaba_g_min: float = 0.01      # Minimum GABA conductance
+    gaba_g_std: float = 0.04      # GABA conductance standard deviation  
+    gaba_g_min: float = 0.001     # Minimum GABA conductance
     gaba_g_max: float = 1.5       # Maximum GABA conductance
     
     # Distribution type for conductance heterogeneity
@@ -257,9 +372,15 @@ def generate_conductance_distribution(n_connections: int,
     # Apply connection-specific modulation to mean
     modulated_mean = mean_conductance * connection_modulation
     modulated_std = std_conductance * connection_modulation
+
+    #print(f"modulated_mean = {modulated_mean} modulated_std = {modulated_std}")
     
     if distribution == 'normal':
-        conductances = torch.normal(modulated_mean, modulated_std, (n_connections,), device=device)
+        if modulated_mean > 0.0:
+            conductances = torch.normal(modulated_mean, modulated_std, (n_connections,), device=device)
+        else:
+            conductances = torch.zeros((n_connections,))
+            
         
     elif distribution == 'lognormal':
         if modulated_mean > 0.0:
@@ -272,12 +393,15 @@ def generate_conductance_distribution(n_connections: int,
             conductances = torch.zeros((n_connections,))
         
     elif distribution == 'gamma':
-        scale = modulated_std**2 / modulated_mean
-        shape = modulated_mean / scale
+        if modulated_mean > 0.0:
+            scale = modulated_std**2 / modulated_mean
+            shape = modulated_mean / scale
         
-        # Use numpy for gamma sampling, then transfer to device
-        gamma_samples = np.random.gamma(shape, scale, n_connections)
-        conductances = torch.from_numpy(gamma_samples).float().to(device)
+            # Use numpy for gamma sampling, then transfer to device
+            gamma_samples = np.random.gamma(shape, scale, n_connections)
+            conductances = torch.from_numpy(gamma_samples).float().to(device)
+        else:
+            conductances = torch.zeros((n_connections,))
         
     else:
         raise ValueError(f"Unknown distribution type: {distribution}")
@@ -503,6 +627,10 @@ class ConnectivityMatrix:
                 # Map conductances back to full matrix
                 conductances = torch.zeros_like(connectivity)
                 conductances[connection_indices] = base_conductances
+                
+                #print(f"modulation {conn_name}: {self.synaptic_params.connection_modulation.get(conn_name, 1.0)}")
+                #print(f"base conductances {conn_name}: {torch.sum(conductances[connection_indices])}")
+                #print(f"conductances {conn_name}: {torch.sum(conductances[connection_indices])}")
             
             # Store as ConductanceMatrix
             conductance_matrices[conn_name] = ConductanceMatrix(
@@ -1049,6 +1177,99 @@ class DentateCircuit(nn.Module):
 
         return changes_summary
 
+    def get_all_synaptic_currents(self) -> Dict[str, Dict[str, Dict[str, torch.Tensor]]]:
+        """
+        Get detailed breakdown of synaptic currents for all populations
+
+        Returns:
+            Nested dict structure:
+            {
+                'gc': {
+                    'by_source': {
+                        'mec': {'ampa': [...], 'gaba': [...], 'nmda': [...]},
+                        'mc': {'ampa': [...], 'gaba': [...], 'nmda': [...]},
+                        ...
+                    },
+                    'by_type': {
+                        'ampa': [...], 'gaba': [...], 'nmda': [...],
+                        'total_exc': [...], 'total_inh': [...], 'net': [...]
+                    }
+                },
+                'mc': {...},
+                'pv': {...},
+                'sst': {...}
+            }
+
+            All currents in pA, arrays have shape [n_cells_in_population]
+        """
+        all_currents = {}
+
+        populations = {
+            'gc': (self.gc_v_soma, self.circuit_params.n_gc),
+            'mc': (self.mc_v_soma, self.circuit_params.n_mc),
+            'pv': (self.pv_v_soma, self.circuit_params.n_pv),
+            'sst': (self.sst_v_soma, self.circuit_params.n_sst)
+        }
+
+        for pop_name, (v_soma, n_cells) in populations.items():
+            # Get currents by source
+            currents_by_source = self.synaptic_state_manager.get_all_currents_by_source(
+                pop_name, v_soma
+            )
+
+            # Get total currents by type
+            currents_by_type = self.synaptic_state_manager.get_total_current_by_type(
+                pop_name, v_soma
+            )
+
+            all_currents[pop_name] = {
+                'by_source': currents_by_source,
+                'by_type': currents_by_type
+            }
+
+        return all_currents
+
+
+    def get_current_statistics(self, currents: Dict) -> Dict:
+        """
+        Compute summary statistics for synaptic currents
+
+        Args:
+            currents: Output from get_all_synaptic_currents()
+
+        Returns:
+            Dict with summary statistics for each population
+        """
+        stats = {}
+
+        for pop_name, pop_currents in currents.items():
+            pop_stats = {'by_source': {}, 'by_type': {}}
+
+            # Statistics for currents from each source
+            for source, source_currents in pop_currents['by_source'].items():
+                source_stats = {}
+                for receptor_type, current in source_currents.items():
+                    source_stats[receptor_type] = {
+                        'mean': float(torch.mean(current)),
+                        'std': float(torch.std(current)),
+                        'min': float(torch.min(current)),
+                        'max': float(torch.max(current))
+                    }
+                pop_stats['by_source'][source] = source_stats
+
+            # Statistics for total currents by type
+            for current_type, current in pop_currents['by_type'].items():
+                pop_stats['by_type'][current_type] = {
+                    'mean': float(torch.mean(current)),
+                    'std': float(torch.std(current)),
+                    'min': float(torch.min(current)),
+                    'max': float(torch.max(current))
+                }
+
+            stats[pop_name] = pop_stats
+
+        return stats    
+    
     def load_and_apply_optimization_results(self, json_filename: str):
         """
         Load optimization results from JSON file and apply to circuit

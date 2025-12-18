@@ -16,6 +16,8 @@ from matplotlib.collections import LineCollection
 from matplotlib.patches import FancyBboxPatch
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
+from matplotlib import gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import networkx as nx
 from typing import Dict, Tuple, List, Optional, Union
 import torch
@@ -100,7 +102,7 @@ class DGCircuitVisualization:
             self._position_cache[pop] = positions.cpu().numpy()
     
     def plot_spatial_organization(self, view='3d', populations=None, show_layers=True,
-                                alpha=0.7, save_path=None):
+                                  alpha=0.7, save_path=None):
         """
         Plot 3D spatial organization of all cell populations
         
@@ -583,11 +585,13 @@ class DGCircuitVisualization:
 
         return fig, activity_history
 
-    
+
     def plot_activity_raster(self, activity_trace, vmin=0, vmax=None, 
                              mean_linewidth=2.5, cmap='coolwarm', save_path=None,
                              sort_by_activity=False, split_populations=None, direct_activation=None,
-                             activation_cmap='plasma', activation_bar_width=None):
+                             activation_cmap='plasma', activation_bar_width=None,
+                             baseline_window=None, normalize_to_baseline=False,
+                             activity_std=None, show_std_shading=True):
         """
         Plot circuit activity as raster plots with neurons sorted by mean firing rate
 
@@ -603,13 +607,18 @@ class DGCircuitVisualization:
             mean_linewidth: Line width for population mean trace overlay
             cmap: Colormap name for activity (default: 'coolwarm')
             save_path: Path to save figure
-            split_populations: Dict mapping population name to dict with 'unit_ids_part1' and 'unit_ids_part2'.
-                               Example: {'pv': {'unit_ids_part1': [0,1,2], 'unit_ids_part2': [3,4,5]}}
-                               If provided, creates separate panels for each part.
-            direct_activation: Dict mapping population names to arrays of current injection values (n_cells,).
-                               Only populations with direct activation need to be included.
+            sort_by_activity: Whether to sort neurons by mean activity
+            split_populations: Dict mapping population name to dict with 'unit_ids_part1' and 'unit_ids_part2'
+            direct_activation: Dict mapping population names to arrays of current injection values (n_cells,)
             activation_cmap: Colormap name for direct activation visualization (default: 'plasma')
             activation_bar_width: Width of activation bar in time units (default: 5% of time range)
+            baseline_window: Tuple (start_time, end_time) in ms for baseline calculation. If provided,
+                            activity can be normalized relative to this baseline period.
+            normalize_to_baseline: If True and baseline_window is provided, normalize activity by
+                                  subtracting baseline mean and dividing by baseline std
+            activity_std: Dictionary with population keys containing std across trials (n_cells, timesteps).
+                         If provided, will show shaded regions for trial-to-trial variability
+            show_std_shading: Whether to show standard deviation shading (only if activity_std provided)
         """
         # Determine number of timesteps
         timesteps = None
@@ -620,33 +629,75 @@ class DGCircuitVisualization:
         # Create time axis
         time_axis = np.arange(timesteps) * self.circuit.circuit_params.dt
 
+        # Calculate baseline statistics if requested
+        baseline_stats = {}
+        if baseline_window is not None and normalize_to_baseline:
+            baseline_start, baseline_end = baseline_window
+            baseline_mask = (time_axis >= baseline_start) & (time_axis < baseline_end)
+
+            for pop, activity in activity_trace.items():
+                if hasattr(activity, 'cpu'):
+                    activity_data = activity.cpu().numpy()
+                else:
+                    activity_data = np.array(activity)
+
+                # Calculate baseline mean and std for each neuron
+                baseline_activity = activity_data[:, baseline_mask]
+                baseline_mean = np.mean(baseline_activity, axis=1, keepdims=True)
+                baseline_std = np.std(baseline_activity, axis=1, keepdims=True)
+                baseline_std = np.maximum(baseline_std, 0.1)  # Prevent division by zero
+
+                baseline_stats[pop] = {
+                    'mean': baseline_mean,
+                    'std': baseline_std
+                }
+
         n_populations = len(activity_trace)
         if split_populations:
-            # Add extra panels for split populations
             for pop in split_populations:
                 if pop in activity_trace:
-                    n_populations += 1  # Add one more panel for the split
+                    n_populations += 1
 
-        fig, axes = plt.subplots(2, 3, figsize=self.config.figsize_large, dpi=self.config.dpi)
+        fig, axes = plt.subplots(2, 3, figsize=self.config.figsize_large,
+                                 dpi=self.config.dpi, constrained_layout=True)
         axes = axes.flatten()
 
-        # Storage for mean activity
-        activity_history = {pop: [] for pop in self.pop_sizes.keys()}
+        # Adjust subplot spacing to make room for colorbars
+        fig.subplots_adjust(left=0.08, right=0.92, top=0.93, bottom=0.07, 
+                            wspace=0.4, hspace=0.35)
 
+        # Storage for mean activity and raster image objects
+        activity_history = {pop: [] for pop in self.pop_sizes.keys()}
+        image_objects = []
+        
         panel_idx = 0
         for idx, (pop, activity) in enumerate(activity_trace.items()):
             if panel_idx >= len(axes):
                 break
 
-            # Get activity data (convert from torch tensor if needed)
+            # Get activity data
             if hasattr(activity, 'cpu'):
                 activity_data = activity.cpu().numpy()
             else:
                 activity_data = np.array(activity)
 
+            # Get std data if provided
+            std_data = None
+            if activity_std is not None and pop in activity_std:
+                if hasattr(activity_std[pop], 'cpu'):
+                    std_data = activity_std[pop].cpu().numpy()
+                else:
+                    std_data = np.array(activity_std[pop])
+
+            # Apply baseline normalization if requested
+            if normalize_to_baseline and pop in baseline_stats:
+                activity_data = (activity_data - baseline_stats[pop]['mean']) / baseline_stats[pop]['std']
+                if std_data is not None:
+                    std_data = std_data / baseline_stats[pop]['std']
+
             n_cells = activity_data.shape[0]
 
-            # Get direct activation data for this population if available
+            # Get direct activation data
             activation_data = None
             if direct_activation is not None and pop in direct_activation:
                 activation_data = direct_activation[pop]
@@ -658,7 +709,6 @@ class DGCircuitVisualization:
             # Check if this population should be split
             should_split = split_populations and pop in split_populations
             if should_split:
-                # Get the two parts
                 split_info = split_populations[pop]
                 unit_ids_part1 = np.array(split_info['unit_ids_part1'])
                 unit_ids_part2 = np.array(split_info['unit_ids_part2'])
@@ -669,89 +719,114 @@ class DGCircuitVisualization:
                 if len(unit_ids_part1) > 0:
                     ax = axes[panel_idx]
                     activity_part1 = activity_data[unit_ids_part1, :]
+                    std_part1 = std_data[unit_ids_part1, :] if std_data is not None else None
                     activation_part1 = activation_data[unit_ids_part1] if activation_data is not None else None
 
-                    self._plot_single_raster(ax, activity_part1, time_axis, pop, 
-                                             vmin, vmax, cmap, mean_linewidth,
-                                             title_suffix=f' - {part1_label}',
-                                             direct_activation=activation_part1,
-                                             activation_cmap=activation_cmap,
-                                             activation_bar_width=activation_bar_width)
+                    im = self._plot_single_raster(ax, activity_part1, time_axis, pop, 
+                                                  vmin, vmax, cmap, mean_linewidth,
+                                                  title_suffix=f' - {part1_label}',
+                                                  direct_activation=activation_part1,
+                                                  activation_cmap=activation_cmap,
+                                                  activation_bar_width=activation_bar_width,
+                                                  normalize_to_baseline=normalize_to_baseline,
+                                                  baseline_window=baseline_window,
+                                                  activity_std=std_part1,
+                                                  show_std_shading=show_std_shading)
+                    if im is not None:
+                        image_objects.append(im)
                     panel_idx += 1
 
                 # Plot Part 2
                 if len(unit_ids_part2) > 0:
                     ax = axes[panel_idx]
                     activity_part2 = activity_data[unit_ids_part2, :]
+                    std_part2 = std_data[unit_ids_part2, :] if std_data is not None else None
                     activation_part2 = activation_data[unit_ids_part2] if activation_data is not None else None
-                    self._plot_single_raster(ax, activity_part2, time_axis, pop, 
-                                             vmin, vmax, cmap, mean_linewidth,
-                                             title_suffix=f' - {part2_label}',
-                                             direct_activation=activation_part2,
-                                             activation_cmap=activation_cmap,
-                                             activation_bar_width=activation_bar_width)
+
+                    im = self._plot_single_raster(ax, activity_part2, time_axis, pop, 
+                                                  vmin, vmax, cmap, mean_linewidth,
+                                                  title_suffix=f' - {part2_label}',
+                                                  direct_activation=activation_part2,
+                                                  activation_cmap=activation_cmap,
+                                                  activation_bar_width=activation_bar_width,
+                                                  normalize_to_baseline=normalize_to_baseline,
+                                                  baseline_window=baseline_window,
+                                                  activity_std=std_part2,
+                                                  show_std_shading=show_std_shading)
+                    if im is not None:
+                        image_objects.append(im)
                     panel_idx += 1
 
-                # Store combined mean activity
                 activity_history[pop] = np.mean(activity_data, axis=0).tolist()
             else:
                 # Plot normally (no split)
                 ax = axes[panel_idx]
-                self._plot_single_raster(ax, activity_data, time_axis, pop, 
-                                         vmin, vmax, cmap, mean_linewidth,
-                                         direct_activation=activation_data,
-                                         activation_cmap=activation_cmap,
-                                         activation_bar_width=activation_bar_width,
-                                         sort_by_activity=sort_by_activity)
+                im = self._plot_single_raster(ax, activity_data, time_axis, pop, 
+                                              vmin, vmax, cmap, mean_linewidth,
+                                              direct_activation=activation_data,
+                                              activation_cmap=activation_cmap,
+                                              activation_bar_width=activation_bar_width,
+                                              sort_by_activity=sort_by_activity,
+                                              normalize_to_baseline=normalize_to_baseline,
+                                              baseline_window=baseline_window,
+                                              activity_std=std_data,
+                                              show_std_shading=show_std_shading)
                 activity_history[pop] = np.mean(activity_data, axis=0).tolist()
                 panel_idx += 1
+                if im is not None:
+                    image_objects.append(im)
 
         # Remove unused subplots
         for idx in range(panel_idx, len(axes)):
             fig.delaxes(axes[idx])
 
-        plt.suptitle('DG Circuit Activity Rasters: Neurons Sorted by Mean Firing Rate', 
-                    fontsize=16, fontweight='bold')
-        plt.tight_layout()
+        # Update title based on normalization
+        title = 'DG Circuit Activity'
+        if normalize_to_baseline:
+            title += ' (Normalized to Baseline)'
+        if activity_std is not None:
+            title += f' - Mean ± Std Across Trials'
+        else:
+            title += ': Neurons Sorted by Mean Firing Rate'
+
+        plt.suptitle(title, fontsize=16, fontweight='bold')
+
+        # Store image objects as figure attribute to prevent garbage collection
+        fig._activity_images = image_objects
 
         if save_path:
-            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            plt.savefig(save_path, dpi=self.config.dpi)
 
         return fig, activity_history
 
     def _plot_single_raster(self, ax, activity_data, time_axis, pop, 
                             vmin, vmax, cmap, mean_linewidth, title_suffix='',
                             direct_activation=None, activation_cmap='plasma',
-                            activation_bar_width=None, sort_by_activity=False):
+                            activation_bar_width=None, sort_by_activity=False,
+                            normalize_to_baseline=False, baseline_window=None,
+                            activity_std=None, show_std_shading=True):
         """
         Helper method to plot a single raster panel with Rectangle patches for activation
 
-        Args:
-            ax: Matplotlib axis to plot on
-            activity_data: Activity array (n_cells, timesteps)
-            time_axis: Time vector
-            pop: Population name
-            vmin, vmax: Colormap limits for activity
-            cmap: Colormap name for activity
-            mean_linewidth: Line width for mean trace
-            title_suffix: Optional suffix for title (e.g., ' - Stimulated')
-            direct_activation: Optional array of current injection values (n_cells,)
-            activation_cmap: Colormap name for activation visualization
-            activation_bar_width: Width of activation bar in time units (None for auto)
-            sort_by_activity: Whether to sort neurons by mean activity
+        Returns:
+            im: The image object from imshow (to prevent garbage collection)
         """
         n_cells = activity_data.shape[0]
 
         # Calculate mean activity per neuron across time
         mean_activity_per_neuron = np.mean(activity_data, axis=1)
-        print(f"population {pop}: mean_activity_per_neuron = {mean_activity_per_neuron}")
 
-        # Sort neurons by mean firing rate (descending - highest at top)
+        # Sort neurons by mean firing rate (descending)
         sorted_indices = np.argsort(mean_activity_per_neuron)[::-1]
         if sort_by_activity:
             sorted_activity = activity_data[sorted_indices, :]
+            if activity_std is not None:
+                sorted_std = activity_std[sorted_indices, :]
+            else:
+                sorted_std = None
         else:
             sorted_activity = activity_data
+            sorted_std = activity_std
 
         # Sort direct activation data if provided
         sorted_activation = None
@@ -761,35 +836,54 @@ class DGCircuitVisualization:
             else:
                 sorted_activation = direct_activation
 
-        # Determine colormap range for activity
-        vmax_pop = vmax if vmax is not None else np.percentile(sorted_activity, 99)
+        # Determine colormap range with robust handling
+        if normalize_to_baseline:
+            activity_abs_max = np.abs(sorted_activity)
+            vmax_pop = np.percentile(activity_abs_max[np.isfinite(activity_abs_max)], 99)
+            if vmax_pop < 0.1:
+                vmax_pop = 1.0
+            vmin_pop = -vmax_pop
+        else:
+            vmin_pop = vmin if vmin is not None else 0
+            if vmax is not None:
+                vmax_pop = vmax
+            else:
+                valid_activity = sorted_activity[np.isfinite(sorted_activity)]
+                if len(valid_activity) > 0:
+                    vmax_pop = np.percentile(valid_activity, 99)
+                    if vmax_pop <= vmin_pop:
+                        vmax_pop = vmin_pop + 1.0
+                else:
+                    vmax_pop = 10.0
 
         # Calculate activation bar parameters
         time_range = time_axis[-1] - time_axis[0]
         if activation_bar_width is None:
-            bar_width = time_range * 0.05  # 5% of time range
+            bar_width = time_range * 0.05
         else:
             bar_width = activation_bar_width
-        
-        bar_gap = time_range * 0.01  # 1% gap between bar and raster
+
+        bar_gap = time_range * 0.01
         bar_x_start = time_axis[0] - bar_width - bar_gap
 
         # Draw activation rectangles if provided
         if sorted_activation is not None:
-            # Normalize activation values for colormap
             activation_vmin = np.min(sorted_activation)
             activation_vmax = np.max(sorted_activation)
-            
+
             if activation_vmax > activation_vmin:
+                from matplotlib.colors import Normalize
+                from matplotlib.cm import ScalarMappable
+                from matplotlib.patches import Rectangle
+                from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
                 norm = Normalize(vmin=activation_vmin, vmax=activation_vmax)
                 cmap_obj = plt.get_cmap(activation_cmap)
-                
-                # Draw one rectangle per neuron
+
                 for i in range(n_cells):
                     activation_value = sorted_activation[i]
                     color = cmap_obj(norm(activation_value))
-                    
-                    # Rectangle positioned at y=i with height=1.0 to match raster row
+
                     rect = Rectangle(xy=(bar_x_start, i), 
                                      width=bar_width, 
                                      height=1.0,
@@ -797,17 +891,16 @@ class DGCircuitVisualization:
                                      edgecolor='none',
                                      zorder=10)
                     ax.add_patch(rect)
-                
-                # Add colorbar for activation using ScalarMappable
+
+                # Add colorbar for activation
                 sm = ScalarMappable(cmap=cmap_obj, norm=norm)
                 sm.set_array([])
-                
-                # Create inset axis for activation colorbar (positioned outside main plot)
+
                 cbar_ax = inset_axes(ax, 
                                      width="2%",  
                                      height="30%",
                                      loc='upper left',
-                                     bbox_to_anchor=(-0.25, 0.05, 1, 1),  # Negative x moves it outside
+                                     bbox_to_anchor=(-0.25, 0.05, 1, 1),
                                      bbox_transform=ax.transAxes,
                                      borderpad=0)
 
@@ -820,69 +913,204 @@ class DGCircuitVisualization:
                                           labelpad=10)
                 cbar_activation.ax.tick_params(labelsize=7)
 
-                
-        # Plot raster as heatmap on main axis
+        # Plot raster as heatmap
         im = ax.imshow(sorted_activity, 
                        aspect='auto',
                        cmap=cmap,
-                       vmin=vmin,
+                       vmin=vmin_pop,
                        vmax=vmax_pop,
                        interpolation='nearest',
                        extent=[time_axis[0], time_axis[-1], n_cells, 0],
-                       alpha=0.6,
                        zorder=1)
 
-        # Adjust x-limits to show activation bar
+        # Store image as axis attribute to prevent garbage collection
+        ax._raster_image = im
+
+        # Mark baseline window if provided
+        if baseline_window is not None:
+            baseline_start, baseline_end = baseline_window
+            ax.axvspan(baseline_start, baseline_end, 
+                       alpha=0.1, color='green', zorder=0,
+                       label='Baseline')
+
+        # Adjust x-limits
         if sorted_activation is not None:
             ax.set_xlim([bar_x_start, time_axis[-1]])
         else:
             ax.set_xlim([time_axis[0], time_axis[-1]])
 
-        # Configure primary axis (raster)
-        ax.set_xlabel('Time (ms)')
-        ax.set_ylabel('Neuron Index\n(sorted by activity)')
+        # Configure primary axis
+        ax.set_xlabel('Time (ms)', fontsize=10)
+        ax.set_ylabel('Neuron Index\n(sorted by activity)', fontsize=10)
 
-        # Add activation indicator to title if present
+        # Title
         title_prefix = f'{pop.upper()} Activity Raster'
         if sorted_activation is not None:
             title_prefix += ' [with input current]'
-        ax.set_title(f'{title_prefix}{title_suffix}\n({n_cells} cells)')
-
-        # Add colorbar for activity with proper spacing
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.08)
-        cbar.set_label('Firing Rate (Hz)', rotation=270, labelpad=20)
+        if normalize_to_baseline:
+            title_prefix += '\n(Baseline Normalized)'
+        ax.set_title(f'{title_prefix}{title_suffix}\n({n_cells} cells)', fontsize=11)
 
         # Compute population mean activity
         mean_activity = np.mean(activity_data, axis=0)
 
+        # Compute std across neurons if std across trials was provided
+        if sorted_std is not None and show_std_shading:
+            mean_std = np.mean(sorted_std, axis=0)
+
         # Create twin axis for mean firing rate overlay
         ax2 = ax.twinx()
 
-        # Adjust position to prevent overlap with colorbar
-        pos = ax.get_position()
-        ax2.set_position([pos.x0, pos.y0, pos.width * 0.85, pos.height])
+        # Normalize mean activity for overlay
+        if normalize_to_baseline:
+            mean_normalized = ((mean_activity + vmax_pop) / (2 * vmax_pop)) * n_cells
+        else:
+            mean_normalized = (mean_activity / vmax_pop) * n_cells
 
-        # Normalize mean activity to neuron index range for overlay
-        mean_normalized = (mean_activity / vmax_pop) * n_cells
+        mean_normalized = np.clip(mean_normalized, 0, n_cells)
 
-        # Plot mean firing rate as overlay
+        # Plot mean firing rate
         ax2.plot(time_axis, mean_normalized, 
                  color='black',
                  linewidth=mean_linewidth,
                  linestyle='-',
                  alpha=0.8,
-                 label=f'Mean={np.mean(mean_activity):.1f} Hz',
+                 label=f'Mean={np.mean(mean_activity):.1f}',
                  zorder=2)
 
-        # Configure secondary axis (mean trace) with padding
-        ax2.set_ylabel('Normalized Mean Activity', rotation=270, labelpad=25)
+        # Add shaded region for trial-to-trial variability if available
+        if sorted_std is not None and show_std_shading:
+            if normalize_to_baseline:
+                std_normalized_upper = ((mean_activity + mean_std + vmax_pop) / (2 * vmax_pop)) * n_cells
+                std_normalized_lower = ((mean_activity - mean_std + vmax_pop) / (2 * vmax_pop)) * n_cells
+            else:
+                std_normalized_upper = ((mean_activity + mean_std) / vmax_pop) * n_cells
+                std_normalized_lower = ((mean_activity - mean_std) / vmax_pop) * n_cells
+
+            std_normalized_upper = np.clip(std_normalized_upper, 0, n_cells)
+            std_normalized_lower = np.clip(std_normalized_lower, 0, n_cells)
+
+            ax2.fill_between(time_axis,
+                            std_normalized_lower,
+                            std_normalized_upper,
+                            color='black',
+                            alpha=0.2,
+                            zorder=1,
+                            label='± Std (trials)')
+
+        # Configure secondary axis
+        ax2.set_ylabel('Normalized Mean Activity', rotation=270, labelpad=20, fontsize=10)
         ax2.set_ylim([0, n_cells])
-        ax2.legend(loc='upper right', framealpha=0.7)
+        ax2.legend(loc='upper right', framealpha=0.7, fontsize=10)
         ax2.set_yticks([])
 
-        # Add grid on primary axis
+        # Add grid
         ax.grid(False)
+
+        # Create raster colorbar last and attach to both axes
+        cbar_raster = plt.colorbar(im, ax=[ax, ax2], fraction=0.046, pad=0.04)
+        if normalize_to_baseline:
+            cbar_raster.set_label('Normalized Firing Rate', rotation=270, labelpad=15, fontsize=10)
+        else:
+            cbar_raster.set_label('Firing Rate (Hz)', rotation=270, labelpad=15, fontsize=10)
+        cbar_raster.ax.tick_params(labelsize=10)
+
+        # Store colorbar reference to prevent garbage collection
+        ax._activity_colorbar = cbar_raster
+
+        # Return the image object so caller can keep reference
+        return im    
+
     
+    def plot_aggregated_activity(self, aggregated_results: Dict,
+                                 target_population: str,
+                                 opsin_expression_levels: np.ndarray,
+                                 light_intensity: float,
+                                 stim_start: float = 500.0,
+                                 baseline_normalize: bool = False,
+                                 sort_by_activity: bool = True,
+                                 save_path: Optional[str] = None):
+        """
+        Plot trial-averaged activity with standard deviation shading
+
+        Args:
+            aggregated_results: Results dictionary from multi-trial simulation containing:
+                - 'time': Time vector
+                - 'activity_trace_mean': Mean activity across trials
+                - 'activity_trace_std': Std of activity across trials
+                - 'n_trials': Number of trials averaged
+                - 'trial_results': List of individual trial results
+            target_population: Population that was stimulated ('pv', 'sst', etc.)
+            opsin_expression_levels: Array of opsin expression levels (n_cells,)
+            light_intensity: Light intensity used for stimulation
+            stim_start: Stimulation start time in ms (for baseline window)
+            baseline_normalize: If True, normalize activity relative to pre-stim baseline
+            sort_by_activity: Whether to sort neurons by mean activity
+            save_path: Path to save figure (optional)
+
+        Returns:
+            fig: Matplotlib figure object
+            activity_history: Dictionary with mean activity traces
+        """
+        # Extract aggregated data
+        time_cpu = aggregated_results['time']
+        activity_mean = aggregated_results['activity_trace_mean']
+        activity_std = aggregated_results['activity_trace_std']
+        n_trials = aggregated_results['n_trials']
+
+        # Get stimulated vs non-stimulated indices from first trial
+        first_trial = aggregated_results['trial_results'][0]
+        stimulated_indices = first_trial['stimulated_indices']
+        non_stimulated_indices = first_trial['non_stimulated_indices']
+
+        # Setup split populations for visualization
+        split_populations = {
+            target_population: {
+                'unit_ids_part1': stimulated_indices.tolist(),
+                'unit_ids_part2': non_stimulated_indices.tolist(),
+                'part1_label': f'Stimulated (n={len(stimulated_indices)})',
+                'part2_label': f'Non-stimulated (n={len(non_stimulated_indices)})'
+            }
+        }
+
+        # Calculate direct activation from opsin expression
+        # Threshold for showing activation (cells with expression >= threshold)
+        activation_threshold = 0.2
+        expressing_mask = opsin_expression_levels >= activation_threshold
+
+        # Create activation array (only for expressing cells)
+        plot_direct_activation = {}
+        if np.any(expressing_mask):
+            # Scale by expression level for visualization
+            activation_values = opsin_expression_levels * light_intensity
+            plot_direct_activation[target_population] = activation_values
+
+        # Calculate baseline window (before stimulation)
+        baseline_window = (0.0, stim_start) if baseline_normalize else None
+
+        # Generate save path if not provided
+        if save_path is None:
+            suffix = f"_aggregated_n{n_trials}"
+            if baseline_normalize:
+                suffix += "_normalized"
+            save_path = f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}{suffix}.png"
+
+        # Plot with trial-averaged data
+        fig, activity_history = self.plot_activity_raster(
+            activity_mean,
+            split_populations=split_populations,
+            direct_activation=plot_direct_activation if plot_direct_activation else None,
+            sort_by_activity=sort_by_activity,
+            baseline_window=baseline_window,
+            normalize_to_baseline=baseline_normalize,
+            activity_std=activity_std,
+            show_std_shading=True,
+            save_path=save_path
+        )
+
+        return fig, activity_history
+
+        
     def plot_network_graph(self, connection_types=None, layout_type='spring',
                           node_size_scale=1.0, save_path=None):
         """
@@ -990,7 +1218,500 @@ class DGCircuitVisualization:
         return fig, G
 
 
-    
+    def plot_current_traces(self, recorded_currents: Dict,
+                            population: str,
+                            stim_start: float,
+                            stim_end: float,
+                            baseline_start: Optional[float] = None,
+                            save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Plot time traces of synaptic currents for a population
+
+        Integrates with existing DG visualization style and uses class config.
+
+        Args:
+            recorded_currents: Output from SynapticCurrentRecorder.get_results()
+            population: Population name ('gc', 'mc', 'pv', 'sst')
+            stim_start: Stimulation start time (ms)
+            stim_end: Stimulation end time (ms)
+            baseline_start: Optional baseline period start (ms)
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        time = recorded_currents['time']
+        if hasattr(time, 'cpu'):
+            time = time.cpu().numpy()
+        else:
+            time = np.array(time)
+
+        fig = plt.figure(figsize=self.config.figsize_large, dpi=self.config.dpi)
+        gs = gridspec.GridSpec(3, 1, hspace=0.3)
+
+        # Panel 1: Currents by receptor type
+        ax1 = fig.add_subplot(gs[0])
+
+        currents_by_type = recorded_currents['by_type'][population]
+
+        # Define colors for receptor types
+        receptor_colors = {'ampa': '#FF6B6B', 'gaba': '#4ECDC4', 'nmda': '#FFA07A'}
+
+        # Plot mean across cells
+        for current_type, color in receptor_colors.items():
+            current = currents_by_type[current_type]  # [n_cells, n_time]
+            if hasattr(current, 'cpu'):
+                current = current.cpu().numpy()
+            else:
+                current = np.array(current)
+
+            mean_current = np.mean(current, axis=0)
+            std_current = np.std(current, axis=0)
+
+            ax1.plot(time, mean_current, color=color, 
+                    label=current_type.upper(), linewidth=2)
+            ax1.fill_between(time, mean_current - std_current, 
+                            mean_current + std_current,
+                            color=color, alpha=0.2)
+
+        # Mark stimulation period
+        ax1.axvspan(stim_start, stim_end, alpha=0.1, color='orange', 
+                    label='Stimulation', zorder=0)
+        if baseline_start is not None:
+            ax1.axvspan(baseline_start, stim_start, alpha=0.1, color='green', 
+                        label='Baseline', zorder=0)
+            
+        ax1.set_xlabel('Time (ms)', fontsize=11)
+        ax1.set_ylabel('Current (pA)', fontsize=11)
+        ax1.set_title(f'{population.upper()}: Currents by Receptor Type', 
+                     fontsize=12, fontweight='bold')
+        ax1.legend(fontsize=10, loc='best')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_axisbelow(True)
+
+        # Panel 2: Total excitatory vs inhibitory
+        ax2 = fig.add_subplot(gs[1])
+
+        total_exc = currents_by_type['total_exc']
+        total_inh = currents_by_type['total_inh']
+
+        if hasattr(total_exc, 'cpu'):
+            total_exc = total_exc.cpu().numpy()
+            total_inh = total_inh.cpu().numpy()
+        else:
+            total_exc = np.array(total_exc)
+            total_inh = np.array(total_inh)
+
+        mean_exc = np.mean(total_exc, axis=0)
+        std_exc = np.std(total_exc, axis=0)
+        mean_inh = np.mean(total_inh, axis=0)
+        std_inh = np.std(total_inh, axis=0)
+
+        ax2.plot(time, mean_exc, color='#E74C3C', label='Total Excitatory', linewidth=2)
+        ax2.fill_between(time, mean_exc - std_exc, mean_exc + std_exc, 
+                        color='#E74C3C', alpha=0.2)
+
+        ax2.plot(time, mean_inh, color='#3498DB', label='Total Inhibitory', linewidth=2)
+        ax2.fill_between(time, mean_inh - std_inh, mean_inh + std_inh,
+                        color='#3498DB', alpha=0.2)
+
+        # Add zero line
+        ax2.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+
+        # Mark periods
+        ax2.axvspan(stim_start, stim_end, alpha=0.1, color='orange', zorder=0)
+        if baseline_start is not None:
+            ax2.axvspan(baseline_start, stim_start, alpha=0.1, color='green', zorder=0)
+
+        ax2.set_xlabel('Time (ms)', fontsize=11)
+        ax2.set_ylabel('Current (pA)', fontsize=11)
+        ax2.set_title(f'{population.upper()}: Total Excitatory vs Inhibitory', 
+                     fontsize=12, fontweight='bold')
+        ax2.legend(fontsize=10, loc='best')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_axisbelow(True)
+
+        # Panel 3: Net current and E/I ratio
+        ax3 = fig.add_subplot(gs[2])
+
+        net_current = currents_by_type['net']
+        if hasattr(net_current, 'cpu'):
+            net_current = net_current.cpu().numpy()
+        else:
+            net_current = np.array(net_current)
+
+        mean_net = np.mean(net_current, axis=0)
+        std_net = np.std(net_current, axis=0)
+
+        # Plot net current
+        ax3_twin = ax3.twinx()
+
+        ax3.plot(time, mean_net, color='#9B59B6', label='Net Current', linewidth=2)
+        ax3.fill_between(time, mean_net - std_net, mean_net + std_net,
+                        color='#9B59B6', alpha=0.2)
+        ax3.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+
+        # Calculate and plot E/I ratio
+        ei_ratio = np.abs(mean_exc) / (np.abs(mean_inh) + 1e-6)
+        ax3_twin.plot(time, ei_ratio, color='#27AE60', label='|E|/|I| Ratio', 
+                     linewidth=2, linestyle=':')
+        ax3_twin.axhline(1, color='#27AE60', linestyle='--', linewidth=1, alpha=0.5)
+
+        # Mark periods
+        ax3.axvspan(stim_start, stim_end, alpha=0.1, color='orange', zorder=0)
+        if baseline_start is not None:
+            ax3.axvspan(baseline_start, stim_start, alpha=0.1, color='green', zorder=0)
+
+        ax3.set_xlabel('Time (ms)', fontsize=11)
+        ax3.set_ylabel('Net Current (pA)', fontsize=11, color='#9B59B6')
+        ax3_twin.set_ylabel('E/I Ratio', fontsize=11, color='#27AE60')
+        ax3.set_title(f'{population.upper()}: Net Current and E/I Balance', 
+                     fontsize=12, fontweight='bold')
+        ax3.tick_params(axis='y', labelcolor='#9B59B6')
+        ax3_twin.tick_params(axis='y', labelcolor='#27AE60')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_axisbelow(True)
+
+        # Combined legend
+        lines1, labels1 = ax3.get_legend_handles_labels()
+        lines2, labels2 = ax3_twin.get_legend_handles_labels()
+        ax3.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='best')
+
+        plt.suptitle(f'Synaptic Currents: {population.upper()}', 
+                    fontsize=14, fontweight='bold')
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved current traces to {save_path}")
+
+        return fig
+
+
+    def plot_current_sources(self, recorded_currents: Dict,
+                            population: str,
+                            stim_start: float,
+                            stim_end: float,
+                            baseline_start: Optional[float] = None,
+                            save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Plot contributions from different presynaptic sources
+
+        Args:
+            recorded_currents: Output from SynapticCurrentRecorder.get_results()
+            population: Target population name
+            stim_start: Stimulation start time (ms)
+            stim_end: Stimulation end time (ms)
+            baseline_start: Optional baseline period start (ms)
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        time = recorded_currents['time']
+        if hasattr(time, 'cpu'):
+            time = time.cpu().numpy()
+        else:
+            time = np.array(time)
+
+        currents_by_source = recorded_currents['by_source'][population]
+
+        # Get list of sources
+        sources = list(currents_by_source.keys())
+        n_sources = len(sources)
+
+        if n_sources == 0:
+            print(f"No current sources found for {population}")
+            return None
+
+        fig, axes = plt.subplots(n_sources, 1, 
+                                figsize=(self.config.figsize_large[0], 4*n_sources), 
+                                sharex=True, squeeze=False, dpi=self.config.dpi)
+        axes = axes.flatten()
+
+        # Define colors for receptor types
+        receptor_colors = {'ampa': '#FF6B6B', 'gaba': '#4ECDC4', 'nmda': '#FFA07A'}
+
+        for idx, source in enumerate(sources):
+            ax = axes[idx]
+            source_currents = currents_by_source[source]
+
+            # Plot AMPA (red), GABA (cyan), NMDA (coral)
+            for receptor_type, color in receptor_colors.items():
+                if receptor_type in source_currents:
+                    current = source_currents[receptor_type]  # [n_cells, n_time]
+                    if hasattr(current, 'cpu'):
+                        current = current.cpu().numpy()
+                    else:
+                        current = np.array(current)
+
+                    mean_current = np.mean(current, axis=0)
+                    std_current = np.std(current, axis=0)
+
+                    ax.plot(time, mean_current, color=color, 
+                           label=f'{receptor_type.upper()}', linewidth=2)
+                    ax.fill_between(time, mean_current - std_current, 
+                                   mean_current + std_current,
+                                   color=color, alpha=0.2)
+
+            # Mark periods
+            ax.axvspan(stim_start, stim_end, alpha=0.1, color='orange', 
+                      label='Stimulation' if idx == 0 else '', zorder=0)
+            if baseline_start is not None:
+                ax.axvspan(baseline_start, stim_start, alpha=0.1, color='green',
+                          label='Baseline' if idx == 0 else '', zorder=0)
+
+            ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+            ax.set_ylabel('Current (pA)', fontsize=11)
+
+            # Use class config colors for source if available
+            source_color = self.config.colors.get(source, 'black')
+            ax.set_title(f'{source.upper()} → {population.upper()}', 
+                        fontsize=11, fontweight='bold', color=source_color)
+            ax.legend(fontsize=10, loc='best')
+            ax.grid(True, alpha=0.3)
+            ax.set_axisbelow(True)
+
+        axes[-1].set_xlabel('Time (ms)', fontsize=11)
+
+        plt.suptitle(f'Synaptic Currents by Source: {population.upper()}',
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved current sources plot to {save_path}")
+
+        return fig
+
+
+    def plot_current_comparison_bar(self, current_analysis: Dict,
+                                    target_population: str,
+                                    populations: Optional[List[str]] = None,
+                                    save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Bar plot comparing baseline vs stimulation currents
+
+        Args:
+            current_analysis: Output from analyze_currents_by_period()
+            target_population: Population that was optogenetically stimulated
+            populations: List of populations to plot (default: ['gc', 'mc', 'pv', 'sst'])
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        if populations is None:
+            populations = ['gc', 'mc', 'pv', 'sst']
+
+        # Filter to only populations present in analysis
+        populations = [p for p in populations if p in current_analysis['baseline']]
+
+        if len(populations) == 0:
+            print("No populations found in current analysis")
+            return None
+
+        fig, axes = plt.subplots(2, len(populations), 
+                                figsize=(4*len(populations), 8),
+                                dpi=self.config.dpi)
+
+        # Handle single population case
+        if len(populations) == 1:
+            axes = axes.reshape(-1, 1)
+
+        for pop_idx, pop in enumerate(populations):
+            if pop not in current_analysis['baseline']:
+                continue
+
+            # Top row: Total excitatory and inhibitory
+            ax_top = axes[0, pop_idx]
+
+            baseline = current_analysis['baseline'][pop]['by_type']
+            stim = current_analysis['stimulation'][pop]['by_type']
+
+            categories = ['Excitatory', 'Inhibitory']
+            baseline_vals = [baseline['total_exc']['mean'], baseline['total_inh']['mean']]
+            stim_vals = [stim['total_exc']['mean'], stim['total_inh']['mean']]
+            baseline_errs = [baseline['total_exc']['sem'], baseline['total_inh']['sem']]
+            stim_errs = [stim['total_exc']['sem'], stim['total_inh']['sem']]
+
+            x = np.arange(len(categories))
+            width = 0.35
+
+            ax_top.bar(x - width/2, baseline_vals, width, label='Baseline',
+                      color='#27AE60', alpha=0.7, yerr=baseline_errs, capsize=5)
+            ax_top.bar(x + width/2, stim_vals, width, label='Stimulation',
+                      color='#E67E22', alpha=0.7, yerr=stim_errs, capsize=5)
+
+            ax_top.set_xticks(x)
+            ax_top.set_xticklabels(categories)
+            ax_top.set_ylabel('Current (pA)', fontsize=10)
+
+            # Use class config color for population
+            pop_color = self.config.colors.get(pop, 'black')
+            ax_top.set_title(f'{pop.upper()}: Exc vs Inh', 
+                            fontsize=11, fontweight='bold', color=pop_color)
+            if pop_idx == 0:
+                ax_top.legend(fontsize=10)
+            ax_top.grid(True, alpha=0.3, axis='y')
+            ax_top.set_axisbelow(True)
+            ax_top.axhline(0, color='black', linestyle='-', linewidth=1)
+
+            # Bottom row: By receptor type
+            ax_bot = axes[1, pop_idx]
+
+            receptor_types = ['AMPA', 'GABA', 'NMDA']
+            baseline_vals = [baseline['ampa']['mean'], baseline['gaba']['mean'], 
+                            baseline['nmda']['mean']]
+            stim_vals = [stim['ampa']['mean'], stim['gaba']['mean'], 
+                        stim['nmda']['mean']]
+            baseline_errs = [baseline['ampa']['sem'], baseline['gaba']['sem'],
+                            baseline['nmda']['sem']]
+            stim_errs = [stim['ampa']['sem'], stim['gaba']['sem'],
+                        stim['nmda']['sem']]
+
+            x = np.arange(len(receptor_types))
+
+            ax_bot.bar(x - width/2, baseline_vals, width, label='Baseline',
+                      color='#27AE60', alpha=0.7, yerr=baseline_errs, capsize=5)
+            ax_bot.bar(x + width/2, stim_vals, width, label='Stimulation',
+                      color='#E67E22', alpha=0.7, yerr=stim_errs, capsize=5)
+
+            ax_bot.set_xticks(x)
+            ax_bot.set_xticklabels(receptor_types)
+            ax_bot.set_ylabel('Current (pA)', fontsize=10)
+            ax_bot.set_title(f'{pop.upper()}: By Receptor', 
+                            fontsize=11, fontweight='bold', color=pop_color)
+            ax_bot.grid(True, alpha=0.3, axis='y')
+            ax_bot.set_axisbelow(True)
+            ax_bot.axhline(0, color='black', linestyle='-', linewidth=1)
+
+        plt.suptitle(f'Synaptic Currents: {target_population.upper()} Stimulation',
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved current comparison to {save_path}")
+
+        return fig
+
+
+    def plot_current_heatmap(self, recorded_currents: Dict,
+                            population: str,
+                            current_type: str = 'net',
+                            stim_start: Optional[float] = None,
+                            stim_end: Optional[float] = None,
+                            baseline_start: Optional[float] = None,
+                            sort_by_mean: bool = True,
+                            vmin: Optional[float] = None,
+                            vmax: Optional[float] = None,
+                            save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Plot heatmap of currents across cells and time
+
+        Similar to activity raster but for currents.
+
+        Args:
+            recorded_currents: Output from SynapticCurrentRecorder.get_results()
+            population: Population name
+            current_type: Type of current to plot ('ampa', 'gaba', 'nmda', 
+                         'total_exc', 'total_inh', 'net')
+            stim_start: Stimulation start time (ms)
+            stim_end: Stimulation end time (ms)
+            baseline_start: Baseline period start (ms)
+            sort_by_mean: Sort cells by mean current
+            vmin: Minimum value for colormap
+            vmax: Maximum value for colormap
+            save_path: Path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        time = recorded_currents['time']
+        if hasattr(time, 'cpu'):
+            time = time.cpu().numpy()
+        else:
+            time = np.array(time)
+
+        currents_by_type = recorded_currents['by_type'][population]
+
+        if current_type not in currents_by_type:
+            print(f"Current type {current_type} not found for {population}")
+            return None
+
+        current = currents_by_type[current_type]
+        if hasattr(current, 'cpu'):
+            current = current.cpu().numpy()
+        else:
+            current = np.array(current)
+
+        n_cells = current.shape[0]
+
+        # Sort by mean current if requested
+        if sort_by_mean:
+            mean_current_per_cell = np.mean(current, axis=1)
+            sorted_indices = np.argsort(mean_current_per_cell)[::-1]
+            current = current[sorted_indices, :]
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=self.config.figsize_large, dpi=self.config.dpi)
+
+        # Determine colormap range
+        if vmin is None:
+            vmin = np.percentile(current, 5)
+        if vmax is None:
+            vmax = np.percentile(current, 95)
+
+        # Plot heatmap
+        im = ax.imshow(current, aspect='auto', cmap='RdBu_r',
+                       vmin=vmin, vmax=vmax, interpolation='nearest',
+                       extent=[time[0], time[-1], n_cells, 0])
+
+        # Mark periods
+        if stim_start is not None and stim_end is not None:
+            ax.axvspan(stim_start, stim_end, alpha=0.1, color='orange',
+                      label='Stimulation', zorder=0)
+        if baseline_start is not None and stim_start is not None:
+            ax.axvspan(baseline_start, stim_start, alpha=0.1, color='green',
+                      label='Baseline', zorder=0)
+
+        # Plot mean current overlay
+        ax2 = ax.twinx()
+        mean_current = np.mean(current, axis=0)
+        # Normalize to cell index range for overlay
+        mean_normalized = ((mean_current - vmin) / (vmax - vmin)) * n_cells
+        mean_normalized = np.clip(mean_normalized, 0, n_cells)
+
+        ax2.plot(time, mean_normalized, color='black', linewidth=2,
+                label=f'Mean={np.mean(mean_current):.1f} pA')
+        ax2.set_ylabel('Normalized Mean Current', rotation=270, labelpad=20)
+        ax2.set_ylim([0, n_cells])
+        ax2.legend(loc='upper right', framealpha=0.7)
+
+        # Labels and title
+        ax.set_xlabel('Time (ms)', fontsize=11)
+        ax.set_ylabel('Cell Index', fontsize=11)
+
+        # Use class config color for title
+        pop_color = self.config.colors.get(population, 'black')
+        title = f'{population.upper()}: {current_type.replace("_", " ").title()} Current'
+        if sort_by_mean:
+            title += '\n(Sorted by Mean Current)'
+        ax.set_title(title, fontsize=12, fontweight='bold', color=pop_color)
+
+        # Colorbar
+        cbar = plt.colorbar(im, ax=[ax, ax2], fraction=0.046, pad=0.04)
+        cbar.set_label('Current (pA)', rotation=270, labelpad=15)
+
+        ax.grid(False)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved current heatmap to {save_path}")
+
+        return fig
 
     
     def create_summary_report(self, save_dir='./DG_visualization_report'):
