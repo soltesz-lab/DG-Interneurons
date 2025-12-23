@@ -1713,6 +1713,985 @@ class DGCircuitVisualization:
 
         return fig
 
+    def compute_input_weights_by_source(self, 
+                                        target_population: str,
+                                        opsin_expression: Optional[Dict[str, np.ndarray]] = None
+                                    ) -> Dict[str, Dict[str, np.ndarray]]:
+        """
+        Compute total synaptic weights from each source population to target cells
+
+        For each cell in the target population, sums all synaptic conductances from
+        each presynaptic population. Optionally separates contributions from
+        opsin-expressing vs non-expressing cells.
+
+        Args:
+            target_population: Target population name ('gc', 'mc', 'pv', 'sst')
+            opsin_expression: Optional dict mapping source population names to boolean
+                              arrays indicating opsin expression (True = expressing)
+                              Shape: {source_pop: [n_source_cells]}
+
+        Returns:
+            Dictionary with structure:
+            {
+                'source_pop': {
+                    'total_weights': np.ndarray [n_target_cells],
+                    'mean_weight': float,
+                    'std_weight': float,
+                    'n_connections': int,
+                    'opsin_expressing': np.ndarray [n_target_cells] (optional),
+                    'non_expressing': np.ndarray [n_target_cells] (optional),
+                    'mean_opsin_expressing': float (optional),
+                    'mean_non_expressing': float (optional)
+                },
+                ...
+            }
+        """
+        n_target = self.pop_sizes[target_population]
+        weight_data = {}
+
+        # Find all connections targeting this population
+        for conn_name, cond_matrix in self.connectivity.conductance_matrices.items():
+            parts = conn_name.split('_')
+            if len(parts) >= 2 and parts[1] == target_population:
+                source_pop = parts[0]
+
+                # Get conductance matrix [n_source, n_target]
+                if hasattr(cond_matrix.conductances, 'cpu'):
+                    conductances = cond_matrix.conductances.cpu().numpy()
+                    connectivity = cond_matrix.connectivity.cpu().numpy()
+                else:
+                    conductances = np.array(cond_matrix.conductances)
+                    connectivity = np.array(cond_matrix.connectivity)
+
+                # Sum conductances from all source cells to each target cell
+                total_weights = np.sum(conductances, axis=0)  # [n_target]
+
+                # Count connections
+                n_connections = np.sum(connectivity > 0)
+
+                source_data = {
+                    'total_weights': total_weights,
+                    'mean_weight': float(np.mean(total_weights)),
+                    'std_weight': float(np.std(total_weights)),
+                    'n_connections': int(n_connections),
+                    'synapse_type': cond_matrix.synapse_type
+                }
+
+                # Separate by opsin expression if provided
+                if opsin_expression is not None and source_pop in opsin_expression:
+                    opsin_mask = opsin_expression[source_pop]
+
+                    if hasattr(opsin_mask, 'cpu'):
+                        opsin_mask = opsin_mask.cpu().numpy()
+                    else:
+                        opsin_mask = np.array(opsin_mask).astype(bool)
+
+                    # Ensure mask is boolean
+                    opsin_mask = opsin_mask.astype(bool)
+
+                    # Sum weights from opsin-expressing sources
+                    opsin_weights = np.sum(conductances[opsin_mask, :], axis=0)
+
+                    # Sum weights from non-expressing sources
+                    non_opsin_weights = np.sum(conductances[~opsin_mask, :], axis=0)
+
+                    source_data['opsin_expressing'] = opsin_weights
+                    source_data['non_expressing'] = non_opsin_weights
+                    source_data['mean_opsin_expressing'] = float(np.mean(opsin_weights))
+                    source_data['mean_non_expressing'] = float(np.mean(non_opsin_weights))
+                    source_data['n_opsin_expressing'] = int(np.sum(opsin_mask))
+                    source_data['n_non_expressing'] = int(np.sum(~opsin_mask))
+
+                weight_data[source_pop] = source_data
+
+        return weight_data
+
+
+    def plot_input_weight_distribution(self,
+                                       post_population: str,
+                                       opsin_expression: Optional[Dict[str, np.ndarray]] = None,
+                                       sources_to_plot: Optional[List[str]] = None,
+                                       plot_type: str = 'both',
+                                       stimulated_population: Optional[str] = None,
+                                       save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Plot distribution of synaptic input weights from different source populations
+
+        Creates visualizations showing how synaptic weights are distributed across
+        cells in the target population, with separate plots for each source.
+
+        Args:
+            post_population: Post-synaptic population name ('gc', 'mc', 'pv', 'sst')
+            opsin_expression: Optional dict with opsin expression masks
+            sources_to_plot: List of source populations to include (None = all)
+            plot_type: 'histogram', 'violin', or 'both'
+            stimulated_population: Optional name of optogenetically stimulated population.
+                                   If provided and matches post_population, only plots
+                                   weights to opsin-non-expressing cells.
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        # Compute weight data
+        weight_data = self.compute_input_weights_by_source(
+            post_population, opsin_expression
+        )
+
+        # Filter to non-expressing target cells if this is the stimulated population
+        # Filter to non-expressing target cells if this is the stimulated population
+        filter_to_non_expressing = (
+            stimulated_population is not None and
+            stimulated_population == post_population and
+            opsin_expression is not None and
+            post_population in opsin_expression
+        )
+
+        if filter_to_non_expressing:
+            # Get mask for non-expressing cells in target population
+            opsin_mask = opsin_expression[post_population]
+            if hasattr(opsin_mask, 'cpu'):
+                opsin_mask = opsin_mask.cpu().numpy()
+            else:
+                opsin_mask = np.array(opsin_mask).astype(bool)
+
+            non_expressing_mask = ~opsin_mask
+            non_expressing_indices = np.where(non_expressing_mask)[0]
+
+            # Filter weight data to only non-expressing target cells
+            for source in list(weight_data.keys()):
+                data = weight_data[source]
+
+                # Filter total weights to non-expressing cells
+                data['total_weights'] = data['total_weights'][non_expressing_indices]
+
+                # Recalculate statistics for filtered cells
+                data['mean_weight'] = float(np.mean(data['total_weights']))
+                data['std_weight'] = float(np.std(data['total_weights']))
+
+                # Filter both opsin+ and opsin- components to non-expressing targets
+                if 'opsin_expressing' in data:
+                    # Filter opsin-expressing presynaptic weights to non-expressing targets
+                    data['opsin_expressing'] = data['opsin_expressing'][non_expressing_indices]
+                    data['mean_opsin_expressing'] = float(np.mean(data['opsin_expressing']))
+
+                    # Filter non-expressing presynaptic weights to non-expressing targets
+                    if 'non_expressing' in data:
+                        data['non_expressing'] = data['non_expressing'][non_expressing_indices]
+                        data['mean_non_expressing'] = float(np.mean(data['non_expressing']))
+
+                weight_data[source] = data
+        
+        # Filter populations
+        if sources_to_plot is not None:
+            weight_data = {k: v for k, v in weight_data.items() 
+                           if k in sources_to_plot}
+
+        if len(weight_data) == 0:
+            print(f"No input weights found for {post_population}")
+            return None
+
+        sources = list(weight_data.keys())
+        n_sources = len(sources)
+
+        # Determine subplot layout
+        if plot_type == 'both':
+            fig = plt.figure(figsize=(self.config.figsize_large[0], 4*n_sources),
+                            dpi=self.config.dpi)
+            gs = gridspec.GridSpec(n_sources, 2, hspace=0.3, wspace=0.3)
+        else:
+            fig = plt.figure(figsize=(self.config.figsize_large[0], 3*n_sources),
+                            dpi=self.config.dpi)
+            gs = gridspec.GridSpec(n_sources, 1, hspace=0.3)
+
+        for idx, source in enumerate(sources):
+            data = weight_data[source]
+            source_color = self.config.colors.get(source, '#7F8C8D')
+
+            if plot_type in ['histogram', 'both']:
+                if plot_type == 'both':
+                    ax_hist = fig.add_subplot(gs[idx, 0])
+                else:
+                    ax_hist = fig.add_subplot(gs[idx, 0])
+
+                # Plot histogram
+                weights = data['total_weights']
+                ax_hist.hist(weights, bins=50, color=source_color, alpha=0.7,
+                            edgecolor='black', linewidth=0.5)
+
+                # Add statistics
+                ax_hist.axvline(data['mean_weight'], color='red', linestyle='--',
+                              linewidth=2, label=f'Mean={data["mean_weight"]:.2f}')
+                ax_hist.axvline(data['mean_weight'] + data['std_weight'],
+                              color='orange', linestyle=':', linewidth=1.5,
+                              label=f'Std={data["std_weight"]:.2f}')
+                ax_hist.axvline(data['mean_weight'] - data['std_weight'],
+                              color='orange', linestyle=':', linewidth=1.5)
+
+                ax_hist.set_xlabel('Total Input Weight (nS)', fontsize=10)
+                ax_hist.set_ylabel('Number of Cells', fontsize=10)
+                ax_hist.set_title(f'{source.upper()} $\\rightarrow$ {post_population.upper()}\n'
+                                f'({data["synapse_type"]}, {data["n_connections"]} connections)',
+                                fontsize=11, fontweight='bold', color=source_color)
+                ax_hist.legend(fontsize=9, loc='upper right')
+                ax_hist.grid(True, alpha=0.3, axis='y')
+                ax_hist.set_axisbelow(True)
+
+            if plot_type in ['violin', 'both']:
+                if plot_type == 'both':
+                    ax_violin = fig.add_subplot(gs[idx, 1])
+                else:
+                    ax_violin = fig.add_subplot(gs[idx, 0])
+
+                # Prepare data for violin plot
+                if opsin_expression is not None and source in opsin_expression:
+                    # Two groups: opsin-expressing and non-expressing
+                    plot_data = []
+                    labels = []
+
+                    if 'opsin_expressing' in data:
+                        plot_data.append(data['opsin_expressing'])
+                        labels.append(f'Opsin+ (n={data["n_opsin_expressing"]})')
+
+                    if 'non_expressing' in data:
+                        plot_data.append(data['non_expressing'])
+                        labels.append(f'Opsin- (n={data["n_non_expressing"]})')
+
+                    # Create violin plot
+                    parts = ax_violin.violinplot(plot_data, positions=range(len(plot_data)),
+                                                showmeans=True, showmedians=True)
+
+                    # Color the violins
+                    colors = ['#E74C3C', '#3498DB']
+                    for i, pc in enumerate(parts['bodies']):
+                        pc.set_facecolor(colors[i % len(colors)])
+                        pc.set_alpha(0.7)
+
+                    ax_violin.set_xticks(range(len(labels)))
+                    ax_violin.set_xticklabels(labels, rotation=15, ha='right')
+                    ax_violin.set_ylabel('Input Weight (nS)', fontsize=10)
+                    ax_violin.set_title(f'{source.upper()} $\\rightarrow$ {post_population.upper()}\n'
+                                      'Opsin-Expressing vs Non-Expressing',
+                                      fontsize=11, fontweight='bold', color=source_color)
+                    ax_violin.grid(True, alpha=0.3, axis='y')
+                    ax_violin.set_axisbelow(True)
+
+                    # Add statistics annotations
+                    if len(plot_data) == 2:
+                        mean_diff = data['mean_opsin_expressing'] - data['mean_non_expressing']
+                        ax_violin.text(0.98, 0.98,
+                                     f'$\\Delta$ Mean = {mean_diff:.2f} nS',
+                                     transform=ax_violin.transAxes,
+                                     ha='right', va='top',
+                                     bbox=dict(boxstyle='round', facecolor='white',
+                                             alpha=0.8, edgecolor='gray'))
+                else:
+                    # Single violin for total weights
+                    ax_violin.violinplot([data['total_weights']], positions=[0],
+                                       showmeans=True, showmedians=True)
+                    ax_violin.set_xticks([0])
+                    ax_violin.set_xticklabels(['All Sources'])
+                    ax_violin.set_ylabel('Input Weight (nS)', fontsize=10)
+                    ax_violin.set_title(f'{source.upper()} $\\rightarrow$ {post_population.upper()}',
+                                      fontsize=11, fontweight='bold', color=source_color)
+                    ax_violin.grid(True, alpha=0.3, axis='y')
+                    ax_violin.set_axisbelow(True)
+
+        # Overall title
+        title = f'Synaptic Input Weights: {post_population.upper()}'
+        if filter_to_non_expressing:
+            title += f' (Opsin-Non-Expressing Cells Only, n={len(non_expressing_indices)})'
+        elif opsin_expression is not None:
+            title += ' (Separated by Opsin Expression)'
+        plt.suptitle(title, fontsize=14, fontweight='bold')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved input weight distribution to {save_path}")
+
+        return fig
+
+
+    def plot_weight_heatmap_by_cell(self,
+                                    post_population: str,
+                                    opsin_expression: Optional[Dict[str, np.ndarray]] = None,
+                                    sort_by: str = 'total',
+                                    normalize: bool = False,
+                                    save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Plot heatmap showing input weights from each source to each target cell
+
+        Each row is a target cell, each column group represents a source population.
+        Cells can be sorted by total input, specific source, or left unsorted.
+
+        Args:
+            post_population: Post-synaptic population name
+            opsin_expression: Optional dict with opsin expression masks
+            sort_by: How to sort cells ('total', 'source_name', or 'none')
+            normalize: Whether to normalize weights to [0, 1] range per source
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        weight_data = self.compute_input_weights_by_source(
+            post_population, opsin_expression
+        )
+
+        if len(weight_data) == 0:
+            print(f"No input weights found for {post_population}")
+            return None
+
+        sources = list(weight_data.keys())
+        n_target = self.pop_sizes[post_population]
+
+        # Build weight matrix [n_target, n_sources (or more if split by opsin)]
+        weight_matrix = []
+        column_labels = []
+        column_colors = []
+
+        for source in sources:
+            data = weight_data[source]
+            source_color = self.config.colors.get(source, '#7F8C8D')
+
+            if opsin_expression is not None and source in opsin_expression:
+                # Split into opsin+ and opsin-
+                if 'opsin_expressing' in data:
+                    weight_matrix.append(data['opsin_expressing'])
+                    column_labels.append(f'{source.upper()}\nOpsin+')
+                    column_colors.append(source_color)
+
+                if 'non_expressing' in data:
+                    weight_matrix.append(data['non_expressing'])
+                    column_labels.append(f'{source.upper()}\nOpsin-')
+                    # Lighter shade for non-expressing
+                    column_colors.append(source_color)
+            else:
+                weight_matrix.append(data['total_weights'])
+                column_labels.append(source.upper())
+                column_colors.append(source_color)
+
+        # Convert to array [n_target, n_columns]
+        weight_matrix = np.column_stack(weight_matrix)
+
+        # Sort cells if requested
+        if sort_by == 'total':
+            total_input = np.sum(weight_matrix, axis=1)
+            sort_indices = np.argsort(total_input)[::-1]
+            weight_matrix = weight_matrix[sort_indices, :]
+        elif sort_by in sources:
+            source_idx = sources.index(sort_by)
+            if opsin_expression is not None and sort_by in opsin_expression:
+                # Sort by total from this source (opsin+ and opsin- combined)
+                source_total = weight_matrix[:, source_idx] + weight_matrix[:, source_idx + 1]
+                sort_indices = np.argsort(source_total)[::-1]
+            else:
+                sort_indices = np.argsort(weight_matrix[:, source_idx])[::-1]
+            weight_matrix = weight_matrix[sort_indices, :]
+
+        # Normalize if requested
+        if normalize:
+            weight_matrix = weight_matrix / (np.max(weight_matrix, axis=0, keepdims=True) + 1e-8)
+
+        # Create figure
+        fig = plt.figure(figsize=(max(len(column_labels) * 1.5, 10), 10),
+                        dpi=self.config.dpi)
+        ax = fig.add_subplot(111)
+
+        # Plot heatmap
+        im = ax.imshow(weight_matrix, aspect='auto', cmap='YlOrRd',
+                       interpolation='nearest')
+
+        # Configure axes
+        ax.set_xticks(range(len(column_labels)))
+        ax.set_xticklabels(column_labels, rotation=45, ha='right', fontsize=10)
+
+        # Color x-axis labels by source
+        for i, (label, color) in enumerate(zip(ax.get_xticklabels(), column_colors)):
+            label.set_color(color)
+            label.set_fontweight('bold')
+
+        ax.set_ylabel(f'{post_population.upper()} Cell Index', fontsize=11)
+        ax.set_xlabel('Source Population', fontsize=11)
+
+        # Title
+        title = f'Synaptic Input Weights: {post_population.upper()}'
+        if normalize:
+            title += ' (Normalized)'
+        if sort_by == 'total':
+            title += '\n(Sorted by Total Input)'
+        elif sort_by in sources:
+            title += f'\n(Sorted by {sort_by.upper()} Input)'
+        ax.set_title(title, fontsize=12, fontweight='bold')
+
+        # Colorbar
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if normalize:
+            cbar.set_label('Normalized Weight', rotation=270, labelpad=15, fontsize=10)
+        else:
+            cbar.set_label('Weight (nS)', rotation=270, labelpad=15, fontsize=10)
+
+        # Add vertical lines to separate source groups
+        for i in range(1, len(column_labels)):
+            ax.axvline(i - 0.5, color='white', linewidth=2)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved weight heatmap to {save_path}")
+
+        return fig
+
+
+    def plot_weight_summary_bars(self,
+                                 post_population: str,
+                                 opsin_expression: Optional[Dict[str, np.ndarray]] = None,
+                                 show_error_bars: bool = True,
+                                 save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Bar plot summarizing mean input weights from each source
+
+        Shows mean ± SEM, with separate bars for opsin-expressing vs non-expressing
+        if opsin_expression is provided.
+
+        Args:
+            post_population: Post-synaptic population name
+            opsin_expression: Optional dict with opsin expression masks
+            show_error_bars: Whether to show error bars (SEM)
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        weight_data = self.compute_input_weights_by_source(
+            post_population, opsin_expression
+        )
+
+        if len(weight_data) == 0:
+            print(f"No input weights found for {post_population}")
+            return None
+
+        sources = list(weight_data.keys())
+
+        # Determine if we're splitting by opsin
+        has_opsin_split = any('opsin_expressing' in weight_data[s] 
+                             for s in sources if s in (opsin_expression or {}))
+
+        if has_opsin_split:
+            # Create grouped bar plot
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=self.config.figsize_large,
+                                           dpi=self.config.dpi)
+
+            # Left panel: Total weights
+            means_total = [weight_data[s]['mean_weight'] for s in sources]
+            stds_total = [weight_data[s]['std_weight'] for s in sources]
+            colors_total = [self.config.colors.get(s, '#7F8C8D') for s in sources]
+
+            x_pos = np.arange(len(sources))
+            bars1 = ax1.bar(x_pos, means_total, yerr=stds_total if show_error_bars else None,
+                           color=colors_total, alpha=0.7, capsize=5, edgecolor='black',
+                           linewidth=1.5)
+
+            ax1.set_xticks(x_pos)
+            ax1.set_xticklabels([s.upper() for s in sources], rotation=45, ha='right')
+            ax1.set_ylabel('Mean Input Weight (nS)', fontsize=11)
+            ax1.set_title('Total Input Weights', fontsize=12, fontweight='bold')
+            ax1.grid(True, alpha=0.3, axis='y')
+            ax1.set_axisbelow(True)
+
+            # Right panel: Opsin+ vs Opsin- comparison
+            # Only include sources that have opsin split
+            sources_with_opsin = [s for s in sources 
+                                 if 'opsin_expressing' in weight_data[s]]
+
+            if len(sources_with_opsin) > 0:
+                x_pos2 = np.arange(len(sources_with_opsin))
+                width = 0.35
+
+                means_opsin = [weight_data[s]['mean_opsin_expressing'] 
+                              for s in sources_with_opsin]
+                means_non = [weight_data[s]['mean_non_expressing'] 
+                            for s in sources_with_opsin]
+
+                bars2a = ax2.bar(x_pos2 - width/2, means_opsin, width,
+                               label='Opsin+', color='#E74C3C', alpha=0.7,
+                               edgecolor='black', linewidth=1.5)
+                bars2b = ax2.bar(x_pos2 + width/2, means_non, width,
+                               label='Opsin-', color='#3498DB', alpha=0.7,
+                               edgecolor='black', linewidth=1.5)
+
+                ax2.set_xticks(x_pos2)
+                ax2.set_xticklabels([s.upper() for s in sources_with_opsin],
+                                   rotation=45, ha='right')
+                ax2.set_ylabel('Mean Input Weight (nS)', fontsize=11)
+                ax2.set_title('Opsin-Expressing vs Non-Expressing', 
+                             fontsize=12, fontweight='bold')
+                ax2.legend(fontsize=10, loc='upper right')
+                ax2.grid(True, alpha=0.3, axis='y')
+                ax2.set_axisbelow(True)
+
+            plt.suptitle(f'Input Weight Summary: {post_population.upper()}',
+                        fontsize=14, fontweight='bold')
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        else:
+            # Simple bar plot without opsin split
+            fig, ax = plt.subplots(figsize=self.config.figsize_medium,
+                                  dpi=self.config.dpi)
+
+            means = [weight_data[s]['mean_weight'] for s in sources]
+            stds = [weight_data[s]['std_weight'] for s in sources]
+            colors = [self.config.colors.get(s, '#7F8C8D') for s in sources]
+
+            x_pos = np.arange(len(sources))
+            bars = ax.bar(x_pos, means, yerr=stds if show_error_bars else None,
+                         color=colors, alpha=0.7, capsize=5, edgecolor='black',
+                         linewidth=1.5)
+
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels([s.upper() for s in sources], rotation=45, ha='right')
+            ax.set_ylabel('Mean Input Weight (nS)', fontsize=11)
+            ax.set_title(f'Input Weight Summary: {post_population.upper()}',
+                        fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_axisbelow(True)
+
+            plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved weight summary to {save_path}")
+
+        return fig
+
+
+    def plot_weight_correlation_matrix(self,
+                                       post_population: str,
+                                       opsin_expression: Optional[Dict[str, np.ndarray]] = None,
+                                       method: str = 'pearson',
+                                       save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Plot correlation matrix showing how inputs from different sources co-vary
+
+        Useful for understanding whether cells receiving strong input from one source
+        also receive strong input from other sources.
+
+        Args:
+            post_population: Post-synaptic population name
+            opsin_expression: Optional dict with opsin expression masks
+            method: Correlation method ('pearson' or 'spearman')
+            save_path: Optional path to save figure
+
+        Returns:
+            matplotlib Figure object
+        """
+        weight_data = self.compute_input_weights_by_source(
+            post_population, opsin_expression
+        )
+
+        if len(weight_data) == 0:
+            print(f"No input weights found for {post_population}")
+            return None
+
+        sources = list(weight_data.keys())
+
+        # Build weight matrix
+        weight_matrix = []
+        column_labels = []
+
+        for source in sources:
+            data = weight_data[source]
+
+            if opsin_expression is not None and source in opsin_expression:
+                if 'opsin_expressing' in data:
+                    weight_matrix.append(data['opsin_expressing'])
+                    column_labels.append(f'{source.upper()}\nOpsin+')
+
+                if 'non_expressing' in data:
+                    weight_matrix.append(data['non_expressing'])
+                    column_labels.append(f'{source.upper()}\nOpsin-')
+            else:
+                weight_matrix.append(data['total_weights'])
+                column_labels.append(source.upper())
+
+        weight_matrix = np.column_stack(weight_matrix)
+
+        # Calculate correlation matrix
+        if method == 'pearson':
+            corr_matrix = np.corrcoef(weight_matrix.T)
+        elif method == 'spearman':
+            from scipy.stats import spearmanr
+            corr_matrix, _ = spearmanr(weight_matrix, axis=0)
+        else:
+            raise ValueError(f"Unknown correlation method: {method}")
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(max(len(column_labels) * 0.8, 8),
+                                       max(len(column_labels) * 0.8, 8)),
+                              dpi=self.config.dpi)
+
+        # Plot correlation matrix
+        im = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1,
+                       aspect='auto', interpolation='nearest')
+
+        # Configure axes
+        ax.set_xticks(range(len(column_labels)))
+        ax.set_yticks(range(len(column_labels)))
+        ax.set_xticklabels(column_labels, rotation=45, ha='right', fontsize=9)
+        ax.set_yticklabels(column_labels, fontsize=9)
+
+        # Add correlation values as text
+        for i in range(len(column_labels)):
+            for j in range(len(column_labels)):
+                text_color = 'white' if abs(corr_matrix[i, j]) > 0.5 else 'black'
+                ax.text(j, i, f'{corr_matrix[i, j]:.2f}',
+                       ha='center', va='center', color=text_color, fontsize=8)
+
+        ax.set_title(f'Input Weight Correlations: {post_population.upper()}\n'
+                    f'({method.capitalize()} correlation)',
+                    fontsize=12, fontweight='bold')
+
+        # Colorbar
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Correlation Coefficient', rotation=270, labelpad=15, fontsize=10)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
+            print(f"Saved correlation matrix to {save_path}")
+
+        return fig
+
+
+    def analyze_weights_by_response_type(self,
+                                         target_population: str,
+                                         post_population: str,
+                                         activity_trace: Dict[str, torch.Tensor],
+                                         baseline_mask: torch.Tensor,
+                                         stim_mask: torch.Tensor,
+                                         opsin_expression: Optional[Dict[str, np.ndarray]] = None,
+                                         threshold_std: float = 1.0) -> Dict:
+            """
+            Analyze synaptic weights to cells that increased vs decreased firing
+
+            Classifies post-synaptic cells based on firing rate changes during 
+            optogenetic stimulation, then computes weight distributions from each
+            presynaptic source to excited vs suppressed cells.
+
+            Args:
+                target_population: Optogenetically stimulated population (e.g., 'pv')
+                post_population: Post-synaptic population to analyze (e.g., 'gc')
+                activity_trace: Activity traces (from simulation results)
+                baseline_mask: Boolean mask for baseline period
+                stim_mask: Boolean mask for stimulation period
+                opsin_expression: Optional dict with opsin expression arrays
+                threshold_std: Threshold in standard deviations for classification
+
+            Returns:
+                Dictionary with weight distributions and statistics:
+                {
+                    'post_population': str,
+                    'target_population': str,
+                    'n_excited': int,
+                    'n_suppressed': int,
+                    'n_unchanged': int,
+                    'excited_indices': np.ndarray,
+                    'suppressed_indices': np.ndarray,
+                    'unchanged_indices': np.ndarray,
+                    'weights_by_source_and_response': {
+                        'source_pop': {
+                            'to_excited': np.ndarray,  # or opsin_to_excited, etc.
+                            'to_suppressed': np.ndarray,
+                            'synapse_type': str,
+                            'split_by_opsin': bool,
+                            ...
+                        },
+                        ...
+                    }
+                }
+            """
+
+                    
+            # Filter to non-expressing cells if analyzing the stimulated population
+            filter_to_non_expressing = (
+                target_population == post_population and
+                opsin_expression is not None and
+                post_population in opsin_expression
+            )
+            
+            # Classify post-synaptic cells by response
+            post_activity = activity_trace[post_population]
+
+            # Apply filter to non-expressing cells if needed
+            cell_indices_to_analyze = None
+            if filter_to_non_expressing:
+                opsin_mask = opsin_expression[post_population]
+                if hasattr(opsin_mask, 'cpu'):
+                    opsin_mask = opsin_mask.cpu().numpy()
+                else:
+                    opsin_mask = np.array(opsin_mask).astype(bool)
+
+                # Get indices of non-expressing cells
+                non_expressing_mask = ~opsin_mask
+                cell_indices_to_analyze = torch.from_numpy(np.where(non_expressing_mask)[0])
+
+                # Filter activity to only non-expressing cells
+                post_activity = post_activity[cell_indices_to_analyze, :]
+            
+            baseline_rate = torch.mean(post_activity[:, baseline_mask], dim=1)
+            stim_rate = torch.mean(post_activity[:, stim_mask], dim=1)
+            rate_change = stim_rate - baseline_rate
+            baseline_std = torch.std(baseline_rate)
+
+            # Classify cells
+            excited_mask = rate_change > threshold_std * baseline_std
+            suppressed_mask = rate_change < -threshold_std * baseline_std
+            unchanged_mask = ~(excited_mask | suppressed_mask)
+
+            excited_indices_filtered = torch.where(excited_mask)[0].cpu().numpy()
+            suppressed_indices_filtered = torch.where(suppressed_mask)[0].cpu().numpy()
+            unchanged_indices_filtered = torch.where(unchanged_mask)[0].cpu().numpy()
+
+            # Map back to original cell indices if we filtered
+            if cell_indices_to_analyze is not None:
+                cell_indices_np = cell_indices_to_analyze.cpu().numpy()
+                excited_indices = cell_indices_np[excited_indices_filtered]
+                suppressed_indices = cell_indices_np[suppressed_indices_filtered]
+                unchanged_indices = cell_indices_np[unchanged_indices_filtered]
+            else:
+                excited_indices = excited_indices_filtered
+                suppressed_indices = suppressed_indices_filtered
+                unchanged_indices = unchanged_indices_filtered
+        
+            n_excited = len(excited_indices)
+            n_suppressed = len(suppressed_indices)
+            n_unchanged = len(unchanged_indices)
+
+            # Get weight data for each source
+            weight_data = self.compute_input_weights_by_source(
+                post_population, opsin_expression
+            )
+
+            # Organize results
+            results = {
+                'post_population': post_population,
+                'target_population': target_population,
+                'n_excited': n_excited,
+                'n_suppressed': n_suppressed,
+                'n_unchanged': n_unchanged,
+                'excited_indices': excited_indices,
+                'suppressed_indices': suppressed_indices,
+                'unchanged_indices': unchanged_indices,
+                'filtered_to_non_expressing': filter_to_non_expressing,
+                'n_analyzed': len(cell_indices_to_analyze) if cell_indices_to_analyze is not None else self.pop_sizes[post_population],
+                'weights_by_source_and_response': {}
+            }
+
+            # For each source population, get weights to excited vs suppressed cells
+            for source, source_data in weight_data.items():
+                source_results = {}
+
+                # Check if this source should be split by opsin expression
+                split_by_opsin = (source == target_population and 
+                                 opsin_expression is not None and 
+                                 source in opsin_expression)
+
+                if split_by_opsin:
+                    # Split by opsin expression AND response type
+                    opsin_weights = source_data['opsin_expressing']
+                    non_opsin_weights = source_data['non_expressing']
+
+                    source_results['opsin_to_excited'] = opsin_weights[excited_indices] if n_excited > 0 else np.array([])
+                    source_results['opsin_to_suppressed'] = opsin_weights[suppressed_indices] if n_suppressed > 0 else np.array([])
+                    source_results['opsin_to_unchanged'] = opsin_weights[unchanged_indices] if n_unchanged > 0 else np.array([])
+
+                    source_results['non_opsin_to_excited'] = non_opsin_weights[excited_indices] if n_excited > 0 else np.array([])
+                    source_results['non_opsin_to_suppressed'] = non_opsin_weights[suppressed_indices] if n_suppressed > 0 else np.array([])
+                    source_results['non_opsin_to_unchanged'] = non_opsin_weights[unchanged_indices] if n_unchanged > 0 else np.array([])
+
+                    source_results['n_opsin'] = source_data['n_opsin_expressing']
+                    source_results['n_non_opsin'] = source_data['n_non_expressing']
+                else:
+                    # Just split by response type
+                    total_weights = source_data['total_weights']
+
+                    source_results['to_excited'] = total_weights[excited_indices] if n_excited > 0 else np.array([])
+                    source_results['to_suppressed'] = total_weights[suppressed_indices] if n_suppressed > 0 else np.array([])
+                    source_results['to_unchanged'] = total_weights[unchanged_indices] if n_unchanged > 0 else np.array([])
+
+                source_results['synapse_type'] = source_data['synapse_type']
+                source_results['split_by_opsin'] = split_by_opsin
+
+                results['weights_by_source_and_response'][source] = source_results
+
+            return results
+
+    def plot_weights_by_response_type(self,
+                                      analysis_results: Dict,
+                                      sources_to_plot: Optional[List[str]] = None,
+                                      save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Create violin plots of synaptic weights split by post-synaptic response
+
+        Shows distribution of weights from each source to excited vs suppressed cells.
+        If source is the optogenetically stimulated population, further splits by
+        opsin expression.
+
+        Args:
+            analysis_results: Output from analyze_weights_by_response_type()
+            sources_to_plot: List of sources to include (None = all)
+            save_path: Optional path to save figure
+
+        Returns:
+            Matplotlib figure object
+        """
+        weights_data = analysis_results['weights_by_source_and_response']
+        post_pop = analysis_results['post_population']
+        target_pop = analysis_results['target_population']
+
+        n_excited = analysis_results['n_excited']
+        n_suppressed = analysis_results['n_suppressed']
+
+        # Filter sources
+        if sources_to_plot is not None:
+            weights_data = {k: v for k, v in weights_data.items() if k in sources_to_plot}
+
+        if len(weights_data) == 0:
+            print("No weight data to plot")
+            return None
+
+        sources = list(weights_data.keys())
+
+        # Create figure
+        n_sources = len(sources)
+        fig, axes = plt.subplots(1, n_sources, figsize=(5*n_sources, 6),
+                                sharey=True, squeeze=False)
+        axes = axes.flatten()
+
+        # Color scheme
+        excited_color = '#E74C3C'  # Red
+        suppressed_color = '#3498DB'  # Blue
+
+        for idx, source in enumerate(sources):
+            ax = axes[idx]
+            source_data = weights_data[source]
+
+            plot_data = []
+            labels = []
+            colors = []
+
+            if source_data['split_by_opsin']:
+                # Four violin groups: opsin+/excited, opsin+/suppressed, opsin-/excited, opsin-/suppressed
+
+                # Opsin+ to excited
+                if len(source_data['opsin_to_excited']) > 0:
+                    plot_data.append(source_data['opsin_to_excited'])
+                    labels.append(f'Opsin+\n$\\rightarrow${post_pop.upper()}+')
+                    colors.append(excited_color)
+
+                # Opsin+ to suppressed
+                if len(source_data['opsin_to_suppressed']) > 0:
+                    plot_data.append(source_data['opsin_to_suppressed'])
+                    labels.append(f'Opsin+\n$\\rightarrow${post_pop.upper()}$-$')
+                    colors.append(suppressed_color)
+
+                # Opsin- to excited
+                if len(source_data['non_opsin_to_excited']) > 0:
+                    plot_data.append(source_data['non_opsin_to_excited'])
+                    labels.append(f'Opsin$-$\n$\\rightarrow${post_pop.upper()}+')
+                    colors.append(excited_color)
+
+                # Opsin- to suppressed
+                if len(source_data['non_opsin_to_suppressed']) > 0:
+                    plot_data.append(source_data['non_opsin_to_suppressed'])
+                    labels.append(f'Opsin$-$\n$\\rightarrow${post_pop.upper()}$-$')
+                    colors.append(suppressed_color)
+            else:
+                # Two violin groups: excited, suppressed
+
+                if len(source_data['to_excited']) > 0:
+                    plot_data.append(source_data['to_excited'])
+                    labels.append(f'$\\rightarrow${post_pop.upper()}+')
+                    colors.append(excited_color)
+
+                if len(source_data['to_suppressed']) > 0:
+                    plot_data.append(source_data['to_suppressed'])
+                    labels.append(f'$\\rightarrow${post_pop.upper()}$-$')
+                    colors.append(suppressed_color)
+
+            if len(plot_data) == 0:
+                ax.text(0.5, 0.5, 'No data', ha='center', va='center',
+                       transform=ax.transAxes)
+                ax.set_title(f'{source.upper()}', fontsize=12, fontweight='bold')
+                continue
+
+            # Create violin plot
+            parts = ax.violinplot(plot_data, positions=range(len(plot_data)),
+                                 showmeans=True, showmedians=True)
+
+            # Color violins
+            for i, pc in enumerate(parts['bodies']):
+                pc.set_facecolor(colors[i])
+                pc.set_alpha(0.7)
+                pc.set_edgecolor('black')
+                pc.set_linewidth(1.5)
+
+            # Style other elements
+            for partname in ['cbars', 'cmins', 'cmaxes', 'cmedians', 'cmeans']:
+                if partname in parts:
+                    parts[partname].set_edgecolor('black')
+                    parts[partname].set_linewidth(1.5)
+
+            # Set labels
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, fontsize=10)
+            ax.set_ylabel('Input Weight (nS)', fontsize=11)
+
+            # Title with source info
+            synapse_type = source_data['synapse_type']
+            title = f'{source.upper()}\n({synapse_type})'
+            if source_data['split_by_opsin']:
+                title += f"\nOpsin+: {source_data['n_opsin']}, Opsin$-$: {source_data['n_non_opsin']}"
+
+            ax.set_title(title, fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_axisbelow(True)
+
+            # Add statistics text
+            stats_text = []
+            for i, data in enumerate(plot_data):
+                if len(data) > 0:
+                    mean = np.mean(data)
+                    stats_text.append(f'{labels[i].replace("$", "").replace("\\rightarrow", "->")}: {mean:.2f} nS')
+
+            if stats_text:
+                ax.text(0.98, 0.98, '\n'.join(stats_text),
+                       transform=ax.transAxes, ha='right', va='top',
+                       fontsize=9, bbox=dict(boxstyle='round', facecolor='white',
+                                            alpha=0.8, edgecolor='gray'))
+
+        # Overall title
+        title = f'Synaptic Weights by Stimulation Response\n'
+        title += f'{target_pop.upper()} Stimulation $\\rightarrow$ {post_pop.upper()} Population\n'
+        # Add info about filtering if applicable
+        if analysis_results.get('filtered_to_non_expressing', False):
+            n_analyzed = analysis_results.get('n_analyzed', 0)
+            title += f' (Non-Opsin-Expressing Only)'
+        title += f'\n({n_excited} excited, {n_suppressed} suppressed cells)'
+
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Saved weights by response plot to: {save_path}")
+
+        return fig
     
     def create_summary_report(self, save_dir='./DG_visualization_report'):
         """

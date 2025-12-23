@@ -1991,7 +1991,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     # Save results if requested
     if save_results_file is not None:
         save_experiment_results(results, conn_analysis, conductance_analysis, 
-                               save_results_file, metadata)
+                                save_results_file, metadata)
     elif auto_save:
         # Auto-save with default filename
         default_filename = get_default_results_filename(optimization_json_file, 
@@ -2000,7 +2000,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
         save_experiment_results(results, conn_analysis, conductance_analysis,
                                 str(save_path), metadata)
     
-    return results, conn_analysis, conductance_analysis
+    return experiment, results, conn_analysis, conductance_analysis
     
 
 def save_experiment_results(results: Dict, 
@@ -4761,6 +4761,85 @@ def plot_recorded_currents(circuit, recorded_currents, current_analysis,
             if fig is not None:
                 plt.close(fig)
 
+def plot_synaptic_distributions(circuit,
+                                target_population: str,
+                                opsin_expression: Dict[str, np.ndarray],
+                                output_dir: str = './synaptic_weights'):
+    """
+    Plot synaptic weight distributions for all post-synaptic populations
+    
+    Args:
+        circuit: DentateCircuit instance
+        target_population: Population that was optogenetically stimulated
+        opsin_expression: Dict mapping population names to expression arrays
+        output_dir: Directory to save plots
+    """
+    from pathlib import Path
+    
+    # Ensure output directory exists
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating synaptic weight distributions for {target_population.upper()} stimulation:")
+    print(f"  Output directory: {output_path}")
+    
+    vis = DGCircuitVisualization(circuit)
+    
+    # Plot weights to each post-synaptic population
+    for post_pop in ['gc', 'mc', 'pv', 'sst']:
+        print(f"  Plotting weights to {post_pop.upper()}...")
+        
+        # 1. Input weight distribution (histogram + violin plots)
+        distribution_path = output_path / f'{target_population}_stim_to_{post_pop}_weight_distribution.pdf'
+        try:
+            fig = vis.plot_input_weight_distribution(
+                post_population=post_pop,
+                opsin_expression=opsin_expression,
+                stimulated_population=target_population,
+                plot_type='both',
+                save_path=str(distribution_path)
+            )
+            if fig is not None:
+                plt.close(fig)
+                print(f"  Saved distribution: {distribution_path.name}")
+        except Exception as e:
+            print(f"    Error creating distribution plot: {e}")
+        
+        # 2. Weight heatmap by cell
+        heatmap_path = output_path / f'{target_population}_stim_to_{post_pop}_weight_heatmap.pdf'
+        try:
+            fig = vis.plot_weight_heatmap_by_cell(
+                post_population=post_pop,
+                opsin_expression=opsin_expression,
+                save_path=str(heatmap_path)
+            )
+            if fig is not None:
+                plt.close(fig)
+                print(f"  Saved heatmap: {heatmap_path.name}")
+        except Exception as e:
+            print(f"  Error creating heatmap: {e}")
+        
+        # 3. Weight correlation matrix
+        correlation_path = output_path / f'{target_population}_stim_to_{post_pop}_weight_correlation.pdf'
+        try:
+            fig = vis.plot_weight_correlation_matrix(
+                post_population=post_pop,
+                opsin_expression=opsin_expression,
+                save_path=str(correlation_path)
+            )
+            if fig is not None:
+                plt.close(fig)
+                print(f"  Saved correlation: {correlation_path.name}")
+        except Exception as e:
+            print(f"  Error creating correlation plot: {e}")
+    
+    print(f"\nCompleted synaptic weight plotting for {target_population.upper()}")
+                
+            
+        
+
+    
+                
 
 def print_current_analysis(current_analysis):
     
@@ -4795,11 +4874,459 @@ def print_current_analysis(current_analysis):
         stim_ei = abs(stim['total_exc']['mean']) / (abs(stim['total_inh']['mean']) + 1e-6)
         print(f"  E/I Ratio:  {baseline_ei:>7.3f} → {stim_ei:>7.3f}")
     
+
+def reconstruct_circuit_from_metadata(metadata: Dict,
+                                      optimization_json_file: Optional[str] = None,
+                                      device: Optional[torch.device] = None) -> Tuple[DentateCircuit, Dict[str, OpsinExpression]]:
+    """
+    Reconstruct circuit and opsin expression from saved metadata
     
-"""
-Updated main block for DG_protocol.py that includes ablation and expression level analysis.
-Replace the existing if __name__ == "__main__": block with this version.
-"""
+    Args:
+        metadata: Metadata dict from saved experiment results
+        optimization_json_file: Optional path to optimization file
+        device: Device to create circuit on
+        
+    Returns:
+        Tuple of (circuit, opsin_expression_dict)
+    """
+    if device is None:
+        device = get_default_device()
+    
+    print("\nReconstructing circuit from saved metadata...")
+    
+    # Extract circuit parameters from metadata
+    circuit_config = metadata.get('circuit_params', {})
+    
+    # Create circuit parameters with saved values
+    circuit_params = CircuitParams(
+        n_gc=circuit_config.get('n_gc', 1000),
+        n_mc=circuit_config.get('n_mc', 30),
+        n_pv=circuit_config.get('n_pv', 30),
+        n_sst=circuit_config.get('n_sst', 20),
+        n_mec=circuit_config.get('n_mec', 60)
+    )
+    
+    # Create synaptic and opsin parameters
+    synaptic_params = PerConnectionSynapticParams()
+    opsin_params = OpsinParams()
+    
+    # Create circuit
+    circuit = DentateCircuit(
+        circuit_params,
+        synaptic_params,
+        opsin_params,
+        device=device
+    )
+    
+    # Apply optimization parameters if file provided
+    if optimization_json_file:
+        circuit.load_and_apply_optimization_results(optimization_json_file)
+    
+    # Create opsin expression for each target population
+    # Use base_seed from metadata to ensure consistency
+    base_seed = metadata.get('base_seed', 42)
+    set_random_seed(base_seed, device)
+    
+    opsin_expression_dict = {}
+    for target_pop in ['pv', 'sst']:
+        n_cells = getattr(circuit_params, f'n_{target_pop}')
+        opsin_expression_dict[target_pop] = OpsinExpression(
+            opsin_params, 
+            n_cells, 
+            device=device
+        )
+    
+    print(f"  Circuit reconstructed with {circuit_params.n_gc} GC, "
+          f"{circuit_params.n_mc} MC, {circuit_params.n_pv} PV, "
+          f"{circuit_params.n_sst} SST cells")
+    print(f"  Using seed: {base_seed}")
+    
+    return circuit, opsin_expression_dict
+
+
+
+def plot_synaptic_weights_from_results(results: Dict,
+                                       metadata: Dict,
+                                       output_path: Path,
+                                       optimization_json_file: Optional[str] = None,
+                                       device: Optional[torch.device] = None):
+    """
+    Plot synaptic weight distributions from saved results
+    
+    Args:
+        results: Loaded experiment results
+        metadata: Metadata from saved results
+        output_path: Base output directory (e.g., Path('protocol'))
+        optimization_json_file: Optional path to optimization file
+        device: Device to create circuit on
+    """
+    print("\n" + "="*80)
+    print("Generating Synaptic Weight Distribution Plots")
+    print("="*80)
+    
+    # Reconstruct circuit
+    circuit, opsin_expression_dict = reconstruct_circuit_from_metadata(
+        metadata, 
+        optimization_json_file,
+        device
+    )
+    
+    # Create base output directory for weights
+    weights_base_dir = output_path / 'synaptic_weights'
+    weights_base_dir.mkdir(exist_ok=True, parents=True)
+    
+    print(f"\nBase output directory: {weights_base_dir}")
+    
+    # Plot for each target population
+    for target_pop in ['pv', 'sst']:
+        if target_pop not in results:
+            print(f"\nSkipping {target_pop.upper()} - no results found")
+            continue
+        
+        # Use highest intensity for weight visualization
+        intensities = sorted(results[target_pop].keys())
+        if len(intensities) == 0:
+            print(f"\nSkipping {target_pop.upper()} - no intensities found")
+            continue
+        
+        intensity = intensities[-1]  # Highest intensity
+        experiment_data = results[target_pop][intensity]
+        
+        print(f"\n{'='*60}")
+        print(f"Processing {target_pop.upper()} stimulation at intensity {intensity}")
+        print('='*60)
+        
+        # Get opsin expression levels
+        if 'opsin_expression_mean' in experiment_data:
+            opsin_expression_array = experiment_data['opsin_expression_mean']
+            if hasattr(opsin_expression_array, 'cpu'):
+                opsin_expression_array = opsin_expression_array.cpu().numpy()
+            else:
+                opsin_expression_array = np.array(opsin_expression_array)
+        else:
+            # Fall back to reconstructed expression
+            opsin_expression_array = opsin_expression_dict[target_pop].expression_levels
+            if hasattr(opsin_expression_array, 'cpu'):
+                opsin_expression_array = opsin_expression_array.cpu().numpy()
+        
+        # Create opsin expression dict for visualization
+        # This should include the target population's expression
+        opsin_expr_dict = {
+            target_pop: opsin_expression_array
+        }
+        
+        # Create subdirectory for this target population
+        target_output_dir = weights_base_dir / f'{target_pop}_stimulation'
+        
+        # Plot weight distributions
+        plot_synaptic_distributions(
+            circuit=circuit,
+            target_population=target_pop,
+            opsin_expression=opsin_expr_dict,
+            output_dir=str(target_output_dir)
+        )
+    
+    print(f"\n{'='*80}")
+    print(f"All synaptic weight plots saved to: {weights_base_dir}")
+    print('='*80)
+
+
+def plot_currents_from_results(results: Dict,
+                               metadata: Dict,
+                               output_path: Path,
+                               optimization_json_file: Optional[str] = None,
+                               device: Optional[torch.device] = None):
+    """
+    Plot synaptic current analysis from saved results
+    
+    Args:
+        results: Loaded experiment results
+        metadata: Metadata from saved results
+        output_path: Directory to save plots
+        optimization_json_file: Optional path to optimization file
+        device: Device to create circuit on
+    """
+    print("\n" + "="*80)
+    print("Generating Synaptic Current Plots")
+    print("="*80)
+    
+    # Check if any results contain current data
+    has_current_data = False
+    for target_pop in ['pv', 'sst']:
+        if target_pop in results:
+            for intensity, data in results[target_pop].items():
+                if 'current_analysis' in data and 'recorded_currents' in data:
+                    has_current_data = True
+                    break
+            if has_current_data:
+                break
+    
+    if not has_current_data:
+        print("No current recording data found in results")
+        print("Note: Current recording must be enabled during simulation with --record-currents")
+        return
+    
+    # Reconstruct circuit from metadata
+    circuit, _ = reconstruct_circuit_from_metadata(
+        metadata,
+        optimization_json_file,
+        device
+    )
+    
+    # Create output directory
+    currents_output = output_path / 'synaptic_currents'
+    currents_output.mkdir(exist_ok=True, parents=True)
+    
+    # Extract stimulation parameters from metadata
+    stim_start = metadata.get('stim_start', 1500.0)
+    stim_duration = metadata.get('stim_duration', 1000.0)
+    baseline_start = metadata.get('warmup', 500.0)
+    
+    print(f"\nStimulation parameters:")
+    print(f"  Baseline: {baseline_start} - {stim_start} ms")
+    print(f"  Stimulation: {stim_start} - {stim_start + stim_duration} ms")
+    
+    # Plot for each target population and intensity with current data
+    for target_pop in ['pv', 'sst']:
+        if target_pop not in results:
+            continue
+        
+        print(f"\nProcessing {target_pop.upper()} stimulation:")
+        
+        for intensity in sorted(results[target_pop].keys()):
+            experiment_data = results[target_pop][intensity]
+            
+            if 'current_analysis' not in experiment_data:
+                continue
+            
+            if 'recorded_currents' not in experiment_data:
+                continue
+            
+            recorded_currents = experiment_data['recorded_currents']
+            current_analysis = experiment_data['current_analysis']
+            
+            if recorded_currents is None or current_analysis is None:
+                continue
+            
+            print(f"  Plotting currents for intensity {intensity}")
+            
+            condition_dir = currents_output / f"{target_pop}_intensity_{intensity}"
+            condition_dir.mkdir(exist_ok=True, parents=True)
+            
+            plot_recorded_currents(
+                circuit=circuit,
+                recorded_currents=recorded_currents,
+                current_analysis=current_analysis,
+                target_population=target_pop,
+                baseline_start=baseline_start,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                output_dir=str(condition_dir)
+            )
+    
+    print(f"\nSynaptic current plots saved to: {currents_output}")
+    
+
+def analyze_and_plot_weights_by_response(
+    circuit,
+    target_population: str,
+    experiment_results: Dict,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float = 500.0,
+    post_populations: Optional[List[str]] = None,
+    threshold_std: float = 1.0,
+    save_path: Optional[str] = None
+) -> Tuple[Dict, List[plt.Figure]]:
+    """
+    Combined analysis and plotting of weights by post-synaptic response
+    
+    For each post-synaptic population, classifies cells as excited vs suppressed
+    during optogenetic stimulation, then plots violin plots of input weights
+    from each source separately for excited and suppressed cells.
+    
+    This analysis reveals whether cells that show paradoxical excitation
+    (or suppression) have different patterns of synaptic input compared to
+    cells that respond in the opposite direction.
+    
+    Args:
+        circuit: DentateCircuit instance
+        target_population: Optogenetically stimulated population (e.g., 'pv')
+        experiment_results: Results from simulate_stimulation (aggregated)
+        stim_start: Stimulation start time (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Pre-stimulation period (ms)
+        post_populations: List of populations to analyze (None = ['gc', 'mc'])
+        threshold_std: Classification threshold in standard deviations
+        save_path: Base directory for saving figures (creates subdirectory)
+        
+    Returns:
+        Tuple of (analysis_results_dict, list_of_figures)
+        
+    Example:
+        >>> analyses, figs = analyze_and_plot_weights_by_response(
+        ...     circuit=circuit,
+        ...     target_population='pv',
+        ...     experiment_results=results,
+        ...     stim_start=1500.0,
+        ...     stim_duration=1000.0,
+        ...     save_path='protocol/weight_analysis'
+        ... )
+    """
+    if post_populations is None:
+        post_populations = ['gc', 'mc', 'pv', 'sst']
+    
+    # Get activity traces and masks
+    time = experiment_results['time']
+    activity_trace_mean = experiment_results['activity_trace_mean']
+    
+    baseline_mask = (time >= warmup) & (time < stim_start)
+    stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+    
+    # Get opsin expression
+    opsin_expression_mean = experiment_results.get('opsin_expression_mean', None)
+    
+    if opsin_expression_mean is not None:
+        if hasattr(opsin_expression_mean, 'cpu'):
+            opsin_expression_array = opsin_expression_mean.cpu().numpy()
+        else:
+            opsin_expression_array = np.array(opsin_expression_mean)
+        
+        opsin_expression = {target_population: opsin_expression_array}
+    else:
+        opsin_expression = None
+    
+    # Create visualization object
+    vis = DGCircuitVisualization(circuit)
+    
+    # Create output directory if save_path provided
+    if save_path:
+        from pathlib import Path
+        output_dir = Path(save_path) / f'{target_population}_weights_by_response'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nSaving analysis of weights by response to: {output_dir}")
+    
+    # Analyze and plot for each post-synaptic population
+    all_analyses = {}
+    all_figures = []
+    
+    print(f"\n{'='*60}")
+    print(f"Analyzing synaptic weights by post-synaptic response")
+    print(f"Target: {target_population.upper()} stimulation")
+    print('='*60)
+    
+    for post_pop in post_populations:
+        print(f"\nAnalyzing weights to {post_pop.upper()}...")
+        
+        # Analyze
+        analysis = vis.analyze_weights_by_response_type(
+            target_population=target_population,
+            post_population=post_pop,
+            activity_trace=activity_trace_mean,
+            baseline_mask=baseline_mask,
+            stim_mask=stim_mask,
+            opsin_expression=opsin_expression,
+            threshold_std=threshold_std
+        )
+        
+        all_analyses[post_pop] = analysis
+        
+        # Print summary
+        print(f"  Excited cells: {analysis['n_excited']}")
+        print(f"  Suppressed cells: {analysis['n_suppressed']}")
+        print(f"  Unchanged cells: {analysis['n_unchanged']}")
+        
+        # Plot
+        if save_path:
+            save_file = str(output_dir / f'weights_by_response_{post_pop}.pdf')
+        else:
+            save_file = None
+        
+        fig = vis.plot_weights_by_response_type(
+            analysis,
+            save_path=save_file
+        )
+        
+        if fig is not None:
+            all_figures.append(fig)
+    
+    print(f"\n{'='*60}")
+    print(f"Completed weights by response analysis")
+    print('='*60)
+    
+    return all_analyses, all_figures
+
+
+def analyze_synaptic_weights_by_response_from_results(results: Dict,
+                                                      metadata: Dict,
+                                                      output_path: Path,
+                                                      optimization_json_file: Optional[str] = None,
+                                                      device: Optional[torch.device] = None):
+    """
+    Analyze and plot synaptic weights by response from saved results
+    
+    Args:
+        results: Loaded experiment results
+        metadata: Metadata from saved results
+        output_path: Base output directory (e.g., Path('protocol'))
+        optimization_json_file: Optional path to optimization file
+        device: Device to create circuit on
+    """
+    
+    # Reconstruct circuit
+    circuit, opsin_expression_dict = reconstruct_circuit_from_metadata(
+        metadata, 
+        optimization_json_file,
+        device
+    )
+    
+    # Extract stimulation parameters from metadata
+    stim_start = metadata.get('stim_start', 1500.0)
+    stim_duration = metadata.get('stim_duration', 1000.0)
+    baseline_start = metadata.get('warmup', 500.0)
+    
+    # Create base output directory for weights
+    weights_base_dir = output_path / 'synaptic_weights'
+    weights_base_dir.mkdir(exist_ok=True, parents=True)
+
+    analyses_dict = {}
+    figures_dict = {}
+    
+    # Plot for each target population
+    for target_pop in ['pv', 'sst']:
+        if target_pop not in results:
+            print(f"\nSkipping {target_pop.upper()} - no results found")
+            continue
+        
+        # Use highest intensity for weight visualization
+        intensities = sorted(results[target_pop].keys())
+        if len(intensities) == 0:
+            print(f"\nSkipping {target_pop.upper()} - no intensities found")
+            continue
+        
+        intensity = intensities[-1]  # Highest intensity
+        experiment_data = results[target_pop][intensity]
+        
+        print(f"\n{'='*60}")
+        print(f"Processing {target_pop.upper()} stimulation at intensity {intensity}")
+        print('='*60)
+        
+        # Create subdirectory for this target population
+        target_output_dir = weights_base_dir / f'{target_pop}_stimulation'
+
+        all_analyses, all_figures = analyze_and_plot_weights_by_response(
+            circuit,
+            target_population=target_pop,
+            experiment_results=experiment_data,
+            stim_start=stim_start,
+            stim_duration=stim_duration,
+            warmup=baseline_start,
+            save_path=target_output_dir)
+
+        analyses_dict[target_pop] = all_analyses
+        figures_dict[target_pop] = all_figures
+        
+    return analyses_dict, figures_dict
 
 if __name__ == "__main__":
     print("Dentate Gyrus Circuit with Anatomical Connectivity")
@@ -4828,6 +5355,10 @@ Examples:
     # Execution mode
     parser.add_argument('--plot-only', action='store_true',
                         help='Only plot results (requires at least one --load-* option)')
+    parser.add_argument('--plot-synaptic-weights', action='store_true',
+                        help='Plot synaptic weight distribution')
+    parser.add_argument('--analyze-synaptic-weights-by-response', action='store_true',
+                        help='Analyze and plot synaptic weight distribution by optogenetic response')
     
     # Loading options (for plot-only mode)
     parser.add_argument('--load-comparative-results', type=str, default=None,
@@ -4962,24 +5493,17 @@ Examples:
                         stimulation_level=intensity, 
                         save_path=str(output_path)
                     )
-                for target_pop in ['pv', 'sst']:
-                    if (intensity in results[target_pop]) and ('current_analysis' in results[target_pop][intensity]):
-                        experiment_data = results[target_pop][intensity]
-                        print(f"experiment_data keys = {list(experiment_data.keys())}")
-                        print(f"experiment_data = {experiment_data}")
-                        recorded_currents = experiment_data.get('recorded_currents', None)
-                        current_analysis = experiment_data.get('current_analysis', None)
-                        circuit = DentateCircuit(CircuitParams(),
-                                                 PerConnectionSynapticParams(),
-                                                 OpsinParams())
-                        stim_start = metadata['stim_start']
-                        stim_duration = metadata['stim_duration']
-                        baseline_start = metadata['warmup']
-                        plot_recorded_currents(circuit, recorded_currents, current_analysis,
-                                               target_population=target_pop, baseline_start=baseline_start,
-                                               stim_start=stim_start, stim_duration=stim_duration,
-                                               output_dir=str(output_path))
-                    
+
+            # Plot current analysis using reconstructed circuit
+            if metadata is not None:
+                plot_currents_from_results(
+                    results=results,
+                    metadata=metadata,
+                    output_path=output_path,
+                    optimization_json_file=metadata.get('optimization_file')
+                )        
+
+        
         # Plot ablation results
         if ablation_results is not None:
             print("\nPlotting ablation test results...")
@@ -5013,7 +5537,24 @@ Examples:
                 intensity=1.5,
                 save_path=str(output_path)
             )
-        
+
+        # Add synaptic weight plotting if requested
+        if args.plot_synaptic_weights and results is not None and metadata is not None:
+            plot_synaptic_weights_from_results(
+                results=results,
+                metadata=metadata,
+                output_path=output_path,
+                optimization_json_file=metadata.get('optimization_file')
+            )
+            
+        # Analyze synaptic weights by response if requested
+        if args.analyze_synaptic_weights_by_response and results is not None and metadata is not None:
+            analyze_synaptic_weights_by_response_from_results(
+                results=results,
+                metadata=metadata,
+                output_path=output_path,
+                optimization_json_file=metadata.get('optimization_file')
+            )
         sys.exit(0)
     
     print("\n" + "="*80)
@@ -5050,7 +5591,7 @@ Examples:
     print("#"*80)
     
     
-    results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
+    experiment, results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
         optimization_json_file=args.optimization_file,
         intensities=[0.5, 1.0, 1.5],
         mec_current=args.mec_current,
@@ -5111,6 +5652,8 @@ Examples:
                     print(f"    Rate: {mean_baseline_rate:.1f} -> {mean_stim_rate:.1f} Hz")
                     print(f"    Change: {mean_change:.2f} +/- {mean_change_std:.2f} Hz")
 
+    plotted_synaptic_weights = False
+                    
     # Plot comparative results
     print("\nGenerating comparative experiment plots...")
     for intensity in [0.5, 1.0, 1.5]:
@@ -5119,23 +5662,66 @@ Examples:
             stimulation_level=intensity, 
             save_path=str(output_path)
         )
-        if args.record_currents:
+    if args.record_currents:
+        for target_pop in ['pv', 'sst']:
+            if (intensity in results[target_pop]) and ('current_analysis' in results[target_pop][intensity]):
+                experiment_data = results[target_pop][intensity]
+                recorded_currents = experiment_data.get('recorded_currents', None)
+                current_analysis = experiment_data.get('current_analysis', None)
+
+                # Use the actual experiment circuit
+                stim_start = args.stim_start
+                stim_duration = args.stim_duration
+                baseline_start = 500.0
+
+                plot_recorded_currents(
+                    experiment.circuit,
+                    recorded_currents, 
+                    current_analysis,
+                    target_population=target_pop, 
+                    baseline_start=baseline_start,
+                    stim_start=stim_start, 
+                    stim_duration=stim_duration,
+                    output_dir=str(output_path)
+                )
+
+    if args.plot_synaptic_weights and (not plotted_synaptic_weights):
+        if intensity > 1.0:
+            # Create base weights directory
+            weights_base_dir = output_path / 'synaptic_weights'
+            weights_base_dir.mkdir(exist_ok=True, parents=True)
+
             for target_pop in ['pv', 'sst']:
-                if 'current_analysis' in results[target_pop][intensity]:
-                    experiment_data = results[target_pop][intensity]
-                    recorded_currents = experiment_data.get('recorded_currents', None)
-                    current_analysis = experiment_data.get('current_analysis', None)
-                    circuit = DentateCircuit(CircuitParams(),
-                                             PerConnectionSynapticParams(),
-                                             OpsinParams())
-                    stim_start=args.stim_start
-                    stim_duration=args.stim_duration
-                    baseline_start = 500.0
-                    plot_recorded_currents(circuit, recorded_currents, current_analysis,
-                                           target_population=target_pop, baseline_start=baseline_start,
-                                           stim_start=stim_start, stim_duration=stim_duration,
-                                           output_dir=str(output_path))
-            
+                experiment_data = results[target_pop][intensity]
+
+                # Get opsin expression for this target
+                opsin_expression_array = experiment_data['opsin_expression_mean']
+                if hasattr(opsin_expression_array, 'cpu'):
+                    opsin_expression_array = opsin_expression_array.cpu().numpy()
+                else:
+                    opsin_expression_array = np.array(opsin_expression_array)
+
+                opsin_expression_dict = {
+                    target_pop: opsin_expression_array
+                }
+
+                # Create subdirectory for this target population
+                target_output_dir = weights_base_dir / f'{target_pop}_stimulation'
+
+                print(f"\n{'='*60}")
+                print(f"Plotting synaptic weights for {target_pop.upper()} stimulation")
+                print('='*60)
+
+                # Plot with proper directory structure
+                plot_synaptic_distributions(
+                    circuit=experiment.circuit,
+                    target_population=target_pop,
+                    opsin_expression=opsin_expression_dict,
+                    output_dir=str(target_output_dir)
+                )
+
+            plotted_synaptic_weights = True
+            print(f"\nAll synaptic weight plots saved to: {weights_base_dir}")
         
     # Run ablation tests
     print("\n" + "#"*80)
