@@ -285,12 +285,12 @@ class PerConnectionSynapticParams:
     """Parameters for per-connection conductances"""
     
     # Base conductance parameters (mean values)
-    ampa_g_mean: float = 0.2      # AMPA conductance mean (nS per connection)
+    ampa_g_mean: float = 0.1      # AMPA conductance mean (nS per connection)
     ampa_g_std: float = 0.04      # AMPA conductance standard deviation
     ampa_g_min: float = 0.001     # Minimum AMPA conductance
     ampa_g_max: float = 1.5       # Maximum AMPA conductance
     
-    gaba_g_mean: float = 0.25     # GABA conductance mean (nS per connection)
+    gaba_g_mean: float = 0.125     # GABA conductance mean (nS per connection)
     gaba_g_std: float = 0.04      # GABA conductance standard deviation  
     gaba_g_min: float = 0.001     # Minimum GABA conductance
     gaba_g_max: float = 1.5       # Maximum GABA conductance
@@ -419,9 +419,9 @@ class CircuitParams:
     """Circuit parameters with anatomical connectivity"""
     # Population sizes (scaled for simulation)
     n_gc: int = 1000
-    n_mc: int = 30
-    n_pv: int = 30
-    n_sst: int = 20
+    n_mc: int = 60
+    n_pv: int = 60
+    n_sst: int = 40
     n_mec: int = 60  # MEC layer 2 principal cells
 
     # Local connection probabilities (GC -> local targets)
@@ -432,8 +432,8 @@ class CircuitParams:
     # MC connection probabilities
     p_mc_gc_local: float = 0.01      # MC to local GC
     p_mc_gc_distant: float = 0.03    # MC to distant GC
-    p_mc_pv_distant: float = 0.1     # MC to distant PV
-    p_mc_sst: float = 0.1            # MC to local SST (molecular layer)
+    p_mc_pv_distant: float = 0.05     # MC to distant PV
+    p_mc_sst: float = 0.075            # MC to local SST (molecular layer)
     p_mc_mc_local: float = 0.05      # MC to local MC
     
     # MEC connection probabilities (from Hainmueller et al.)
@@ -448,8 +448,8 @@ class CircuitParams:
     p_pv_pv: float = 0.11          # PV lateral inhibition
     p_pv_sst: float = 0.025          
     p_sst_gc: float = 0.04         # SST dendritic inhibition
-    p_sst_mc: float = 0.3          # SST to MC inhibition
-    p_sst_pv: float = 0.12         # SST to PV feedback
+    p_sst_mc: float = 0.15          # SST to MC inhibition
+    p_sst_pv: float = 0.06         # SST to PV feedback
     p_sst_sst: float = 0.05        # SST to SST feedback
     
     # Population heterogeneity for competition

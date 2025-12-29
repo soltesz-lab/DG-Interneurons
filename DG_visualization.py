@@ -2568,8 +2568,15 @@ class DGCircuitVisualization:
 
         # Create figure
         n_sources = len(sources)
-        fig, axes = plt.subplots(1, n_sources, figsize=(5*n_sources, 6),
-                                sharey=True, squeeze=False)
+        # Create figure with 2-column vertical layout
+        n_sources = len(sources)
+        n_rows = (n_sources + 1) // 2  # Ceiling division
+        n_cols = 2
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(12, 5*n_rows),
+                                 sharey=True,
+                                 squeeze=False)
+        
         axes = axes.flatten()
 
         # Color scheme
@@ -2673,6 +2680,10 @@ class DGCircuitVisualization:
                        transform=ax.transAxes, ha='right', va='top',
                        fontsize=9, bbox=dict(boxstyle='round', facecolor='white',
                                             alpha=0.8, edgecolor='gray'))
+                
+        # Remove unused subplot if odd number of sources
+        if n_sources % 2 == 1:
+            fig.delaxes(axes[-1])
 
         # Overall title
         title = f'Synaptic Weights by Stimulation Response\n'

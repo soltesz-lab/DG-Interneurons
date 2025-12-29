@@ -1,5 +1,7 @@
 import sys
 import math
+import pickle
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,10 +23,24 @@ from DG_circuit_dendritic_somatic_transfer import (
     PerConnectionSynapticParams,
     OpsinParams
 )
+from nested_experiment import (
+    NestedExperimentConfig,
+    run_nested_comparative_experiment,
+    aggregate_nested_results,
+    compute_variance_decomposition,
+    classify_mechanism_regime,
+    save_nested_experiment_results,
+    print_nested_experiment_summary,
+    save_nested_experiment_summary,
+    plot_variance_decomposition,
+    plot_connectivity_instance_variance,
+    plot_connectivity_instance_variance_detailed,
+)
 from DG_visualization import (
     DGCircuitVisualization
 )
-
+from statistical_testing_weights import (analyze_weights_by_average_response,
+                                         plot_weights_by_average_response)
 from gradient_adaptive_stepper import (
     GradientAdaptiveStepConfig,
     GradientAdaptiveStepper,
@@ -952,7 +968,6 @@ class OptogeneticExperiment:
                     trial_index=trial
                 )
 
-            print(f"trial_result keys: {list(trial_result.keys())}")
             all_trial_results.append(trial_result)
 
             # Clean up if regenerating circuits
@@ -1499,8 +1514,6 @@ class OptogeneticExperiment:
             Aggregated current statistics or None if currents not recorded
         """
 
-        print(f"_aggregate_trial_currents: recorded_currents = {list('recorded_currents' in tr for tr in trial_results)}")
-        
         # Check if any trial has recorded currents
         if not any('recorded_currents' in tr for tr in trial_results):
             return None
@@ -1881,7 +1894,6 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
 
             # Extract currents
             recorded_currents = result.get('recorded_currents', None)
-            print(f"recorded_currents = {recorded_currents}")
             
             baseline_mask = (time >= warmup) & (time < stim_start)
             stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
@@ -1889,6 +1901,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             analysis = {}
             analysis['opsin_expression_mean'] = opsin_expression_mean
             analysis['n_trials'] = n_trials
+            
 
             if recorded_currents is not None:
                 analysis['recorded_currents'] = recorded_currents
@@ -1908,10 +1921,13 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                 stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
                 
                 if pop == target:
+                    # For target population, analyze both all cells and non-expressing cells
+
+                    # Store all-cell metrics for target (includes directly stimulated cells)
                     analysis[f'{pop}_stim_rates_mean'] = stim_rate.numpy()
                     analysis[f'{pop}_baseline_rates_mean'] = baseline_rate.numpy()
-                    
-                    # Calculate trial-to-trial variability for target population
+
+                    # Calculate trial-to-trial variability for all cells
                     stim_rates_all_trials = []
                     baseline_rates_all_trials = []
                     for trial_result in result['trial_results']:
@@ -1920,11 +1936,81 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                         trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
                         baseline_rates_all_trials.append(trial_baseline.numpy())
                         stim_rates_all_trials.append(trial_stim.numpy())
-                    
+
                     analysis[f'{pop}_baseline_rates_std'] = np.std(baseline_rates_all_trials, axis=0)
                     analysis[f'{pop}_stim_rates_std'] = np.std(stim_rates_all_trials, axis=0)
-                    continue
 
+                    # Analyze non-expressing cells separately
+                    # Get non-stimulated indices from first trial (same across trials if not regenerating opsin)
+                    non_stimulated_indices = result['trial_results'][0]['non_stimulated_indices']
+                    n_non_expressing = len(non_stimulated_indices)
+
+                    if n_non_expressing > 0:
+                        # Analyze only non-expressing cells
+                        rate_change = stim_rate - baseline_rate
+                        baseline_std = torch.std(baseline_rate)
+
+                        # Get responses for non-expressing cells
+                        baseline_rate_nonexpr = baseline_rate[non_stimulated_indices]
+                        stim_rate_nonexpr = stim_rate[non_stimulated_indices]
+                        rate_change_nonexpr = rate_change[non_stimulated_indices]
+                        baseline_std_nonexpr = torch.std(baseline_rate_nonexpr)
+
+                        # Compute excited/inhibited fractions for non-expressing cells
+                        excited_fraction_nonexpr = torch.mean(
+                            (rate_change_nonexpr > baseline_std_nonexpr).float()
+                        )
+                        inhibited_fraction_nonexpr = torch.mean(
+                            (rate_change_nonexpr < -baseline_std_nonexpr).float()
+                        )
+
+                        analysis[f'{pop}_nonexpr_excited'] = excited_fraction_nonexpr.item()
+                        analysis[f'{pop}_nonexpr_inhibited'] = inhibited_fraction_nonexpr.item()
+                        analysis[f'{pop}_nonexpr_mean_change'] = torch.mean(rate_change_nonexpr).item()
+                        analysis[f'{pop}_nonexpr_mean_stim_rate'] = torch.mean(stim_rate_nonexpr).item()
+                        analysis[f'{pop}_nonexpr_mean_baseline_rate'] = torch.mean(baseline_rate_nonexpr).item()
+                        analysis[f'{pop}_nonexpr_count'] = n_non_expressing
+
+                        # Calculate trial-to-trial variability for non-expressing cells
+                        excited_fractions_nonexpr_all = []
+                        mean_changes_nonexpr_all = []
+
+                        for trial_result in result['trial_results']:
+                            trial_activity = trial_result['activity_trace'][pop]
+                            trial_non_stim_idx = trial_result['non_stimulated_indices']
+
+                            if len(trial_non_stim_idx) > 0:
+                                trial_baseline = torch.mean(trial_activity[:, baseline_mask], dim=1)
+                                trial_stim = torch.mean(trial_activity[:, stim_mask], dim=1)
+                                trial_change = trial_stim - trial_baseline
+                                trial_baseline_std = torch.std(trial_baseline)
+
+                                # Non-expressing cells only
+                                trial_change_nonexpr = trial_change[trial_non_stim_idx]
+                                trial_baseline_std_nonexpr = torch.std(trial_baseline[trial_non_stim_idx])
+
+                                trial_excited_nonexpr = torch.mean(
+                                    (trial_change_nonexpr > trial_baseline_std_nonexpr).float()
+                                ).item()
+                                excited_fractions_nonexpr_all.append(trial_excited_nonexpr)
+                                mean_changes_nonexpr_all.append(torch.mean(trial_change_nonexpr).item())
+
+                        analysis[f'{pop}_nonexpr_excited_std'] = np.std(excited_fractions_nonexpr_all)
+                        analysis[f'{pop}_nonexpr_mean_change_std'] = np.std(mean_changes_nonexpr_all)
+                    else:
+                        # All cells express opsin - no non-expressing cells
+                        analysis[f'{pop}_nonexpr_excited'] = 0.0
+                        analysis[f'{pop}_nonexpr_inhibited'] = 0.0
+                        analysis[f'{pop}_nonexpr_mean_change'] = 0.0
+                        analysis[f'{pop}_nonexpr_count'] = 0
+                        if n_trials > 1:
+                            analysis[f'{pop}_nonexpr_excited_std'] = 0.0
+                            analysis[f'{pop}_nonexpr_mean_change_std'] = 0.0
+
+                    # Skip standard analysis for target population
+                    continue                
+                
+                # Standard analysis for NON-TARGET populations
                 rate_change = stim_rate - baseline_rate
                 baseline_std = torch.std(baseline_rate)
                 
@@ -2018,8 +2104,6 @@ def save_experiment_results(results: Dict,
         filepath: Path to save file (e.g., 'experiment_results.pkl')
         metadata: Optional metadata dict (parameters, timestamp, etc.)
     """
-    import pickle
-    from datetime import datetime
     
     # Prepare data for saving
     save_data = {
@@ -2071,8 +2155,6 @@ def load_experiment_results(filepath: str) -> Tuple[Dict, Dict, Dict, Dict]:
     Returns:
         Tuple of (results, connectivity_analysis, conductance_analysis, metadata)
     """
-    import pickle
-    
     filepath = Path(filepath)
     
     if not filepath.exists():
@@ -2135,8 +2217,6 @@ def get_default_results_filename(optimization_file: Optional[str] = None,
     Returns:
         Default filename string
     """
-    from datetime import datetime
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     if optimization_file:
@@ -2506,6 +2586,50 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax.legend(fontsize=10)
         ax.set_axisbelow(True)
 
+    # Panel E: Non-expressing cells in target populations
+    for i, target in enumerate(targets):
+        ax = plt.subplot(3, 4, 9 + i)
+
+        # Check if non-expressing cell data exists
+        if f'{target}_nonexpr_excited' in results[target][stimulation_level]:
+            nonexpr_data = results[target][stimulation_level]
+
+            # Get statistics
+            excited_nonexpr = nonexpr_data[f'{target}_nonexpr_excited']
+            n_nonexpr = nonexpr_data.get(f'{target}_nonexpr_count', 0)
+
+            if has_multitrial and f'{target}_nonexpr_excited_std' in nonexpr_data:
+                excited_std = nonexpr_data[f'{target}_nonexpr_excited_std']
+            else:
+                excited_std = 0
+
+            # Create bar plot
+            x_pos = [0]
+            bars = ax.bar(x_pos, [excited_nonexpr * 100], 
+                         yerr=[excited_std * 100] if has_multitrial else None,
+                         color='purple', alpha=0.7, edgecolor='black', linewidth=1.5,
+                         capsize=5)
+
+            # Add value label
+            height = bars[0].get_height()
+            ax.text(0, height, f'{excited_nonexpr*100:.1f}%\n(n={n_nonexpr})',
+                   ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+            ax.set_xlim(-0.5, 0.5)
+            ax.set_xticks([])
+            ax.set_ylabel('% Paradoxically Excited', fontsize=10)
+            title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+            ax.set_title(f'{target.upper()} Non-Expressing Cells{title_suffix}',
+                        fontsize=11, fontweight='bold', color='purple')
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_ylim(0, max(100, excited_nonexpr * 120))
+        else:
+            # No data available
+            ax.text(0.5, 0.5, 'No non-expressing\ncell data available',
+                   ha='center', va='center', transform=ax.transAxes,
+                   fontsize=10, style='italic')
+            ax.axis('off')
+        
     # Panel F: Summary text
     ax6 = plt.subplot(3, 4, 12)
     ax6.axis('off')
@@ -2527,7 +2651,21 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                 else:
                     summary_text += f"  {pop.upper()}: {excited:.1%} excited\n"
         summary_text += "\n"
-    
+
+    summary_text += "\nNon-Expressing Cells:\n"
+    for target in targets:
+        if f'{target}_nonexpr_excited' in results[target][stimulation_level]:
+            excited_nonexpr = results[target][stimulation_level][f'{target}_nonexpr_excited']
+            n_nonexpr = results[target][stimulation_level].get(f'{target}_nonexpr_count', 0)
+
+            if has_multitrial and f'{target}_nonexpr_excited_std' in results[target][stimulation_level]:
+                std = results[target][stimulation_level][f'{target}_nonexpr_excited_std']
+                summary_text += f"{target.upper()}: {excited_nonexpr:.1%} ± {std:.1%} (n={n_nonexpr})\n"
+            else:
+                summary_text += f"{target.upper()}: {excited_nonexpr:.1%} (n={n_nonexpr})\n"
+        else:
+            summary_text += f"{target.upper()}: No data\n"
+        
     ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes, va='top', ha='left',
             fontsize=10, fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
@@ -3079,7 +3217,6 @@ def test_interneuron_interactions(
     
     # Save results if requested
     if save_results_file:
-        import pickle
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
         print(f"\nResults saved to: {save_results_file}")
@@ -3321,7 +3458,6 @@ def test_excitation_to_interneurons(
                 print(f"             -> {'STRONG' if abs(change) > 0.15 else 'MODERATE'} reduction suggests disinhibition mechanism")
     
     if save_results_file:
-        import pickle
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
         print(f"\nResults saved to: {save_results_file}")
@@ -3552,7 +3688,6 @@ def test_recurrent_excitation(
                 print(f"             -> Recurrent excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
     
     if save_results_file:
-        import pickle
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
         print(f"\nResults saved to: {save_results_file}")
@@ -3789,7 +3924,6 @@ def test_intrinsic_excitation(
                 print(f"             -> Intrinsic excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
     
     if save_results_file:
-        import pickle
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
         print(f"\nResults saved to: {save_results_file}")
@@ -3992,7 +4126,6 @@ def run_all_ablation_tests(
     
     # Save combined results
     combined_file = output_path / "all_ablation_tests.pkl"
-    import pickle
     with open(combined_file, 'wb') as f:
         pickle.dump(all_results, f)
     print(f"\n\nAll results saved to: {combined_file}")
@@ -4335,7 +4468,6 @@ def test_opsin_expression_levels(
     
     # Save results if requested
     if save_results_file:
-        import pickle
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
         print(f"\nResults saved to: {save_results_file}")
@@ -4774,8 +4906,6 @@ def plot_synaptic_distributions(circuit,
         opsin_expression: Dict mapping population names to expression arrays
         output_dir: Directory to save plots
     """
-    from pathlib import Path
-    
     # Ensure output directory exists
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -5201,7 +5331,6 @@ def analyze_and_plot_weights_by_response(
     
     # Create output directory if save_path provided
     if save_path:
-        from pathlib import Path
         output_dir = Path(save_path) / f'{target_population}_weights_by_response'
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"\nSaving analysis of weights by response to: {output_dir}")
@@ -5357,9 +5486,15 @@ Examples:
                         help='Only plot results (requires at least one --load-* option)')
     parser.add_argument('--plot-synaptic-weights', action='store_true',
                         help='Plot synaptic weight distribution')
-    parser.add_argument('--analyze-synaptic-weights-by-response', action='store_true',
-                        help='Analyze and plot synaptic weight distribution by optogenetic response')
-    
+    parser.add_argument('--plot-weights-by-response', action='store_true',
+                        help='Plot synaptic weight distributions by response type (violin plots)')
+    parser.add_argument('--test-weights-by-response', action='store_true',
+                        help='Statistical testing of weights by response with bootstrap CIs')
+    parser.add_argument('--response-threshold-std', type=float, default=1.0,
+                        help='Standard deviation threshold for response classification (default: 1.0)')
+    parser.add_argument('--n-bootstrap', type=int, default=10000,
+                        help='Number of bootstrap samples for confidence intervals (default: 10000)')
+
     # Loading options (for plot-only mode)
     parser.add_argument('--load-comparative-results', type=str, default=None,
                         metavar='FILE',
@@ -5437,15 +5572,34 @@ Examples:
     # Parameters for synaptic current recording
     parser.add_argument('--record-currents', action='store_true',
                         help='Record synaptic currents and generate current plots')
+
+    # Command-line arguments for nested experiments (connectivity x MEC input patterns)
+    nested_group = parser.add_argument_group('Nested Experiment Options')
+    
+    nested_group.add_argument('--nested-experiment', action='store_true',
+                              help='Run nested experiment (connectivity x input patterns)')
+    nested_group.add_argument('--n-connectivity', type=int, default=5,
+                              help='Number of connectivity instances (default: 5)')
+    nested_group.add_argument('--n-mec-patterns', type=int, default=3,
+                              help='Number of MEC patterns per connectivity (default: 3)')
+    nested_group.add_argument('--load-nested-results', type=str, default=None,
+                              help='Load nested experiment results from file')
+    nested_group.add_argument('--plot-variance-decomposition', action='store_true',
+                              help='Plot variance decomposition')
+    nested_group.add_argument('--plot-connectivity-variance', action='store_true',
+                              help='Plot connectivity variance')
+    nested_group.add_argument('--plot-connectivity-variance-details', action='store_true',
+                              help='Plot connectivity variance details')
+    
     
     args = parser.parse_args()
 
     # Validate arguments
     if args.plot_only:
         if not any([args.load_comparative_results, args.load_ablation_results, 
-                    args.load_expression_results]):
+                    args.load_expression_results, args.load_nested_results]):
             parser.error("--plot-only requires at least one of: --load-comparative-results, "
-                         "--load-ablation-results, --load-expression-results")
+                         "--load-ablation-results, --load-expression-results, --load-nested-results")
             
     output_dir = "protocol"
     output_path = Path(output_dir)
@@ -5472,14 +5626,12 @@ Examples:
         # Load ablation results
         if args.load_ablation_results:
             print(f"\nLoading ablation results from: {args.load_ablation_results}")
-            import pickle
             with open(args.load_ablation_results, 'rb') as f:
                 ablation_results = pickle.load(f)
         
         # Load expression results
         if args.load_expression_results:
             print(f"\nLoading expression results from: {args.load_expression_results}")
-            import pickle
             with open(args.load_expression_results, 'rb') as f:
                 expression_results = pickle.load(f)
         
@@ -5548,15 +5700,129 @@ Examples:
             )
             
         # Analyze synaptic weights by response if requested
-        if args.analyze_synaptic_weights_by_response and results is not None and metadata is not None:
+        if args.plot_weights_by_response and results is not None and metadata is not None:
             analyze_synaptic_weights_by_response_from_results(
                 results=results,
                 metadata=metadata,
                 output_path=output_path,
                 optimization_json_file=metadata.get('optimization_file')
             )
+
+        # Statistical testing with bootstrap (new)
+        if args.test_weights_by_response and results is not None and metadata is not None:
+            print("\nPerforming statistical testing of weights by response...")
+
+            # Reconstruct circuit
+            circuit, _ = reconstruct_circuit_from_metadata(
+                metadata,
+                optimization_json_file=metadata.get('optimization_file')
+            )
+
+            # Create output directory
+            weights_stats_dir = output_path / 'weights_statistical_tests'
+            weights_stats_dir.mkdir(exist_ok=True, parents=True)
+
+            # Analyze for each target at highest intensity
+            for target_pop in ['pv', 'sst']:
+                if target_pop not in results:
+                    continue
+
+                intensities = sorted(results[target_pop].keys())
+                if len(intensities) == 0:
+                    continue
+
+                intensity = intensities[-1]
+
+                print(f"\n  Testing {target_pop.upper()} stimulation at intensity {intensity}...")
+
+                # Run statistical analysis
+                response_analysis = analyze_weights_by_average_response(
+                    comparative_results=results,
+                    circuit=circuit,
+                    target_population=target_pop,
+                    intensity=intensity,
+                    baseline_start=metadata.get('warmup', 500.0),
+                    stim_start=metadata.get('stim_start', 1500.0),
+                    stim_duration=metadata.get('stim_duration', 1000.0),
+                    post_populations=['gc', 'mc', 'pv', 'sst'],
+                    threshold_std=args.response_threshold_std,
+                    n_permutations=10000,
+                    n_bootstrap=args.n_bootstrap,
+                    confidence_level=0.95
+                )
+
+                # Plot
+                fig = plot_weights_by_average_response(
+                    response_analysis,
+                    target_population=target_pop,
+                    post_populations=['gc', 'mc', 'pv', 'sst'],
+                    save_path=str(weights_stats_dir / f'{target_pop}_statistical_tests.pdf')
+                )
+                plt.close(fig)
+
+                # Save analysis results
+                with open(weights_stats_dir / f'{target_pop}_statistical_analysis.pkl', 'wb') as f:
+                    pickle.dump(response_analysis, f)
+        
+        # Nested experiment results plotting
+        nested_results = None
+
+        if args.load_nested_results:
+            print(f"\nLoading nested experiment results from: {args.load_nested_results}")
+            with open(args.load_nested_results, 'rb') as f:
+                nested_results = pickle.load(f)
+
+        if nested_results is not None:
+
+            metadata = None
+            intensities = None
+            
+            if 'metadata' in nested_results:
+                metadata = nested_results['metadata']
+                if 'intensities' in metadata:
+                    intensities = sorted(nested_results['metadata']['intensities'])
+
+            if args.plot_variance_decomposition:
+                print("\nPlotting variance decomposition...")
+                plot_variance_decomposition(
+                    nested_results['variance_analysis'],
+                    nested_results['regime_classification'],
+                    save_path=str(output_path / "variance_decomposition.pdf")
+                )
+
+            if args.plot_connectivity_variance:
+                print("\nPlotting connectivity instance variance...")
+                intensities = None
+                if 'metadata' in nested_results and 'intensities' in nested_results['metadata']:
+                    intensities = sorted(nested_results['metadata']['intensities'])
+                intensity = intensities[-1]
+
+                plot_connectivity_instance_variance(
+                    nested_results['aggregated_results'],
+                    intensity=intensity,
+                    save_path=str(output_path / "connectivity_instance_variance.pdf")
+                )
+
+            if args.plot_connectivity_variance_details:
+                print("\nPlotting detailed connectivity instance variance...")
+
+                intensity = intensities[-1]
+                
+                plot_connectivity_instance_variance_detailed(
+                    nested_results,
+                    intensity=intensity,
+                    warmup=metadata.get('warmup', 500.0),
+                    stim_start=metadata.get('stim_start', 1500.0),
+                    stim_duration=metadata.get('stim_duration', 1000.0),
+                    save_path=str(output_path / "connectivity_instance_variance_detailed.pdf")
+                )
+
+
+            # Print regime classification summary
+            print_nested_experiment_summary(nested_results)
+                    
         sys.exit(0)
-    
+
     print("\n" + "="*80)
     print("Executing all experiments")
     print("="*80)
@@ -5580,6 +5846,62 @@ Examples:
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
         print(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
+        
+    if args.nested_experiment:
+
+        # Configure nested experiment
+        nested_config = NestedExperimentConfig(
+            n_connectivity_instances=args.n_connectivity,
+            n_mec_patterns_per_connectivity=args.n_mec_patterns,
+            base_seed=args.base_seed,
+            save_nested_trials=True,
+            save_full_activity=args.save_full_activity
+        )
+
+        # Run nested experiment
+        nested_results = run_nested_comparative_experiment(
+            optimization_json_file=args.optimization_file,
+            intensities=[1.0, 1.5],
+            mec_current=args.mec_current,
+            opsin_current=args.opsin_current,
+            stim_start=args.stim_start,
+            stim_duration=args.stim_duration,
+            warmup=500.0,
+            device=device,
+            nested_config=nested_config,
+            save_results_file=str(output_path / 'nested_experiment_results.pkl'),
+            # Pass through MEC pattern parameters
+            use_time_varying_mec=args.time_varying_mec,
+            mec_pattern_type=args.mec_pattern_type,
+            mec_theta_freq=args.mec_theta_freq,
+            mec_theta_amplitude=args.mec_theta_amplitude,
+            mec_gamma_freq=args.mec_gamma_freq,
+            mec_gamma_amplitude=args.mec_gamma_amplitude,
+            mec_gamma_coupling_strength=args.mec_gamma_coupling,
+            mec_gamma_preferred_phase=args.mec_gamma_phase,
+            mec_rotation_groups=args.mec_rotation_groups,
+            # Adaptive stepping
+            adaptive_config=adaptive_config if args.adaptive_step else None
+        )
+
+        # Generate variance decomposition plots
+        if args.plot_variance_decomposition:
+            print("\nGenerating variance decomposition plots...")
+            plot_variance_decomposition(
+                nested_results['variance_analysis'],
+                nested_results['regime_classification'],
+                save_path=str(output_path / 'variance_decomposition.pdf')
+            )
+
+        # Save summary to memory bank
+        if nested_results is not None:
+            save_nested_experiment_summary(
+                nested_results,
+                output_dir=output_path
+            )
+            
+        sys.exit(0)
+        
     
     print(f"Number of trials: {args.n_trials}")
     print(f"Base seed: {args.base_seed}")
@@ -5722,7 +6044,192 @@ Examples:
 
             plotted_synaptic_weights = True
             print(f"\nAll synaptic weight plots saved to: {weights_base_dir}")
+
+
+    # Visualization-based analysis of weights
+    if args.plot_weights_by_response and not args.plot_only:
+        print("\n" + "#"*80)
+        print("# Synaptic Weight Distribution by Response Type")
+        print("#"*80)
+
+        # Create output directory
+        weights_viz_output = output_path / "weights_by_response_viz"
+        weights_viz_output.mkdir(exist_ok=True)
+
+        for target_pop in ['pv', 'sst']:
+            if target_pop not in results:
+                continue
+
+            intensities = sorted(results[target_pop].keys())
+            if len(intensities) == 0:
+                continue
+
+            intensity = intensities[-1]
+            experiment_data = results[target_pop][intensity]
+
+            print(f"\n{'='*60}")
+            print(f"Visualizing {target_pop.upper()} stimulation at intensity {intensity}")
+            print('='*60)
+
+            # Get opsin expression for this target
+            opsin_expression_array = experiment_data['opsin_expression_mean']
+            if hasattr(opsin_expression_array, 'cpu'):
+                opsin_expression_array = opsin_expression_array.cpu().numpy()
+            else:
+                opsin_expression_array = np.array(opsin_expression_array)
+
+            opsin_expression_dict = {target_pop: opsin_expression_array}
+
+            # Create subdirectory
+            target_viz_dir = weights_viz_output / f'{target_pop}_stimulation'
+
+            # Run visualization analysis
+            viz_analyses, viz_figs = analyze_and_plot_weights_by_response(
+                circuit=experiment.circuit,
+                target_population=target_pop,
+                experiment_results=experiment_data,
+                stim_start=args.stim_start,
+                stim_duration=args.stim_duration,
+                warmup=500.0,
+                post_populations=['gc', 'mc', 'pv', 'sst'],
+                save_path=str(target_viz_dir)
+            )
+
+            # Close figures
+            for fig in viz_figs:
+                plt.close(fig)
+
+    # Statistical testing with bootstrap
+    if args.test_weights_by_response and not args.plot_only:
+        print("\n" + "#"*80)
+        print("# Statistical Testing: Weights by Response")
+        print("#"*80)
+
+        # Create output directory
+        weights_stats_output = output_path / "weights_statistical_tests"
+        weights_stats_output.mkdir(exist_ok=True)
+
+        # Analyze for each target population
+        all_statistical_analyses = {}
+
+        for target_pop in ['pv', 'sst']:
+            print(f"\n{'='*60}")
+            print(f"Statistical testing for {target_pop.upper()} stimulation")
+            print('='*60)
+
+            # Use highest intensity
+            intensities = sorted(results[target_pop].keys())
+            if len(intensities) == 0:
+                continue
+
+            intensity = intensities[-1]
+
+            # Run statistical analysis
+            response_analysis = analyze_weights_by_average_response(
+                comparative_results=results,
+                circuit=experiment.circuit,
+                target_population=target_pop,
+                intensity=intensity,
+                baseline_start=500.0,
+                stim_start=args.stim_start,
+                stim_duration=args.stim_duration,
+                post_populations=['gc', 'mc', 'pv', 'sst'],
+                threshold_std=args.response_threshold_std,
+                n_permutations=10000,
+                n_bootstrap=args.n_bootstrap,
+                confidence_level=0.95
+            )
+
+            all_statistical_analyses[target_pop] = response_analysis
+
+            # Generate plots
+            print(f"\nGenerating statistical plots for {target_pop.upper()}...")
+            fig = plot_weights_by_average_response(
+                response_analysis,
+                target_population=target_pop,
+                post_populations=['gc', 'mc', 'pv', 'sst'],
+                save_path=str(weights_stats_output / f'{target_pop}_statistical_tests.pdf')
+            )
+            plt.close(fig)
+
+            # Print mechanistic interpretation
+            print(f"\n{'='*60}")
+            print(f"Mechanistic Interpretation for {target_pop.upper()} Stimulation:")
+            print('='*60)
+
+            for post_pop in ['gc', 'mc', 'pv', 'sst']:
+                if post_pop == target_pop:
+                    continue
+
+                if post_pop not in response_analysis:
+                    continue
+
+                stats = response_analysis[post_pop]['statistics']
+
+                print(f"\n{post_pop.upper()} cells:")
+
+                # Check direct inhibition from target
+                if target_pop in stats and not np.isnan(stats[target_pop]['mann_whitney_p']):
+                    target_stats = stats[target_pop]
+                    if target_stats['bonferroni_significant']:
+                        if target_stats['cohens_d'] < 0:
+                            print(f"  Excited cells receive LESS direct inhibition from {target_pop.upper()}")
+                            print(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
+                                  f"[{target_stats['cohens_d_ci_lower']:.3f}, {target_stats['cohens_d_ci_upper']:.3f}]")
+                            print(f"    Δ = {target_stats['mean_diff']:.3f} nS "
+                                  f"[{target_stats['mean_diff_ci_lower']:.3f}, {target_stats['mean_diff_ci_upper']:.3f}]")
+                        else:
+                            print(f"  Excited cells receive MORE direct inhibition from {target_pop.upper()}")
+                            print(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
+                                  f"[{target_stats['cohens_d_ci_lower']:.3f}, {target_stats['cohens_d_ci_upper']:.3f}]")
+
+                # Check other significant sources
+                other_sources = [s for s in stats.keys() if s != target_pop]
+                significant_sources = [s for s in other_sources 
+                                      if not np.isnan(stats[s]['mann_whitney_p']) 
+                                      and stats[s]['bonferroni_significant']]
+
+                if significant_sources:
+                    print(f"  Other significant differences:")
+                    for source in significant_sources:
+                        s = stats[source]
+                        direction = "MORE" if s['cohens_d'] > 0 else "LESS"
+                        print(f"    {source.upper()}: {direction} input")
+                        print(f"      d = {s['cohens_d']:.3f} [{s['cohens_d_ci_lower']:.3f}, {s['cohens_d_ci_upper']:.3f}], "
+                              f"Δ = {s['mean_diff']:.3f} nS")
+
+        # Save all statistical analyses
+        stats_file = weights_stats_output / "statistical_analysis_results.pkl"
+        with open(stats_file, 'wb') as f:
+            pickle.dump(all_statistical_analyses, f)
+        print(f"\nStatistical analysis results saved to: {stats_file}")
+
+        # Generate cross-population summary
+        print(f"\n{'='*60}")
+        print("Cross-Population Summary: Direct Inhibition Effects")
+        print('='*60)
+        print(f"\n{'Target':<8} {'Post':<6} {'Cohen d':<25} {'Mean Diff (nS)':<25} {'Sig':<5}")
+        print(f"{'-'*8} {'-'*6} {'-'*25} {'-'*25} {'-'*5}")
+
+        for target_pop in ['pv', 'sst']:
+            if target_pop not in all_statistical_analyses:
+                continue
+
+            for post_pop in ['gc', 'mc']:
+                if post_pop not in all_statistical_analyses[target_pop]:
+                    continue
+
+                stats = all_statistical_analyses[target_pop][post_pop]['statistics']
+
+                if target_pop in stats and not np.isnan(stats[target_pop]['cohens_d']):
+                    s = stats[target_pop]
+                    d_str = f"{s['cohens_d']:>6.3f} [{s['cohens_d_ci_lower']:>6.3f}, {s['cohens_d_ci_upper']:>6.3f}]"
+                    diff_str = f"{s['mean_diff']:>6.3f} [{s['mean_diff_ci_lower']:>6.3f}, {s['mean_diff_ci_upper']:>6.3f}]"
+                    sig = '***' if s['bonferroni_significant'] else ('*' if s['significant'] else 'n.s.')
+
+                    print(f"{target_pop.upper():<8} {post_pop.upper():<6} {d_str:<25} {diff_str:<25} {sig:<5}")
         
+            
     # Run ablation tests
     print("\n" + "#"*80)
     print("# Ablation Tests")
