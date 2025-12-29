@@ -732,9 +732,13 @@ def _decompose_population_variance(
     
     return result
 
-def _hierarchical_variance_decomposition(grouped_data: List[List[float]]) -> Dict:
+def _hierarchical_variance_decomposition(grouped_data: List[List[float]],
+                                         permutation_random_seed=47) -> Dict:
     """
-    Compute hierarchical variance decomposition
+    Compute hierarchical variance decomposition with robust statistical testing.
+    
+    Uses permutation test as primary method (better for small samples and discrete data),
+    with fallback to F-test and explicit handling of edge cases.
     
     Args:
         grouped_data: List of lists, where each inner list is data from one group
@@ -753,32 +757,86 @@ def _hierarchical_variance_decomposition(grouped_data: List[List[float]]) -> Dic
     all_data = [val for group in grouped_data for val in group]
     grand_mean = np.mean(all_data)
     
-    # Group means
+    # Group means and sizes
     group_means = [np.mean(group) for group in grouped_data]
     group_sizes = [len(group) for group in grouped_data]
     
     # Total variance
-    total_var = np.var(all_data, ddof=1)
+    total_var = np.var(all_data, ddof=1) if len(all_data) > 1 else 0.0
     
-    # Between-group variance (variance of group means, weighted by group size)
+    # Between-group variance
     n_total = sum(group_sizes)
-    between_group_var = sum(
-        n * (mean - grand_mean)**2 
-        for n, mean in zip(group_sizes, group_means)
-    ) / (len(group_means) - 1) if len(group_means) > 1 else 0.0
+    if len(group_means) > 1:
+        between_group_var = sum(
+            n * (mean - grand_mean)**2 
+            for n, mean in zip(group_sizes, group_means)
+        ) / (len(group_means) - 1)
+    else:
+        between_group_var = 0.0
     
-    # Within-group variance (mean of group variances)
+    # Within-group variance
     within_group_var = np.mean([
         np.var(group, ddof=1) if len(group) > 1 else 0.0
         for group in grouped_data
     ])
     
-    # ANOVA F-test
-    if len(grouped_data) > 1 and within_group_var > 0:
-        f_statistic, p_value = stats.f_oneway(*grouped_data)
-    else:
+    # Statistical test
+    if len(grouped_data) <= 1:
+        # Only one group - no test possible
         f_statistic = np.nan
         p_value = np.nan
+        test_method = 'insufficient_groups'
+        
+    elif within_group_var < 1e-10:
+        # Zero or near-zero within-group variance - handle explicitly
+        group_means_array = np.array(group_means)
+        unique_means = np.unique(group_means_array)
+        
+        if len(unique_means) > 1:
+            # Means differ but no within-group variance
+            # This indicates deterministic separation by group
+            f_statistic = np.inf
+            p_value = 0.0
+            test_method = 'deterministic_separation'
+        else:
+            # All values identical everywhere
+            f_statistic = 0.0
+            p_value = 1.0
+            test_method = 'no_variation'
+    
+    else:
+        # Normal case: use permutation test (primary method)
+        try:
+            def test_statistic(*groups):
+                """F-statistic equivalent: variance of group means"""
+                means = [np.mean(g) for g in groups]
+                return np.var(means, ddof=1)
+            
+            # Run permutation test
+            from scipy.stats import permutation_test
+            
+            result = permutation_test(
+                grouped_data,
+                test_statistic,
+                permutation_type='independent',
+                n_resamples=10000,
+                random_state=permutation_random_seed  # For reproducibility
+            )
+            
+            p_value = result.pvalue
+            f_statistic = test_statistic(*grouped_data)
+            test_method = 'permutation'
+            
+        except Exception as e:
+            # Fallback to parametric F-test
+            try:
+                f_statistic, p_value = stats.f_oneway(*grouped_data)
+                test_method = 'anova_fallback'
+            except Exception as e2:
+                # Ultimate fallback - should rarely happen
+                f_statistic = np.nan
+                p_value = np.nan
+                test_method = f'failed: {str(e2)[:50]}'
     
     return {
         'total_var': total_var,
@@ -787,8 +845,9 @@ def _hierarchical_variance_decomposition(grouped_data: List[List[float]]) -> Dic
         'f_statistic': f_statistic,
         'p_value': p_value,
         'n_groups': len(grouped_data),
-        'n_total': n_total
-    }
+        'n_total': n_total,
+        'test_method': test_method  # track which test was used
+    }    
 
 
 def classify_mechanism_regime(
@@ -811,6 +870,19 @@ def classify_mechanism_regime(
     P_VALUE_THRESHOLD = config.variance_significance_alpha
     
     classification = {}
+def classify_mechanism_regime(
+    variance_analysis: Dict,
+    config: NestedExperimentConfig
+) -> Dict:
+    """
+    Classify mechanism regime with robust handling of edge cases
+    """
+    # Classification thresholds
+    ICC_CONNECTIVITY_THRESHOLD = 0.5
+    ICC_INPUT_THRESHOLD = 0.2
+    P_VALUE_THRESHOLD = config.variance_significance_alpha
+    
+    classification = {}
     
     for target in variance_analysis.keys():
         classification[target] = {}
@@ -819,20 +891,33 @@ def classify_mechanism_regime(
             classification[target][intensity] = {}
             
             for pop, variance_data in pop_analysis.items():
-                excited_icc = variance_data['excited_fraction']['icc']
-                excited_p = variance_data['excited_fraction']['p_value']
-                change_icc = variance_data['mean_change']['icc']
+                excited_data = variance_data['excited_fraction']
+                excited_icc = excited_data['icc']
+                excited_p = excited_data['p_value']
+                test_method = excited_data.get('test_method', 'unknown')
                 
-                # Classify based on ICC and significance
+                # Classify based on test results
                 if np.isnan(excited_p) or np.isnan(excited_icc):
                     regime = 'insufficient_data'
-                elif excited_p > P_VALUE_THRESHOLD:
-                    # Not significant - no clear regime
+                    
+                elif test_method == 'deterministic_separation':
+                    # Perfect separation by connectivity - clearly connectivity-driven
+                    regime = 'connectivity_driven'
+                    
+                elif test_method == 'no_variation':
+                    # No variation at all
                     regime = 'no_significant_variance'
+                    
+                elif excited_p > P_VALUE_THRESHOLD:
+                    # Not statistically significant
+                    regime = 'no_significant_variance'
+                    
                 elif excited_icc > ICC_CONNECTIVITY_THRESHOLD:
                     regime = 'connectivity_driven'
+                    
                 elif excited_icc < ICC_INPUT_THRESHOLD:
                     regime = 'input_driven'
+                    
                 else:
                     regime = 'mixed'
                 
@@ -840,40 +925,48 @@ def classify_mechanism_regime(
                     'regime': regime,
                     'excited_icc': excited_icc,
                     'excited_p_value': excited_p,
-                    'change_icc': change_icc,
-                    'interpretation': _get_regime_interpretation(regime, excited_icc)
+                    'test_method': test_method, 
+                    'interpretation': _get_regime_interpretation(regime, excited_icc, test_method)
                 }
     
     return classification
 
 
-def _get_regime_interpretation(regime: str, icc: float) -> str:
-    """Generate interpretation text for regime classification"""
+def _get_regime_interpretation(regime: str, icc: float, test_method: str = '') -> str:
+    """Generate interpretation text with test method context"""
+    
+    method_note = ""
+    if test_method == 'deterministic_separation':
+        method_note = " (deterministic: zero within-group variance)"
+    elif test_method == 'permutation':
+        method_note = " (permutation test)"
+    elif test_method == 'anova_fallback':
+        method_note = " (ANOVA F-test)"
+    
     interpretations = {
         'connectivity_driven': (
             f"High ICC ({icc:.3f}) indicates paradoxical excitation is primarily "
             "determined by specific synaptic weight patterns. Different circuit "
-            "instantiations show distinct response profiles."
+            f"instantiations show distinct response profiles{method_note}."
         ),
         'input_driven': (
             f"Low ICC ({icc:.3f}) indicates paradoxical excitation is primarily "
             "determined by population-level dynamics. The same connectivity can "
-            "produce different responses depending on input patterns."
+            f"produce different responses depending on input patterns{method_note}."
         ),
         'mixed': (
             f"Moderate ICC ({icc:.3f}) indicates both connectivity patterns and "
-            "population dynamics contribute to paradoxical excitation."
+            f"population dynamics contribute to paradoxical excitation{method_note}."
         ),
         'no_significant_variance': (
             "No significant variance between connectivity instances. "
-            "Effect may be too small or sample size insufficient."
+            f"Effect may be too small or sample size insufficient{method_note}."
         ),
         'insufficient_data': (
             "Insufficient data for regime classification."
         )
     }
     return interpretations.get(regime, "Unknown regime")
-
 
 # ============================================================================
 # Saving and Loading
