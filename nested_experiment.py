@@ -23,6 +23,13 @@ from pathlib import Path
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import logging
+
+logger = logging.getLogger('nested_experiment')
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+logger.addHandler(ch)
 
 
 @dataclass
@@ -137,14 +144,14 @@ def run_nested_comparative_experiment(
     if nested_config is None:
         nested_config = NestedExperimentConfig()
     
-    print("\n" + "="*80)
-    print("Nested comparative experiment")
-    print("="*80)
-    print(f"Structure:")
-    print(f"  Connectivity instances: {nested_config.n_connectivity_instances}")
-    print(f"  MEC patterns per connectivity: {nested_config.n_mec_patterns_per_connectivity}")
-    print(f"  Total trials per condition: {nested_config.n_connectivity_instances * nested_config.n_mec_patterns_per_connectivity}")
-    print("="*80 + "\n")
+    logger.info("\n" + "="*80)
+    logger.info("Nested comparative experiment")
+    logger.info("="*80)
+    logger.info(f"Structure:")
+    logger.info(f"  Connectivity instances: {nested_config.n_connectivity_instances}")
+    logger.info(f"  MEC patterns per connectivity: {nested_config.n_mec_patterns_per_connectivity}")
+    logger.info(f"  Total trials per condition: {nested_config.n_connectivity_instances * nested_config.n_mec_patterns_per_connectivity}")
+    logger.info("="*80 + "\n")
     
     # Generate seeds
     seed_structure = generate_nested_seeds(nested_config)
@@ -162,19 +169,19 @@ def run_nested_comparative_experiment(
     
     # Main nested loop
     for target in ['pv', 'sst']:
-        print(f"\n{'='*60}")
-        print(f"Testing {target.upper()} stimulation")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
         
         for intensity in intensities:
-            print(f"\nIntensity: {intensity}")
-            print(f"{'-'*60}")
+            logger.info(f"\nIntensity: {intensity}")
+            logger.info(f"{'-'*60}")
             
             for conn_idx in range(nested_config.n_connectivity_instances):
                 connectivity_seed = seed_structure['connectivity_seeds'][conn_idx]
                 
-                print(f"\n  Connectivity instance {conn_idx + 1}/{nested_config.n_connectivity_instances}")
-                print(f"    Seed: {connectivity_seed}")
+                logger.info(f"\n  Connectivity instance {conn_idx + 1}/{nested_config.n_connectivity_instances}")
+                logger.info(f"    Seed: {connectivity_seed}")
                 
                 # Create experiment with this connectivity
                 experiment = OptogeneticExperiment(
@@ -191,7 +198,7 @@ def run_nested_comparative_experiment(
                 for mec_idx in range(nested_config.n_mec_patterns_per_connectivity):
                     mec_seed = seed_structure['mec_pattern_seeds'][conn_idx][mec_idx]
                     
-                    print(f"    MEC pattern {mec_idx + 1}/{nested_config.n_mec_patterns_per_connectivity} (seed: {mec_seed})")
+                    logger.info(f"    MEC pattern {mec_idx + 1}/{nested_config.n_mec_patterns_per_connectivity} (seed: {mec_seed})")
                     
                     # Set seed for MEC pattern generation
                     set_random_seed(mec_seed, device)
@@ -240,9 +247,9 @@ def run_nested_comparative_experiment(
                     torch.cuda.empty_cache()
     
     # Aggregate results
-    print("\n" + "="*80)
-    print("Aggregating nested results")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("Aggregating nested results")
+    logger.info("="*80)
     
     aggregated_results = aggregate_nested_results(
         nested_results,
@@ -1009,8 +1016,8 @@ def save_nested_experiment_results(results: Dict, filepath: str):
     with open(filepath, 'wb') as f:
         pickle.dump(results_converted, f, protocol=pickle.HIGHEST_PROTOCOL)
     
-    print(f"\nNested experiment results saved to: {filepath}")
-    print(f"  File size: {filepath.stat().st_size / 1024 / 1024:.2f} MB")
+    logger.info(f"\nNested experiment results saved to: {filepath}")
+    logger.info(f"  File size: {filepath.stat().st_size / 1024 / 1024:.2f} MB")
 
 
 def print_nested_experiment_summary(results: Dict):
@@ -1019,21 +1026,21 @@ def print_nested_experiment_summary(results: Dict):
     variance_analysis = results['variance_analysis']
     regime_classification = results['regime_classification']
     
-    print("\n" + "="*80)
-    print("Nested experiment summary")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("Nested experiment summary")
+    logger.info("="*80)
     
-    print(f"\nExperimental Design:")
-    print(f"  Connectivity instances: {config.n_connectivity_instances}")
-    print(f"  MEC patterns per connectivity: {config.n_mec_patterns_per_connectivity}")
-    print(f"  Total trials per condition: {config.n_connectivity_instances * config.n_mec_patterns_per_connectivity}")
+    logger.info(f"\nExperimental Design:")
+    logger.info(f"  Connectivity instances: {config.n_connectivity_instances}")
+    logger.info(f"  MEC patterns per connectivity: {config.n_mec_patterns_per_connectivity}")
+    logger.info(f"  Total trials per condition: {config.n_connectivity_instances * config.n_mec_patterns_per_connectivity}")
     
     for target in ['pv', 'sst']:
-        print(f"\n{target.upper()} Stimulation:")
-        print("-"*60)
+        logger.info(f"\n{target.upper()} Stimulation:")
+        logger.info("-"*60)
         
         for intensity in sorted(variance_analysis[target].keys()):
-            print(f"\n  Intensity {intensity}:")
+            logger.info(f"\n  Intensity {intensity}:")
             
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 var_data = variance_analysis[target][intensity][pop]
@@ -1042,13 +1049,13 @@ def print_nested_experiment_summary(results: Dict):
                 excited_icc = var_data['excited_fraction']['icc']
                 excited_p = var_data['excited_fraction']['p_value']
                 
-                print(f"\n    {pop.upper()}:")
-                print(f"      ICC (excited fraction): {excited_icc:.3f}")
-                print(f"      ANOVA p-value: {excited_p:.4f}")
-                print(f"      Regime: {regime_data['regime']}")
-                print(f"      {regime_data['interpretation']}")
+                logger.info(f"\n    {pop.upper()}:")
+                logger.info(f"      ICC (excited fraction): {excited_icc:.3f}")
+                logger.info(f"      ANOVA p-value: {excited_p:.4f}")
+                logger.info(f"      Regime: {regime_data['regime']}")
+                logger.info(f"      {regime_data['interpretation']}")
     
-    print("\n" + "="*80)
+    logger.info("\n" + "="*80)
 
 
 def save_nested_experiment_summary(results: Dict, output_dir: str):
@@ -1118,7 +1125,7 @@ def save_nested_experiment_summary(results: Dict, output_dir: str):
     with open(summary_file, 'w') as f:
         f.write(content)
     
-    print(f"\nSaved nested experiment summary to: {summary_file}")
+    logger.info(f"\nSaved nested experiment summary to: {summary_file}")
 
 
 def plot_variance_decomposition(variance_analysis: Dict,
@@ -1276,7 +1283,7 @@ def plot_variance_decomposition(variance_analysis: Dict,
     
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved variance decomposition plot to: {save_path}")
+        logger.info(f"Saved variance decomposition plot to: {save_path}")
     
     plt.show()
     return fig    
@@ -1443,7 +1450,7 @@ def plot_connectivity_instance_variance(
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved connectivity variance plot to: {save_path}")
+        logger.info(f"Saved connectivity variance plot to: {save_path}")
     
     return fig    
 
@@ -1647,6 +1654,6 @@ def plot_connectivity_instance_variance_detailed(
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved detailed connectivity variance plot to: {save_path}")
+        logger.info(f"Saved detailed connectivity variance plot to: {save_path}")
     
     return fig

@@ -2673,7 +2673,8 @@ class DGCircuitVisualization:
             for i, data in enumerate(plot_data):
                 if len(data) > 0:
                     mean = np.mean(data)
-                    stats_text.append(f'{labels[i].replace("$", "").replace("\\rightarrow", "->")}: {mean:.2f} nS')
+                    text = labels[i].replace("$", "").replace("\\rightarrow", "->")
+                    stats_text.append(f'{text}: {mean:.2f} nS')
 
             if stats_text:
                 ax.text(0.98, 0.98, '\n'.join(stats_text),
