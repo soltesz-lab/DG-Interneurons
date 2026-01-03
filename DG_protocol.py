@@ -1283,8 +1283,6 @@ class OptogeneticExperiment:
         
         target_positions = self.circuit.layout.positions[target_population]
 
-        logger.info(f"opsin_expression {target_population}: {opsin.expression_levels}")
-
         # Calculate direct optogenetic activation
         opsin = self.opsin_expression[target_population]
         activation_prob = opsin.calculate_activation(target_positions, light_intensity)
@@ -4711,13 +4709,13 @@ def plot_combined_ablation_and_expression(
             # Color interneuron titles differently
             if pop.endswith('_nonexpr'):
                 base_pop = pop.replace('_nonexpr', '')
-                ax.set_title(f'{target.upper()}→{target.upper()}†', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{target.upper()}†', fontsize=10, 
                            fontweight='bold', color='purple')
             elif pop in ['pv', 'sst']:
-                ax.set_title(f'{target.upper()}→{pop.upper()}*', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}*', fontsize=10, 
                            fontweight='bold', color='darkred')
             else:
-                ax.set_title(f'{target.upper()}→{pop.upper()}', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}', fontsize=10, 
                            fontweight='bold')
             
             ax.grid(True, alpha=0.3, axis='y')
@@ -4783,13 +4781,13 @@ def plot_combined_ablation_and_expression(
             # Color interneuron titles differently
             if pop.endswith('_nonexpr'):
                 base_pop = pop.replace('_nonexpr', '')
-                ax.set_title(f'{target.upper()}→{target.upper()}†', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{target.upper()}†', fontsize=10, 
                            fontweight='bold', color='purple')
             elif pop in ['pv', 'sst']:
-                ax.set_title(f'{target.upper()}→{pop.upper()}*', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}*', fontsize=10, 
                            fontweight='bold', color='darkred')
             else:
-                ax.set_title(f'{target.upper()}→{pop.upper()}', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}', fontsize=10, 
                            fontweight='bold')
             
             ax.grid(True, alpha=0.3)
@@ -5001,22 +4999,22 @@ def print_current_analysis(current_analysis):
         stim = current_analysis['stimulation'][pop]['by_type']
         change = current_analysis['change'][pop]['by_type']
         
-        logger.info(f"  Excitatory: {baseline['total_exc']['mean']:>7.2f} → "
+        logger.info(f"  Excitatory: {baseline['total_exc']['mean']:>7.2f} -> "
               f"{stim['total_exc']['mean']:>7.2f} pA "
               f"(Δ = {change['total_exc']['mean']:>+7.2f} pA)")
         
-        logger.info(f"  Inhibitory: {baseline['total_inh']['mean']:>7.2f} → "
+        logger.info(f"  Inhibitory: {baseline['total_inh']['mean']:>7.2f} -> "
               f"{stim['total_inh']['mean']:>7.2f} pA "
               f"(Δ = {change['total_inh']['mean']:>+7.2f} pA)")
         
-        logger.info(f"  Net:        {baseline['net']['mean']:>7.2f} → "
+        logger.info(f"  Net:        {baseline['net']['mean']:>7.2f} -> "
               f"{stim['net']['mean']:>7.2f} pA "
               f"(Δ = {change['net']['mean']:>+7.2f} pA)")
         
         # E/I ratio
         baseline_ei = abs(baseline['total_exc']['mean']) / (abs(baseline['total_inh']['mean']) + 1e-6)
         stim_ei = abs(stim['total_exc']['mean']) / (abs(stim['total_inh']['mean']) + 1e-6)
-        logger.info(f"  E/I Ratio:  {baseline_ei:>7.3f} → {stim_ei:>7.3f}")
+        logger.info(f"  E/I Ratio:  {baseline_ei:>7.3f} -> {stim_ei:>7.3f}")
     
 
 def reconstruct_circuit_from_metadata(metadata: Dict,
@@ -5510,7 +5508,6 @@ def run_nested_effect_size_analysis(
     print("\n" + "="*80)
     print("Bootstrap Effect Size Analysis: Nested Experiment Data")
     print("="*80)
-    print(f"Loading results from: {nested_results_file}")
     
     # Load nested experiment results
     nested_results = nested_data['nested_results']
@@ -5597,7 +5594,7 @@ def run_nested_effect_size_analysis(
             
             # Analyze each post-synaptic population
             for post_pop in post_populations:
-                print(f"\n    Analyzing {target.upper()} → {post_pop.upper()}")
+                print(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
                 
                 # Run bootstrap analysis
                 analysis_results = analyze_effect_size_all_sources_nested(

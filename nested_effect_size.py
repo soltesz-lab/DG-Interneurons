@@ -66,6 +66,10 @@ def average_activity_across_trials(
             activity = trial.results['activity_trace'][population]
         else:
             raise KeyError(f"Trial results missing both 'activity_trace' and 'activity_trace_mean'")
+
+        # Convert to tensor if needed (handles loaded NumPy arrays)
+        if isinstance(activity, np.ndarray):
+            activity = torch.from_numpy(activity)
         
         activities.append(activity)
     
@@ -633,6 +637,21 @@ def plot_bootstrap_distributions(
     results = analysis_results[source_population]['bootstrap_results']
     weight_diffs = analysis_results[source_population]['weight_differences']
     
+    # Check if bootstrap distribution exists (may be missing if insufficient data)
+    if 'bootstrap_distribution' not in results or results['bootstrap_distribution'] is None:
+        print(f"Warning: No bootstrap distribution available for {source_population}")
+        # Create simple figure showing the issue
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+        ax.text(0.5, 0.5, f'Insufficient data for bootstrap analysis\n'
+                          f'{source_population.upper()} -> {post_population.upper()}\n'
+                          f'N connectivity instances: {results.get("n_connectivity", 0)}',
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        return fig
+    
     fig, axes = plt.subplots(2, 1, figsize=(10, 8))
     
     # Panel 1: Connectivity-level weight differences
@@ -696,7 +715,6 @@ def plot_bootstrap_distributions(
     
     return fig
 
-
 def plot_weight_distributions_by_response(
     analysis_results: Dict,
     source_population: str,
@@ -719,6 +737,28 @@ def plot_weight_distributions_by_response(
     Returns:
         Figure object
     """
+def plot_weight_distributions_by_response(
+    analysis_results: Dict,
+    source_population: str,
+    connectivity_idx: int,
+    target_population: str,
+    post_population: str,
+    save_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Plot weight distributions for excited vs suppressed cells (single connectivity)
+    
+    Args:
+        analysis_results: Output from analyze_all_sources_nested()
+        source_population: Source population to plot
+        connectivity_idx: Which connectivity instance to plot
+        target_population: Stimulated population (for title)
+        post_population: Post-synaptic population (for title)
+        save_path: Optional path to save figure
+        
+    Returns:
+        Figure object
+    """
     weights_by_conn = analysis_results[source_population]['weights_by_connectivity']
     
     if connectivity_idx not in weights_by_conn:
@@ -728,12 +768,37 @@ def plot_weight_distributions_by_response(
     weights_excited = weights_data['weights_excited']
     weights_suppressed = weights_data['weights_suppressed']
     
+    # Check for empty arrays
+    if len(weights_excited) == 0 and len(weights_suppressed) == 0:
+        raise ValueError(f"No weights found for connectivity {connectivity_idx}")
+    
+    if len(weights_excited) == 0 or len(weights_suppressed) == 0:
+        # Handle case where one group is empty
+        fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+        ax.text(0.5, 0.5, 
+                f'Insufficient data: {"Excited" if len(weights_excited)==0 else "Suppressed"} '
+                f'cells have no synaptic weights\n'
+                f'Connectivity {connectivity_idx}\n'
+                f'{source_population.upper()} → {post_population.upper()}',
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        return fig
+    
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
     # Panel 1: Histograms
     ax1 = axes[0]
     
-    bins = np.linspace(0, max(np.max(weights_excited), np.max(weights_suppressed)), 30)
+    max_weight = max(np.max(weights_excited) if len(weights_excited) > 0 else 0, 
+                     np.max(weights_suppressed) if len(weights_suppressed) > 0 else 0)
+    
+    if max_weight > 0:
+        bins = np.linspace(0, max_weight, 30)
+    else:
+        bins = 30
     
     ax1.hist(weights_excited, bins=bins, alpha=0.6, color='red', 
              label=f'Excited (n={len(weights_excited)})', edgecolor='black')
@@ -770,7 +835,7 @@ def plot_weight_distributions_by_response(
                   fontsize=12, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='y')
     
-    plt.suptitle(f'{target_population.upper()} -> {post_population.upper()}\n'
+    plt.suptitle(f'{target_population.upper()} → {post_population.upper()}\n'
                  f'{source_population.upper()} inputs',
                  fontsize=14, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -780,8 +845,7 @@ def plot_weight_distributions_by_response(
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Saved weight distribution plot to: {save_path}")
     
-    return fig
-
+    return fig    
 
 # ============================================================================
 # Summary Statistics
