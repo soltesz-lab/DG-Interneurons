@@ -43,6 +43,13 @@ from nested_experiment import (
     plot_connectivity_instance_variance,
     plot_connectivity_instance_variance_detailed,
 )
+from nested_effect_size import (
+    analyze_effect_size_all_sources_nested,
+    plot_effect_sizes_forest,
+    plot_bootstrap_distributions,
+    plot_weight_distributions_by_response,
+    print_nested_effect_size_analysis_summary
+)
 from DG_visualization import (
     DGCircuitVisualization
 )
@@ -5464,6 +5471,230 @@ def analyze_synaptic_weights_by_response_from_results(results: Dict,
         
     return analyses_dict, figures_dict
 
+
+def run_nested_effect_size_analysis(
+    nested_data: Dict,
+    target_populations: List[str] = ['pv', 'sst'],
+    post_populations: List[str] = ['gc', 'mc', 'pv', 'sst'],
+    intensities: Optional[List[float]] = None,
+    source_populations: List[str] = ['pv', 'sst', 'mc', 'mec'],
+    n_bootstrap: int = 10000,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    random_seed: Optional[int] = None,
+    output_dir: str = './effect_size_analysis',
+    device: Optional[torch.device] = None
+) -> Dict:
+    """
+    Run bootstrap effect size analysis from saved nested experiment results
+    
+    Args:
+        nested_results: nested experiment results
+        target_populations: Populations that were stimulated
+        post_populations: Post-synaptic populations to analyze
+        intensities: Light intensities to analyze (None = all available)
+        source_populations: Source populations to analyze for weights
+        n_bootstrap: Number of bootstrap samples
+        threshold_std: Classification threshold (std deviations)
+        expression_threshold: Opsin expression threshold for non-expressing cells
+        random_seed: Random seed for reproducibility
+        output_dir: Directory to save results and plots
+        device: Device for circuit creation
+        
+    Returns:
+        Dict with analysis results for each target/intensity/post combination
+    """
+    if device is None:
+        device = get_default_device()
+    
+    print("\n" + "="*80)
+    print("Bootstrap Effect Size Analysis: Nested Experiment Data")
+    print("="*80)
+    print(f"Loading results from: {nested_results_file}")
+    
+    # Load nested experiment results
+    nested_results = nested_data['nested_results']
+    metadata = nested_data['metadata']
+    seed_structure = nested_data['seed_structure']
+    
+    # Extract experiment parameters
+    stim_start = metadata['stim_start']
+    stim_duration = metadata['stim_duration']
+    warmup = metadata['warmup']
+    
+    # Determine intensities to analyze
+    if intensities is None:
+        intensities = metadata['intensities']
+    
+    print(f"\nExperiment parameters:")
+    print(f"  Stimulation: {stim_start} - {stim_start + stim_duration} ms")
+    print(f"  Baseline: {warmup} - {stim_start} ms")
+    print(f"  Intensities: {intensities}")
+    print(f"  Bootstrap samples: {n_bootstrap:,}")
+    
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Storage for all results
+    all_analyses = {}
+    
+    # Analyze each target population
+    for target in target_populations:
+        if target not in nested_results:
+            print(f"\nSkipping {target.upper()} - no results found")
+            continue
+        
+        all_analyses[target] = {}
+        
+        print(f"\n{'='*60}")
+        print(f"Analyzing {target.upper()} stimulation")
+        print('='*60)
+        
+        for intensity in intensities:
+            if intensity not in nested_results[target]:
+                continue
+            
+            all_analyses[target][intensity] = {}
+            
+            print(f"\n  Intensity: {intensity}")
+            
+            # Get trials for this condition
+            trials = nested_results[target][intensity]
+            
+            print(f"    Total trials: {len(trials)}")
+            print(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
+            
+            # Recreate circuit (use seed from first connectivity instance)
+            first_conn_seed = seed_structure['connectivity_seeds'][0]
+            
+            print(f"    Recreating circuit with seed: {first_conn_seed}")
+            
+            # Import necessary classes
+            from DG_circuit_dendritic_somatic_transfer import (
+                CircuitParams, PerConnectionSynapticParams, OpsinParams
+            )
+            
+            circuit_params = CircuitParams()
+            synaptic_params = PerConnectionSynapticParams()
+            opsin_params = OpsinParams()
+            
+            # Apply optimization if available
+            optimization_file = metadata.get('optimization_file')
+            if optimization_file:
+                print(f"    Applying optimization from: {optimization_file}")
+            
+            # Create circuit
+            set_random_seed(first_conn_seed, device)
+            experiment = OptogeneticExperiment(
+                circuit_params,
+                synaptic_params,
+                opsin_params,
+                optimization_json_file=optimization_file,
+                device=device,
+                base_seed=first_conn_seed
+            )
+            
+            # Analyze each post-synaptic population
+            for post_pop in post_populations:
+                print(f"\n    Analyzing {target.upper()} → {post_pop.upper()}")
+                
+                # Run bootstrap analysis
+                analysis_results = analyze_effect_size_all_sources_nested(
+                    nested_results=trials,
+                    circuit=experiment.circuit,
+                    target_population=target,
+                    post_population=post_pop,
+                    source_populations=source_populations,
+                    stim_start=stim_start,
+                    stim_duration=stim_duration,
+                    warmup=warmup,
+                    n_bootstrap=n_bootstrap,
+                    threshold_std=threshold_std,
+                    expression_threshold=expression_threshold,
+                    random_seed=random_seed
+                )
+                
+                if not analysis_results:
+                    print(f"      No valid results for {post_pop.upper()}")
+                    continue
+                
+                # Store results
+                all_analyses[target][intensity][post_pop] = analysis_results
+                
+                # Print summary
+                print_nested_effect_size_analysis_summary(
+                    analysis_results,
+                    target,
+                    post_pop
+                )
+                
+                # Create visualizations
+                vis_dir = output_path / f"{target}_intensity_{intensity}" / post_pop
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Forest plot
+                print(f"      Generating forest plot...")
+                fig_forest = plot_effect_sizes_forest(
+                    analysis_results,
+                    target,
+                    post_pop,
+                    save_path=str(vis_dir / 'effect_sizes_forest.pdf')
+                )
+                plt.close(fig_forest)
+                
+                # Bootstrap distributions for each source
+                for source_pop in analysis_results.keys():
+                    print(f"      Generating bootstrap plot for {source_pop.upper()}...")
+                    fig_bootstrap = plot_bootstrap_distributions(
+                        analysis_results,
+                        source_pop,
+                        target,
+                        post_pop,
+                        save_path=str(vis_dir / f'bootstrap_dist_{source_pop}.pdf')
+                    )
+                    plt.close(fig_bootstrap)
+                    
+                    # Weight distributions for first connectivity
+                    try:
+                        fig_weights = plot_weight_distributions_by_response(
+                            analysis_results,
+                            source_pop,
+                            connectivity_idx=0,
+                            target_population=target,
+                            post_population=post_pop,
+                            save_path=str(vis_dir / f'weight_distributions_{source_pop}_conn0.pdf')
+                        )
+                        plt.close(fig_weights)
+                    except Exception as e:
+                        print(f"        Warning: Could not plot weight distributions for {source_pop}: {e}")
+            
+            # Clean up circuit
+            del experiment
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+    
+    # Save complete analysis results
+    analysis_file = output_path / 'bootstrap_analysis_results.pkl'
+    with open(analysis_file, 'wb') as f:
+        pickle.dump({
+            'all_analyses': all_analyses,
+            'metadata': metadata,
+            'parameters': {
+                'n_bootstrap': n_bootstrap,
+                'threshold_std': threshold_std,
+                'expression_threshold': expression_threshold,
+                'random_seed': random_seed
+            }
+        }, f)
+    
+    print(f"\n{'='*80}")
+    print(f"Analysis complete. Results saved to: {output_path}")
+    print(f"  Summary file: {analysis_file}")
+    print('='*80)
+    
+    return all_analyses
+
 if __name__ == "__main__":
     logger.info("Dentate Gyrus Circuit with Anatomical Connectivity")
     logger.info("=========================================================")
@@ -5601,7 +5832,27 @@ Examples:
                               help='Plot connectivity variance')
     nested_group.add_argument('--plot-connectivity-variance-details', action='store_true',
                               help='Plot connectivity variance details')
+
+    # Bootstrap analysis options
+    bootstrap_group = parser.add_argument_group('Bootstrap Effect Size Analysis')
     
+    bootstrap_group.add_argument('--run-bootstrap-analysis', action='store_true',
+                                 help='Run bootstrap effect size analysis on nested experiment results')
+    bootstrap_group.add_argument('--bootstrap-n-samples', type=int, default=10000,
+                                 help='Number of bootstrap samples (default: 10000)')
+    bootstrap_group.add_argument('--bootstrap-threshold-std', type=float, default=1.0,
+                                 help='Classification threshold in std deviations (default: 1.0)')
+    bootstrap_group.add_argument('--bootstrap-expression-threshold', type=float, default=0.2,
+                                 help='Opsin expression threshold for non-expressing cells (default: 0.2)')
+    bootstrap_group.add_argument('--bootstrap-seed', type=int, default=None,
+                                 help='Random seed for bootstrap analysis')
+    bootstrap_group.add_argument('--bootstrap-output-dir', type=str, 
+                                 default='./bootstrap_analysis',
+                                 help='Output directory for bootstrap analysis results')
+    bootstrap_group.add_argument('--bootstrap-intensities', type=float, nargs='+',
+                                 default=None,
+                                 help='Intensities to analyze (default: all available)')
+
     
     args = parser.parse_args()
 
@@ -5618,7 +5869,7 @@ Examples:
     
     # =========================================================================
     # PLOT-ONLY MODE: Load and plot results
-    # =========================================================================
+    # =========================================================================oo
     
     if args.plot_only:
         
@@ -5831,7 +6082,36 @@ Examples:
 
             # Print regime classification summary
             print_nested_experiment_summary(nested_results)
-                    
+
+            if args.run_bootstrap_analysis:
+                if nested_results is None:
+                    parser.error("--run-bootstrap-analysis requires --load-nested-results")
+
+                print("\n" + "="*80)
+                print("Bootstrap Effect Size Analysis Mode")
+                print("="*80)
+    
+                # Determine device
+                if args.device is None:
+                    device = get_default_device()
+                else:
+                    device = torch.device(args.device)
+    
+                # Run analysis
+                bootstrap_results = run_nested_effect_size_analysis(
+                    nested_data=nested_results,
+                    target_populations=['pv', 'sst'],
+                    post_populations=['gc', 'mc', 'pv', 'sst'],
+                    intensities=args.bootstrap_intensities,
+                    source_populations=['pv', 'sst', 'mc', 'mec'],
+                    n_bootstrap=args.bootstrap_n_samples,
+                    threshold_std=args.bootstrap_threshold_std,
+                    expression_threshold=args.bootstrap_expression_threshold,
+                    random_seed=args.bootstrap_seed,
+                    output_dir=args.bootstrap_output_dir,
+                    device=device
+                )
+            
         sys.exit(0)
 
     logger.info("\n" + "="*80)
