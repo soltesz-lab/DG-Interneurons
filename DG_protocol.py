@@ -6521,7 +6521,45 @@ Examples:
                     output_dir=args.bootstrap_output_dir,
                     device=device
                 )
-            
+
+        if args.run_decision_analysis:
+            if nested_results is None:
+                parser.error("--run-decision-analysis requires --load-nested-results")
+
+            print("\n" + "="*80)
+            print("Effect Size Decision Analysis Mode")
+            print("="*80)
+
+            # Determine device
+            if args.device is None:
+                device = get_default_device()
+            else:
+                device = torch.device(args.device)
+
+            # Run decision analysis
+            decision_results = run_nested_effect_size_decision_analysis(
+                nested_data=nested_results,
+                target_populations=['pv', 'sst'],
+                post_populations=['gc', 'mc'],
+                intensities=args.bootstrap_intensities,  # Reuse bootstrap intensities arg
+                source_populations=['pv', 'sst', 'mc', 'mec'],
+                n_bootstrap=args.bootstrap_n_samples,
+                threshold_std=args.bootstrap_threshold_std,
+                expression_threshold=args.bootstrap_expression_threshold,
+                current_n=None,  # Auto-detect from nested results
+                target_power=args.decision_target_power,
+                max_feasible_n=args.decision_max_feasible_n,
+                min_meaningful_effect=args.decision_min_effect,
+                min_meaningful_diff_nS=args.decision_min_diff_nS,
+                random_seed=args.bootstrap_seed,
+                output_dir=args.decision_output_dir,
+                device=device
+            )
+
+            print("\nDecision analysis complete!")
+            print(f"Results saved to: {args.decision_output_dir}")
+                
+                
         sys.exit(0)
 
     logger.info("\n" + "="*80)

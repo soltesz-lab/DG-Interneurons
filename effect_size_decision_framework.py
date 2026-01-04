@@ -349,10 +349,10 @@ def make_data_collection_decision(
     Integrate all criteria to make data collection recommendation
     
     Decision logic:
-    1. If already significant + biologically meaningful + precise → STOP
-    2. If biologically meaningful but underpowered/imprecise + feasible N → CONTINUE
-    3. If promising but uncertain → CONSIDER
-    4. If not biologically meaningful or infeasible N → STOP
+    1. If already significant + biologically meaningful + precise -> STOP
+    2. If biologically meaningful but underpowered/imprecise + feasible N -> CONTINUE
+    3. If promising but uncertain -> CONSIDER
+    4. If not biologically meaningful or infeasible N -> STOP
     
     Args:
         bootstrap_results: Results from analyze_effect_size_all_sources_nested()
@@ -501,7 +501,7 @@ def print_effect_size_decision_report(
 ):
     """Print report integrating all decision criteria"""
     print("\n" + "="*80)
-    print(f"EFFECT SIZE DECISION REPORT: {target_population.upper()} → {post_population.upper()}")
+    print(f"EFFECT SIZE DECISION REPORT: {target_population.upper()} -> {post_population.upper()}")
     print("="*80)
     
     # Summary table
@@ -536,7 +536,7 @@ def print_effect_size_decision_report(
         rec = recommendations[source_pop]
         bio = bio_sig_results[source_pop]
         
-        print(f"\n{source_pop.upper()} → {post_population.upper()}:")
+        print(f"\n{source_pop.upper()} -> {post_population.upper()}:")
         print(f"  Action: {rec.action} (Priority: {rec.priority})")
         print(f"  Current N: {power_results[source_pop].current_n}")
         print(f"  Recommended N: {rec.recommended_total_n}")
