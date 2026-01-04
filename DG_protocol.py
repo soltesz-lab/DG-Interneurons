@@ -43,6 +43,22 @@ from nested_effect_size import (
     plot_weight_distributions_by_response,
     print_nested_effect_size_analysis_summary
 )
+from effect_size_decision_framework import (
+    PowerAnalysisResult,
+    PrecisionAssessment,
+    BiologicalSignificanceAssessment,
+    DataCollectionRecommendation,
+    compute_power_one_sample,
+    estimate_required_n,
+    analyze_statistical_power,
+    assess_ci_precision,
+    assess_biological_significance,
+    make_data_collection_decision,
+    print_effect_size_decision_report,
+    plot_effect_size_decision_summary,
+    run_effect_size_decision_analysis
+)
+
 from DG_visualization import (
     DGCircuitVisualization
 )
@@ -4143,7 +4159,7 @@ def plot_ablation_test_results(all_results: Dict,
                                intensity: float = 1.0,
                                save_path: Optional[str] = None) -> None:
     """
-    Plot comprehensive ablation test results including non-target interneurons
+    Plot ablation test results including non-target interneurons
     
     Creates a multi-panel figure showing:
     - Bar plots comparing % excited cells across ablation conditions
@@ -5501,7 +5517,7 @@ def run_nested_effect_size_analysis(
         device = get_default_device()
     
     print("\n" + "="*80)
-    print("Bootstrap Effect Size Analysis: Nested Experiment Data")
+    print("Nested Bootstrap Effect Size Analysis")
     print("="*80)
     print(f"Loading results from: {nested_results_file}")
     
@@ -5688,6 +5704,387 @@ def run_nested_effect_size_analysis(
     
     return all_analyses
 
+
+
+def run_nested_effect_size_decision_analysis(
+    nested_data: Dict,
+    target_populations: List[str] = ['pv', 'sst'],
+    post_populations: List[str] = ['gc', 'mc'],
+    intensities: Optional[List[float]] = None,
+    source_populations: List[str] = ['pv', 'sst', 'mc', 'mec'],
+    n_bootstrap: int = 10000,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    current_n: Optional[int] = None,
+    target_power: float = 0.80,
+    max_feasible_n: int = 20,
+    min_meaningful_effect: float = 0.5,
+    min_meaningful_diff_nS: float = 0.1,
+    random_seed: Optional[int] = None,
+    output_dir: str = './effect_size_decision',
+    device: Optional[torch.device] = None
+) -> Dict:
+    """
+    Run effect size decision analysis from nested experiment results.
+    
+    This function integrates bootstrap effect size analysis with power analysis,
+    precision assessment, and biological significance evaluation to make data
+    collection recommendations.
+    
+    Args:
+        nested_data: Nested experiment data dict with keys:
+            - 'nested_results': Trial data
+            - 'metadata': Experiment metadata
+            - 'seed_structure': RNG seed information
+            - 'variance_analysis': Variance decomposition results (optional)
+        target_populations: Populations that were stimulated
+        post_populations: Post-synaptic populations to analyze
+        intensities: Light intensities to analyze (None = all available)
+        source_populations: Source populations for weight analysis
+        n_bootstrap: Number of bootstrap samples
+        threshold_std: Classification threshold (std deviations)
+        expression_threshold: Opsin expression threshold
+        current_n: Current number of connectivity instances (auto-detected if None)
+        target_power: Desired statistical power
+        max_feasible_n: Maximum feasible sample size
+        min_meaningful_effect: Minimum biologically meaningful effect size
+        min_meaningful_diff_nS: Minimum biologically meaningful weight difference
+        random_seed: Random seed for reproducibility
+        output_dir: Directory to save results and plots
+        device: Device for circuit creation
+        
+    Returns:
+        Dict with complete analysis results for each target/intensity/post combination
+    """
+    if device is None:
+        device = get_default_device()
+    
+    print("\n" + "="*80)
+    print("Nested effect size decision framework")
+    print("="*80)
+    
+    # Extract experiment data
+    nested_results = nested_data['nested_results']
+    metadata = nested_data['metadata']
+    seed_structure = nested_data['seed_structure']
+    
+    # Extract experiment parameters
+    stim_start = metadata['stim_start']
+    stim_duration = metadata['stim_duration']
+    warmup = metadata['warmup']
+    
+    # Determine intensities to analyze
+    if intensities is None:
+        intensities = metadata['intensities']
+    
+    # Auto-detect current N if not specified
+    if current_n is None:
+        # Get from seed structure
+        current_n = len(seed_structure['connectivity_seeds'])
+    
+    print(f"\nExperiment parameters:")
+    print(f"  Stimulation: {stim_start} - {stim_start + stim_duration} ms")
+    print(f"  Baseline: {warmup} - {stim_start} ms")
+    print(f"  Intensities: {intensities}")
+    print(f"  Current N: {current_n} connectivity instances")
+    print(f"  Bootstrap samples: {n_bootstrap:,}")
+    print(f"  Target power: {target_power:.0%}")
+    print(f"  Max feasible N: {max_feasible_n}")
+    
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Check for variance decomposition results (ICC analysis)
+    variance_analysis = nested_data.get('variance_analysis', None)
+    regime_classification = nested_data.get('regime_classification', None)
+    
+    # Storage for all results
+    all_analyses = {}
+    
+    # Analyze each target population
+    for target in target_populations:
+        if target not in nested_results:
+            print(f"\nSkipping {target.upper()} - no results found")
+            continue
+        
+        all_analyses[target] = {}
+        
+        print(f"\n{'='*60}")
+        print(f"Analyzing {target.upper()} stimulation")
+        print('='*60)
+        
+        for intensity in intensities:
+            if intensity not in nested_results[target]:
+                continue
+            
+            all_analyses[target][intensity] = {}
+            
+            print(f"\n  Intensity: {intensity}")
+            
+            # Get trials for this condition
+            trials = nested_results[target][intensity]
+            
+            print(f"    Total trials: {len(trials)}")
+            print(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
+            
+            # Recreate circuit (use seed from first connectivity instance)
+            first_conn_seed = seed_structure['connectivity_seeds'][0]
+            
+            print(f"    Recreating circuit with seed: {first_conn_seed}")
+            
+            # Create circuit with optimization if available
+            from DG_circuit_dendritic_somatic_transfer import (
+                CircuitParams, PerConnectionSynapticParams, OpsinParams
+            )
+            
+            circuit_params = CircuitParams()
+            synaptic_params = PerConnectionSynapticParams()
+            opsin_params = OpsinParams()
+            
+            optimization_file = metadata.get('optimization_file')
+            if optimization_file:
+                print(f"    Applying optimization from: {optimization_file}")
+            
+            # Create circuit
+            set_random_seed(first_conn_seed, device)
+            experiment = OptogeneticExperiment(
+                circuit_params,
+                synaptic_params,
+                opsin_params,
+                optimization_json_file=optimization_file,
+                device=device,
+                base_seed=first_conn_seed
+            )
+            
+            # Analyze each post-synaptic population
+            for post_pop in post_populations:
+                print(f"\n    Analyzing {target.upper()} → {post_pop.upper()}")
+                
+                # Create output directory for this combination
+                combo_dir = output_path / f"{target}_intensity_{intensity}" / post_pop
+                combo_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Compute bootstrap effect sizes
+                print(f"      Computing bootstrap effect sizes...")
+                bootstrap_results = analyze_effect_size_all_sources_nested(
+                    nested_results=trials,
+                    circuit=experiment.circuit,
+                    target_population=target,
+                    post_population=post_pop,
+                    source_populations=source_populations,
+                    stim_start=stim_start,
+                    stim_duration=stim_duration,
+                    warmup=warmup,
+                    n_bootstrap=n_bootstrap,
+                    threshold_std=threshold_std,
+                    expression_threshold=expression_threshold,
+                    random_seed=random_seed
+                )
+                
+                if not bootstrap_results:
+                    print(f"      No valid results for {post_pop.upper()}")
+                    continue
+                
+                # Extract ICC if available
+                icc_value = None
+                if variance_analysis is not None:
+                    if target in variance_analysis and intensity in variance_analysis[target]:
+                        if post_pop in variance_analysis[target][intensity]:
+                            var_results = variance_analysis[target][intensity][post_pop]
+                            icc_value = var_results.get('icc', None)
+                
+                # Run complete decision analysis
+                analysis_results = run_effect_size_decision_analysis(
+                    bootstrap_results=bootstrap_results,
+                    target_population=target,
+                    post_population=post_pop,
+                    current_n=current_n,
+                    target_power=target_power,
+                    max_feasible_n=max_feasible_n,
+                    min_meaningful_effect=min_meaningful_effect,
+                    min_meaningful_diff_nS=min_meaningful_diff_nS,
+                    icc_value=icc_value,
+                    save_dir=str(combo_dir)
+                )
+                
+                # Store results
+                all_analyses[target][intensity][post_pop] = analysis_results
+                
+                # Print summary
+                print_nested_effect_size_analysis_summary(
+                    analysis_results['bootstrap_results'],
+                    target,
+                    post_pop
+                )
+            
+            # Clean up circuit
+            del experiment
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+    
+    # Save complete analysis results
+    analysis_file = output_path / 'effect_size_decision_analysis_results.pkl'
+    with open(analysis_file, 'wb') as f:
+        pickle.dump({
+            'all_analyses': all_analyses,
+            'metadata': metadata,
+            'parameters': {
+                'n_bootstrap': n_bootstrap,
+                'threshold_std': threshold_std,
+                'expression_threshold': expression_threshold,
+                'current_n': current_n,
+                'target_power': target_power,
+                'max_feasible_n': max_feasible_n,
+                'min_meaningful_effect': min_meaningful_effect,
+                'min_meaningful_diff_nS': min_meaningful_diff_nS,
+                'random_seed': random_seed
+            }
+        }, f)
+    
+    # Generate cross-population summary report
+    print_cross_population_summary(all_analyses, output_path)
+    
+    print(f"\n{'='*80}")
+    print(f"Decision analysis complete. Results saved to: {output_path}")
+    print(f"  Summary file: {analysis_file}")
+    print('='*80)
+    
+    return all_analyses
+
+
+def print_cross_population_summary(
+    all_analyses: Dict,
+    output_path: Path
+):
+    """
+    Print and save cross-population summary of recommendations
+    
+    Args:
+        all_analyses: Complete analysis results
+        output_path: Directory to save summary
+    """
+    print("\n" + "="*80)
+    print("Cross-population effect size decision summary")
+    print("="*80)
+    
+    summary_lines = []
+    summary_lines.append("\n" + "="*80)
+    summary_lines.append("Cross-population Effect Size Decision Summary")
+    summary_lines.append("="*80)
+    
+    # Organize by intensity
+    for target in sorted(all_analyses.keys()):
+        for intensity in sorted(all_analyses[target].keys()):
+            
+            header = f"\n{target.upper()} Stimulation at Intensity {intensity}"
+            print(header)
+            summary_lines.append(header)
+            
+            divider = "-"*80
+            print(divider)
+            summary_lines.append(divider)
+            
+            table_header = f"{'Post Pop':<10} {'Source':<8} {'d':<8} {'Power':<8} {'Action':<15} {'Add N':<8} {'Priority':<10}"
+            print(table_header)
+            summary_lines.append(table_header)
+            
+            print(divider)
+            summary_lines.append(divider)
+            
+            for post_pop in sorted(all_analyses[target][intensity].keys()):
+                results = all_analyses[target][intensity][post_pop]
+                recommendations = results['recommendations']
+                power_analysis = results['power_analysis']
+                bootstrap_results = results['bootstrap_results']
+                
+                for source_pop in sorted(recommendations.keys()):
+                    rec = recommendations[source_pop]
+                    power = power_analysis[source_pop]
+                    boot = bootstrap_results[source_pop]
+                    
+                    line = (f"{post_pop.upper():<10} {source_pop.upper():<8} "
+                           f"{boot['effect_size']:>6.2f}  {power.current_power:>6.2f}  "
+                           f"{rec.action:<15} {rec.additional_n_needed:>6}  "
+                           f"{rec.priority:<10}")
+                    print(line)
+                    summary_lines.append(line)
+    
+    # Overall recommendations
+    print("\n" + "="*80)
+    print("Overall Recommendations")
+    print("="*80)
+    summary_lines.append("\n" + "="*80)
+    summary_lines.append("Overall Recommendations")
+    summary_lines.append("="*80)
+    
+    # Find maximum additional N needed across all conditions
+    max_add_n = 0
+    high_priority_items = []
+    medium_priority_items = []
+    
+    for target in all_analyses:
+        for intensity in all_analyses[target]:
+            for post_pop in all_analyses[target][intensity]:
+                recommendations = all_analyses[target][intensity][post_pop]['recommendations']
+                for source_pop, rec in recommendations.items():
+                    max_add_n = max(max_add_n, rec.additional_n_needed)
+                    
+                    if rec.priority == 'HIGH':
+                        high_priority_items.append(
+                            (target, intensity, post_pop, source_pop, rec.additional_n_needed)
+                        )
+                    elif rec.priority == 'MEDIUM':
+                        medium_priority_items.append(
+                            (target, intensity, post_pop, source_pop, rec.additional_n_needed)
+                        )
+    
+    if high_priority_items:
+        msg = f"\nHIGH PRIORITY: Add {max_add_n} connectivity instances"
+        print(msg)
+        summary_lines.append(msg)
+        
+        print("\nEffects requiring additional data:")
+        summary_lines.append("\nEffects requiring additional data:")
+        
+        for target, intensity, post_pop, source_pop, add_n in high_priority_items:
+            item = f"  • {target.upper()} → {post_pop.upper()} (from {source_pop.upper()}): +{add_n}"
+            print(item)
+            summary_lines.append(item)
+    
+    elif medium_priority_items:
+        msg = f"\nMEDIUM PRIORITY: Consider adding {max_add_n} connectivity instances"
+        print(msg)
+        summary_lines.append(msg)
+        
+        print("\nEffects that would benefit from more data:")
+        summary_lines.append("\nEffects that would benefit from more data:")
+        
+        for target, intensity, post_pop, source_pop, add_n in medium_priority_items:
+            item = f"  • {target.upper()} → {post_pop.upper()} (from {source_pop.upper()}): +{add_n}"
+            print(item)
+            summary_lines.append(item)
+    
+    else:
+        msg = "\nNO ADDITIONAL DATA NEEDED"
+        print(msg)
+        summary_lines.append(msg)
+        
+        msg2 = "All effects are either well-characterized or not biologically meaningful"
+        print(msg2)
+        summary_lines.append(msg2)
+    
+    print("\n" + "="*80)
+    summary_lines.append("\n" + "="*80)
+    
+    # Save summary to file
+    summary_file = output_path / 'effect_size_decision_summary.txt'
+    with open(summary_file, 'w') as f:
+        f.write('\n'.join(summary_lines))
+    
+    print(f"\nSummary saved to: {summary_file}")
+
+    
 if __name__ == "__main__":
     print("Dentate Gyrus Circuit with Anatomical Connectivity")
     print("=========================================================")
@@ -5842,6 +6239,22 @@ Examples:
                                  default=None,
                                  help='Intensities to analyze (default: all available)')
 
+    # Effect size decision framework options
+    efsz_decision_group = parser.add_argument_group('Effect Size Decision Framework')
+
+    efsz_decision_group.add_argument('--run-decision-analysis', action='store_true',
+                                     help='Run effect size decision analysis on nested results')
+    efsz_decision_group.add_argument('--decision-target-power', type=float, default=0.80,
+                                     help='Target statistical power (default: 0.80)')
+    efsz_decision_group.add_argument('--decision-max-feasible-n', type=int, default=30,
+                                     help='Maximum feasible sample size (default: 30)')
+    efsz_decision_group.add_argument('--decision-min-effect', type=float, default=0.5,
+                                     help='Minimum meaningful effect size (Cohen\'s d, default: 0.5)')
+    efsz_decision_group.add_argument('--decision-min-diff-nS', type=float, default=0.05,
+                                     help='Minimum meaningful weight difference (nS, default: 0.05)')
+    efsz_decision_group.add_argument('--decision-output-dir', type=str,
+                                     default='./effect_size_decision',
+                                     help='Output directory for decision analysis')
     
     args = parser.parse_args()
 
