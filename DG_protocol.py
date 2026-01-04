@@ -6005,7 +6005,7 @@ def print_cross_population_summary(
                 for source_pop in sorted(recommendations.keys()):
                     rec = recommendations[source_pop]
                     power = power_analysis[source_pop]
-                    boot = bootstrap_results[source_pop]
+                    boot = bootstrap_results[source_pop]['bootstrap_results']
                     
                     line = (f"{post_pop.upper():<10} {source_pop.upper():<8} "
                            f"{boot['effect_size']:>6.2f}  {power.current_power:>6.2f}  "
