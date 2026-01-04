@@ -13,6 +13,13 @@ import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist
 from pathlib import Path
 import tqdm
+import logging
+
+logger = logging.getLogger('DG_protocol')
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+logger.addHandler(ch)
 
 from dendritic_somatic_transfer import (
     get_default_device
@@ -740,9 +747,9 @@ class OptogeneticExperiment:
         if optimization_json_file is not None:
             success = self._load_optimization_results(optimization_json_file)
             if success:
-                print(f"OptogeneticExperiment initialized with optimized parameters from {optimization_json_file}")
+                logger.info(f"OptogeneticExperiment initialized with optimized parameters from {optimization_json_file}")
             else:
-                print(f"Failed to load optimization file. Using default parameters.")
+                logger.info(f"Failed to load optimization file. Using default parameters.")
 
         # Create initial circuit (will be recreated for each trial if regenerate_connectivity is True)
         self.circuit = self._create_circuit(base_seed)
@@ -757,8 +764,8 @@ class OptogeneticExperiment:
             self.current_recording_config = current_recording_config
             self.current_recording_config.enabled = record_currents
         
-        print(f"OptogeneticExperiment initialized on device: {self.device}")
-        print(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
+        logger.info(f"OptogeneticExperiment initialized on device: {self.device}")
+        logger.info(f"  Base seed: {base_seed} (trials will use base_seed + trial_index)")
 
         
     def _create_circuit(self, seed: int) -> DentateCircuit:
@@ -783,9 +790,9 @@ class OptogeneticExperiment:
             with open(json_filename, 'r') as f:
                 self.optimization_data = json.load(f)
 
-            print(f"Loading optimization results from {json_filename}")
-            print(f"Results from: {self.optimization_data['optimization_info']['timestamp']}")
-            print(f"Best loss achieved: {self.optimization_data['optimization_info']['best_loss']:.6f}")
+            logger.info(f"Loading optimization results from {json_filename}")
+            logger.info(f"Results from: {self.optimization_data['optimization_info']['timestamp']}")
+            logger.info(f"Best loss achieved: {self.optimization_data['optimization_info']['best_loss']:.6f}")
 
             # Create modified circuit parameters
             self.circuit_params = self._create_optimized_circuit_params()
@@ -795,23 +802,23 @@ class OptogeneticExperiment:
             return True
 
         except FileNotFoundError:
-            print(f"Error: Could not find optimization file {json_filename}")
+            logger.info(f"Error: Could not find optimization file {json_filename}")
             return False
         except json.JSONDecodeError:
-            print(f"Error: Invalid JSON format in {json_filename}")
+            logger.info(f"Error: Invalid JSON format in {json_filename}")
             return False
         except KeyError as e:
-            print(f"Error: Missing expected key in optimization file: {e}")
+            logger.info(f"Error: Missing expected key in optimization file: {e}")
             return False
         except Exception as e:
-            print(f"Error loading optimization file: {e}")
+            logger.info(f"Error loading optimization file: {e}")
             return False
 
     def _create_optimized_synaptic_params(self):
         """Create PerConnectionSynapticParams with optimized connection modulation"""
         if ('optimized_parameters' not in self.optimization_data or 
             'connection_modulation' not in self.optimization_data['optimized_parameters']):
-            print("Warning: No optimized connection modulation found in JSON")
+            logger.info("Warning: No optimized connection modulation found in JSON")
             return PerConnectionSynapticParams()
 
         # Extract base conductance parameters
@@ -920,16 +927,16 @@ class OptogeneticExperiment:
             set_random_seed(trial_seed, self.device)
 
             if trial == 0:
-                print(f"\nRunning {n_trials} trial(s)...")
+                logger.info(f"\nRunning {n_trials} trial(s)...")
 
             if regenerate_connectivity_per_trial:
-                print(f"  Trial {trial + 1}/{n_trials}: Creating circuit with seed {trial_seed}...")
+                logger.info(f"  Trial {trial + 1}/{n_trials}: Creating circuit with seed {trial_seed}...")
                 self.circuit = self._create_circuit(trial_seed)
             else:
-                print(f"  Trial {trial + 1}/{n_trials}...")
+                logger.info(f"  Trial {trial + 1}/{n_trials}...")
 
             if (self.opsin_expression.get(target_population, None) is None) or regenerate_opsin_per_trial:
-                print(f"  Creating opsin expression...")
+                logger.info(f"  Creating opsin expression...")
                 self.opsin_expression[target_population] = self.create_opsin_expression(target_population)
 
             duration = stim_start + stim_duration + post_duration
@@ -1038,9 +1045,9 @@ class OptogeneticExperiment:
             plt.close(fig)
         
         if regenerate_connectivity_per_trial:
-            print(f"Completed {n_trials} trial(s) with different connectivity")
+            logger.info(f"Completed {n_trials} trial(s) with different connectivity")
         else:
-            print(f"Completed {n_trials} trial(s) with the same connectivity")
+            logger.info(f"Completed {n_trials} trial(s) with the same connectivity")
 
         return aggregated_results
 
@@ -1105,10 +1112,10 @@ class OptogeneticExperiment:
         non_stimulated_indices = torch.where(~stimulated_mask)[0].cpu().numpy()
         activation_prob[non_stimulated_indices] = 0.0
         plot_direct_activation = {}
-        print(f"activation_prob: {activation_prob}")
+        logger.info(f"activation_prob: {activation_prob}")
 
-        print(f"stimulated_indices = {stimulated_indices}")
-        print(f"non_stimulated_indices = {non_stimulated_indices}")
+        logger.info(f"stimulated_indices = {stimulated_indices}")
+        logger.info(f"non_stimulated_indices = {non_stimulated_indices}")
         # Simulation parameters
         duration = stim_start + stim_duration + post_duration
         stim_start_step_time = stim_start  # Store as time, not step index
@@ -1291,8 +1298,6 @@ class OptogeneticExperiment:
         self.circuit.reset_state()
         
         target_positions = self.circuit.layout.positions[target_population]
-
-        print(f"opsin_expression {target_population}: {opsin.expression_levels}")
 
         # Calculate direct optogenetic activation
         opsin = self.opsin_expression[target_population]
@@ -1788,15 +1793,15 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     
     # Check if we should load from file
     if load_results_file is not None:
-        print(f"\nLoading experiment results from file: {load_results_file}")
+        logger.info(f"\nLoading experiment results from file: {load_results_file}")
         results, conn_analysis, conductance_analysis, metadata = load_experiment_results(load_results_file)
         
         # Print loaded configuration
-        print("\nLoaded experiment configuration:")
-        print(f"  Light intensities: {metadata.get('intensities', 'Unknown')}")
-        print(f"  MEC current: {metadata.get('mec_current', 'Unknown')} pA")
-        print(f"  Opsin current: {metadata.get('opsin_current', 'Unknown')} pA")
-        print(f"  Stimulation: {metadata.get('stim_start', 'Unknown')} ms start, "
+        logger.info("\nLoaded experiment configuration:")
+        logger.info(f"  Light intensities: {metadata.get('intensities', 'Unknown')}")
+        logger.info(f"  MEC current: {metadata.get('mec_current', 'Unknown')} pA")
+        logger.info(f"  Opsin current: {metadata.get('opsin_current', 'Unknown')} pA")
+        logger.info(f"  Stimulation: {metadata.get('stim_start', 'Unknown')} ms start, "
               f"{metadata.get('stim_duration', 'Unknown')} ms duration")
         
         return results, conn_analysis, conductance_analysis
@@ -1839,8 +1844,8 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
         current_recording_config=current_config
     )
     
-    print(f"\nRunning comparative experiment with {n_trials} trial(s) per condition")
-    print(f"Base seed: {base_seed}\n")
+    logger.info(f"\nRunning comparative experiment with {n_trials} trial(s) per condition")
+    logger.info(f"Base seed: {base_seed}\n")
     
     # Analyze connectivity patterns (from last trial's circuit)
     conn_analysis = analyze_connectivity_patterns(experiment)
@@ -1848,24 +1853,24 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     # Analyze conductance patterns
     conductance_analysis = analyze_conductance_patterns(experiment)
     
-    print("Connectivity Analysis:")
-    print(f"GC->MC distances (mean): {np.mean(conn_analysis['gc_mc_distances']):.3f} mm")
-    print(f"GC->PV distances (mean): {np.mean(conn_analysis['gc_pv_distances']):.3f} mm")
-    print(f"GC->SST distances (mean): {np.mean(conn_analysis['gc_sst_distances']):.3f} mm")
-    print(f"MC->GC distances (mean): {np.mean(conn_analysis['mc_gc_distances']):.3f} mm")
-    print(f"MC->SST distances (mean): {np.mean(conn_analysis['mc_sst_distances']):.3f} mm")
-    print(f"Local radius threshold: {conn_analysis['local_radius']} mm")
-    print(f"Distant minimum threshold: {conn_analysis['distant_min']} mm")
+    logger.info("Connectivity Analysis:")
+    logger.info(f"GC->MC distances (mean): {np.mean(conn_analysis['gc_mc_distances']):.3f} mm")
+    logger.info(f"GC->PV distances (mean): {np.mean(conn_analysis['gc_pv_distances']):.3f} mm")
+    logger.info(f"GC->SST distances (mean): {np.mean(conn_analysis['gc_sst_distances']):.3f} mm")
+    logger.info(f"MC->GC distances (mean): {np.mean(conn_analysis['mc_gc_distances']):.3f} mm")
+    logger.info(f"MC->SST distances (mean): {np.mean(conn_analysis['mc_sst_distances']):.3f} mm")
+    logger.info(f"Local radius threshold: {conn_analysis['local_radius']} mm")
+    logger.info(f"Distant minimum threshold: {conn_analysis['distant_min']} mm")
 
-    print("\nConductance Analysis:")
-    print("-" * 50)
+    logger.info("\nConductance Analysis:")
+    logger.info("-" * 50)
     for conn_name, stats in conductance_analysis.items():
         if stats['n_connections'] > 0:
-            print(f"{conn_name} ({stats['synapse_type']}):")
-            print(f"  Connections: {stats['n_connections']}")
-            print(f"  Conductance: {stats['mean_conductance']:.3f} +/- {stats['std_conductance']:.3f} nS")
-            print(f"  CV: {stats['cv_conductance']:.2f}")
-            print(f"  Range: [{stats['min_conductance']:.3f}, {stats['max_conductance']:.3f}] nS")
+            logger.info(f"{conn_name} ({stats['synapse_type']}):")
+            logger.info(f"  Connections: {stats['n_connections']}")
+            logger.info(f"  Conductance: {stats['mean_conductance']:.3f} +/- {stats['std_conductance']:.3f} nS")
+            logger.info(f"  CV: {stats['cv_conductance']:.2f}")
+            logger.info(f"  Range: [{stats['min_conductance']:.3f}, {stats['max_conductance']:.3f}] nS")
     
     # Test different stimulation intensities
     results = {}
@@ -1875,10 +1880,10 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     
     for target in ['pv', 'sst']:
         results[target] = {}
-        print(f"\nTesting {target.upper()} stimulation...")
+        logger.info(f"\nTesting {target.upper()} stimulation...")
         
         for intensity in intensities:
-            print(f"\n  Intensity: {intensity}")
+            logger.info(f"\n  Intensity: {intensity}")
             
             # Run multi-trial stimulation
             result = experiment.simulate_stimulation(
@@ -1898,14 +1903,14 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
     
                 # For multi-trial: show mean +/- std
                 if n_trials > 1:
-                    print(f"  Steps: {adaptive_stats['n_steps_mean']:.0f} +/- {adaptive_stats['n_steps_std']:.0f} "
+                    logger.info(f"  Steps: {adaptive_stats['n_steps_mean']:.0f} +/- {adaptive_stats['n_steps_std']:.0f} "
                           f"(range: {adaptive_stats['n_steps_min']}-{adaptive_stats['n_steps_max']})")
-                    print(f"  Avg dt: {adaptive_stats['avg_dt_mean']:.3f} +/- {adaptive_stats['avg_dt_std']:.3f} ms")
-                    print(f"  dt range: [{adaptive_stats['min_dt_mean']:.3f}, {adaptive_stats['max_dt_mean']:.3f}] ms")
+                    logger.info(f"  Avg dt: {adaptive_stats['avg_dt_mean']:.3f} +/- {adaptive_stats['avg_dt_std']:.3f} ms")
+                    logger.info(f"  dt range: [{adaptive_stats['min_dt_mean']:.3f}, {adaptive_stats['max_dt_mean']:.3f}] ms")
                 # For single trial: show direct values
                 else:
-                    print(f"  Steps: {adaptive_stats['n_steps_mean']:.0f} (avg dt: {adaptive_stats['avg_dt_mean']:.3f} ms)")
-                    print(f"  dt range: [{adaptive_stats['min_dt_min']:.3f}, {adaptive_stats['max_dt_max']:.3f}] ms")
+                    logger.info(f"  Steps: {adaptive_stats['n_steps_mean']:.0f} (avg dt: {adaptive_stats['avg_dt_mean']:.3f} ms)")
+                    logger.info(f"  dt range: [{adaptive_stats['min_dt_min']:.3f}, {adaptive_stats['max_dt_max']:.3f}] ms")
 
 
                 
@@ -2161,10 +2166,10 @@ def save_experiment_results(results: Dict,
     with open(filepath, 'wb') as f:
         pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
     
-    print(f"\nExperiment results saved to: {filepath}")
-    print(f"  File size: {filepath.stat().st_size / 1024 / 1024:.2f} MB")
+    logger.info(f"\nExperiment results saved to: {filepath}")
+    logger.info(f"  File size: {filepath.stat().st_size / 1024 / 1024:.2f} MB")
     if metadata:
-        print(f"  Configuration: {metadata.get('n_trials', 'N/A')} trials, "
+        logger.info(f"  Configuration: {metadata.get('n_trials', 'N/A')} trials, "
               f"seed {metadata.get('base_seed', 'N/A')}")
 
 
@@ -2192,14 +2197,14 @@ def load_experiment_results(filepath: str) -> Tuple[Dict, Dict, Dict, Dict]:
     conductance_analysis = save_data['conductance_analysis']
     metadata = save_data.get('metadata', {})
     
-    print(f"\nLoaded experiment results from: {filepath}")
-    print(f"  Saved: {save_data.get('timestamp', 'Unknown')}")
-    print(f"  Version: {save_data.get('version', 'Unknown')}")
+    logger.info(f"\nLoaded experiment results from: {filepath}")
+    logger.info(f"  Saved: {save_data.get('timestamp', 'Unknown')}")
+    logger.info(f"  Version: {save_data.get('version', 'Unknown')}")
     if metadata:
-        print(f"  Configuration: {metadata.get('n_trials', 'N/A')} trials, "
+        logger.info(f"  Configuration: {metadata.get('n_trials', 'N/A')} trials, "
               f"seed {metadata.get('base_seed', 'N/A')}")
         if 'optimization_file' in metadata and metadata['optimization_file']:
-            print(f"  Optimization: {metadata['optimization_file']}")
+            logger.info(f"  Optimization: {metadata['optimization_file']}")
     
     # Convert numpy arrays back to torch tensors where needed
     def convert_numpy_to_tensors(obj):
@@ -2380,7 +2385,7 @@ def plot_adaptive_stepping_analysis(adaptive_stats: Dict,
     
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved adaptive stepping analysis to: {save_path}")
+        logger.info(f"Saved adaptive stepping analysis to: {save_path}")
     
     plt.show()
 
@@ -2940,12 +2945,12 @@ def test_disinhibition_hypothesis(optimization_json_file: Optional[str] = None,
         device=device
     )
     
-    print("Testing Disinhibition Hypothesis")
-    print("=" * 40)
+    logger.info("Testing Disinhibition Hypothesis")
+    logger.info("=" * 40)
     
     for target in ['pv', 'sst']:
-        print(f"\n{target.upper()} Stimulation:")
-        print("-" * 20)
+        logger.info(f"\n{target.upper()} Stimulation:")
+        logger.info("-" * 20)
         
         analysis = analyze_disinhibition_effects(
             experiment, target, 1.0,
@@ -2956,12 +2961,12 @@ def test_disinhibition_hypothesis(optimization_json_file: Optional[str] = None,
             if f'{pop}_paradoxical_excitation' in analysis:
                 result = analysis[f'{pop}_paradoxical_excitation']
                 
-                print(f"{pop.upper()}:")
-                print(f"  With inhibition: {result['with_inhibition']} cells excited")
-                print(f"  Reduced inhibition: {result['without_inhibition']} cells excited") 
-                print(f"  Disinhibition-dependent: {result['disinhibition_dependent']} cells")
-                print(f"  Mean change: {result['mean_change_full']:.3f} -> {result['mean_change_no_inh']:.3f}")
-                print(f"  Change variability: {result['std_change_full']:.3f} -> {result['std_change_no_inh']:.3f}")
+                logger.info(f"{pop.upper()}:")
+                logger.info(f"  With inhibition: {result['with_inhibition']} cells excited")
+                logger.info(f"  Reduced inhibition: {result['without_inhibition']} cells excited") 
+                logger.info(f"  Disinhibition-dependent: {result['disinhibition_dependent']} cells")
+                logger.info(f"  Mean change: {result['mean_change_full']:.3f} -> {result['mean_change_no_inh']:.3f}")
+                logger.info(f"  Change variability: {result['std_change_full']:.3f} -> {result['std_change_no_inh']:.3f}")
      
 
 def test_interneuron_interactions(
@@ -3010,18 +3015,18 @@ def test_interneuron_interactions(
     if device is None:
         device = get_default_device()
     
-    print("\n" + "="*80)
-    print("TEST: Interneuron-Interneuron Interaction Hypothesis")
-    print("="*80)
-    print("\nBlocking connections:")
-    print("  - PV -> PV (prevents lateral inhibition within PV population)")
-    print("  - PV -> SST (prevents PV-mediated disinhibition of SST)")
-    print("  - SST -> PV (prevents SST-mediated disinhibition of PV)")
-    print("  - SST -> SST (prevents lateral inhibition within SST population)")
-    print("\nPrediction: If paradoxical excitation relies on interneuron")
-    print("           interactions (e.g., PV->SST disinhibition), this")
-    print("           manipulation should reduce the effect.")
-    print("="*80 + "\n")
+    logger.info("\n" + "="*80)
+    logger.info("TEST: Interneuron-Interneuron Interaction Hypothesis")
+    logger.info("="*80)
+    logger.info("\nBlocking connections:")
+    logger.info("  - PV -> PV (prevents lateral inhibition within PV population)")
+    logger.info("  - PV -> SST (prevents PV-mediated disinhibition of SST)")
+    logger.info("  - SST -> PV (prevents SST-mediated disinhibition of PV)")
+    logger.info("  - SST -> SST (prevents lateral inhibition within SST population)")
+    logger.info("\nPrediction: If paradoxical excitation relies on interneuron")
+    logger.info("           interactions (e.g., PV->SST disinhibition), this")
+    logger.info("           manipulation should reduce the effect.")
+    logger.info("="*80 + "\n")
     
     circuit_params = CircuitParams()
     opsin_params = OpsinParams()
@@ -3055,13 +3060,13 @@ def test_interneuron_interactions(
     }
     
     for target in target_populations:
-        print(f"\n{'='*60}")
-        print(f"Testing {target.upper()} stimulation")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
         
         # Run full network (control)
-        print("\n1. Full Network (Control)")
-        print("-"*60)
+        logger.info("\n1. Full Network (Control)")
+        logger.info("-"*60)
         experiment_full = OptogeneticExperiment(
             circuit_params, base_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3072,7 +3077,7 @@ def test_interneuron_interactions(
         
         full_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_full.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3177,8 +3182,8 @@ def test_interneuron_interactions(
         results['full_network'][target] = full_results
         
         # Run with blocked interneuron interactions
-        print("\n2. Blocked Interneuron-Interneuron Connections")
-        print("-"*60)
+        logger.info("\n2. Blocked Interneuron-Interneuron Connections")
+        logger.info("-"*60)
         experiment_blocked = OptogeneticExperiment(
             circuit_params, blocked_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3189,7 +3194,7 @@ def test_interneuron_interactions(
         
         blocked_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_blocked.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3224,11 +3229,11 @@ def test_interneuron_interactions(
         results['blocked_int_int'][target] = blocked_results
         
         # Print comparison
-        print(f"\n{'='*60}")
-        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
-        print('='*60)
-        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Int-Int':<20} {'Change':<15}")
-        print('-'*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        logger.info('='*60)
+        logger.info(f"{'Population':<12} {'Full Network':<20} {'Blocked Int-Int':<20} {'Change':<15}")
+        logger.info('-'*60)
         
         for pop in ['gc', 'mc', 'pv', 'sst']:
             if pop == target:
@@ -3236,13 +3241,13 @@ def test_interneuron_interactions(
             full_exc = full_results[intensities[-1]][f'{pop}_excited']
             blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
             change = blocked_exc - full_exc
-            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+            logger.info(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
     
     # Save results if requested
     if save_results_file:
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
-        print(f"\nResults saved to: {save_results_file}")
+        logger.info(f"\nResults saved to: {save_results_file}")
     
     return results
 
@@ -3298,23 +3303,23 @@ def test_excitation_to_interneurons(
     if device is None:
         device = get_default_device()
     
-    print("\n" + "="*80)
-    print("TEST: Disinhibition Hypothesis (Clean Test)")
-    print("="*80)
-    print("\nBlocking connections:")
-    print("  - MEC -> PV (blocks external excitation to PV)")
-    print("  - GC -> PV (blocks local excitation to PV)")
-    print("  - MC -> PV (blocks distant excitation to PV)")
-    print("  - GC -> SST (blocks local excitation to SST)")
-    print("  - MC -> SST (blocks distant excitation to SST)")
-    print("\nKept intact:")
-    print("  - All excitation to principal cells (GC, MC)")
-    print("  - All inhibition from interneurons")
-    print("  - Direct optogenetic activation of target interneurons")
-    print("\nPrediction: If paradoxical excitation requires excitatory")
-    print("           recruitment of the inhibitory network (disinhibition),")
-    print("           this should eliminate the effect.")
-    print("="*80 + "\n")
+    logger.info("\n" + "="*80)
+    logger.info("TEST: Disinhibition Hypothesis (Clean Test)")
+    logger.info("="*80)
+    logger.info("\nBlocking connections:")
+    logger.info("  - MEC -> PV (blocks external excitation to PV)")
+    logger.info("  - GC -> PV (blocks local excitation to PV)")
+    logger.info("  - MC -> PV (blocks distant excitation to PV)")
+    logger.info("  - GC -> SST (blocks local excitation to SST)")
+    logger.info("  - MC -> SST (blocks distant excitation to SST)")
+    logger.info("\nKept intact:")
+    logger.info("  - All excitation to principal cells (GC, MC)")
+    logger.info("  - All inhibition from interneurons")
+    logger.info("  - Direct optogenetic activation of target interneurons")
+    logger.info("\nPrediction: If paradoxical excitation requires excitatory")
+    logger.info("           recruitment of the inhibitory network (disinhibition),")
+    logger.info("           this should eliminate the effect.")
+    logger.info("="*80 + "\n")
     
     circuit_params = CircuitParams()
     opsin_params = OpsinParams()
@@ -3348,13 +3353,13 @@ def test_excitation_to_interneurons(
     }
     
     for target in target_populations:
-        print(f"\n{'='*60}")
-        print(f"Testing {target.upper()} stimulation")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
         
         # Run full network (control)
-        print("\n1. Full Network (Control)")
-        print("-"*60)
+        logger.info("\n1. Full Network (Control)")
+        logger.info("-"*60)
         experiment_full = OptogeneticExperiment(
             circuit_params, base_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3365,7 +3370,7 @@ def test_excitation_to_interneurons(
         
         full_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_full.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3415,8 +3420,8 @@ def test_excitation_to_interneurons(
         results['full_network'][target] = full_results
         
         # Run with blocked excitation to interneurons
-        print("\n2. Blocked Excitation to Interneurons")
-        print("-"*60)
+        logger.info("\n2. Blocked Excitation to Interneurons")
+        logger.info("-"*60)
         experiment_blocked = OptogeneticExperiment(
             circuit_params, blocked_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3427,7 +3432,7 @@ def test_excitation_to_interneurons(
         
         blocked_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_blocked.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3462,11 +3467,11 @@ def test_excitation_to_interneurons(
         results['blocked_exc_to_int'][target] = blocked_results
         
         # Print comparison
-        print(f"\n{'='*60}")
-        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
-        print('='*60)
-        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Exc->Int':<20} {'Change':<15}")
-        print('-'*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        logger.info('='*60)
+        logger.info(f"{'Population':<12} {'Full Network':<20} {'Blocked Exc->Int':<20} {'Change':<15}")
+        logger.info('-'*60)
         
         for pop in ['gc', 'mc', 'pv', 'sst']:
             if pop == target:
@@ -3475,15 +3480,15 @@ def test_excitation_to_interneurons(
             blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
             change = blocked_exc - full_exc
             
-            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+            logger.info(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
             
             if abs(change) > 0.05:  # Significant reduction
-                print(f"             -> {'STRONG' if abs(change) > 0.15 else 'MODERATE'} reduction suggests disinhibition mechanism")
+                logger.info(f"             -> {'STRONG' if abs(change) > 0.15 else 'MODERATE'} reduction suggests disinhibition mechanism")
     
     if save_results_file:
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
-        print(f"\nResults saved to: {save_results_file}")
+        logger.info(f"\nResults saved to: {save_results_file}")
     
     return results
 
@@ -3534,21 +3539,21 @@ def test_recurrent_excitation(
     if device is None:
         device = get_default_device()
     
-    print("\n" + "="*80)
-    print("TEST: Recurrent Excitation Hypothesis")
-    print("="*80)
-    print("\nBlocking connections:")
-    print("  - GC -> MC (blocks feedforward excitation)")
-    print("  - MC -> GC (blocks feedback excitation)")
-    print("  - MC -> MC (blocks lateral excitation within MC)")
-    print("\nKept intact:")
-    print("  - All connections involving interneurons")
-    print("  - External drive (MEC -> GC, MEC -> MC)")
-    print("\nPrediction: If paradoxical excitation depends on amplification")
-    print("           through recurrent excitatory loops among principal")
-    print("           cells, blocking these connections should reduce")
-    print("           the effect.")
-    print("="*80 + "\n")
+    logger.info("\n" + "="*80)
+    logger.info("TEST: Recurrent Excitation Hypothesis")
+    logger.info("="*80)
+    logger.info("\nBlocking connections:")
+    logger.info("  - GC -> MC (blocks feedforward excitation)")
+    logger.info("  - MC -> GC (blocks feedback excitation)")
+    logger.info("  - MC -> MC (blocks lateral excitation within MC)")
+    logger.info("\nKept intact:")
+    logger.info("  - All connections involving interneurons")
+    logger.info("  - External drive (MEC -> GC, MEC -> MC)")
+    logger.info("\nPrediction: If paradoxical excitation depends on amplification")
+    logger.info("           through recurrent excitatory loops among principal")
+    logger.info("           cells, blocking these connections should reduce")
+    logger.info("           the effect.")
+    logger.info("="*80 + "\n")
     
     circuit_params = CircuitParams()
     opsin_params = OpsinParams()
@@ -3580,13 +3585,13 @@ def test_recurrent_excitation(
     }
     
     for target in target_populations:
-        print(f"\n{'='*60}")
-        print(f"Testing {target.upper()} stimulation")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
         
         # Run full network (control)
-        print("\n1. Full Network (Control)")
-        print("-"*60)
+        logger.info("\n1. Full Network (Control)")
+        logger.info("-"*60)
         experiment_full = OptogeneticExperiment(
             circuit_params, base_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3597,7 +3602,7 @@ def test_recurrent_excitation(
         
         full_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_full.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3647,8 +3652,8 @@ def test_recurrent_excitation(
         results['full_network'][target] = full_results
         
         # Run with blocked recurrent excitation
-        print("\n2. Blocked Recurrent Excitation")
-        print("-"*60)
+        logger.info("\n2. Blocked Recurrent Excitation")
+        logger.info("-"*60)
         experiment_blocked = OptogeneticExperiment(
             circuit_params, blocked_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3659,7 +3664,7 @@ def test_recurrent_excitation(
         
         blocked_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_blocked.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3694,26 +3699,26 @@ def test_recurrent_excitation(
         results['blocked_recurrent'][target] = blocked_results
         
         # Print comparison
-        print(f"\n{'='*60}")
-        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
-        print('='*60)
-        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Recurrent':<20} {'Change':<15}")
-        print('-'*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        logger.info('='*60)
+        logger.info(f"{'Population':<12} {'Full Network':<20} {'Blocked Recurrent':<20} {'Change':<15}")
+        logger.info('-'*60)
         
         for pop in ['gc', 'mc']:  # Focus on principal cells for this test
             full_exc = full_results[intensities[-1]][f'{pop}_excited']
             blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
             change = blocked_exc - full_exc
             
-            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+            logger.info(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
             
             if abs(change) > 0.05:
-                print(f"             -> Recurrent excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
+                logger.info(f"             -> Recurrent excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
     
     if save_results_file:
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
-        print(f"\nResults saved to: {save_results_file}")
+        logger.info(f"\nResults saved to: {save_results_file}")
     
     return results
 
@@ -3766,21 +3771,21 @@ def test_intrinsic_excitation(
     if device is None:
         device = get_default_device()
     
-    print("\n" + "="*80)
-    print("TEST: Recurrent Excitation Hypothesis")
-    print("="*80)
-    print("\nBlocking connections:")
-    print("  - GC -> MC (blocks feedforward excitation)")
-    print("  - MC -> GC (blocks feedback excitation)")
-    print("  - MC -> MC (blocks lateral excitation within MC)")
-    print("  - GC -> PV")
-    print("  - GC -> SST")
-    print("  - MC -> PV")
-    print("  - MC -> SST")
-    print("\nKept intact:")
-    print("  - All inhibitory connections involving interneurons")
-    print("  - External drive (MEC -> GC, MEC -> MC)")
-    print("="*80 + "\n")
+    logger.info("\n" + "="*80)
+    logger.info("TEST: Recurrent Excitation Hypothesis")
+    logger.info("="*80)
+    logger.info("\nBlocking connections:")
+    logger.info("  - GC -> MC (blocks feedforward excitation)")
+    logger.info("  - MC -> GC (blocks feedback excitation)")
+    logger.info("  - MC -> MC (blocks lateral excitation within MC)")
+    logger.info("  - GC -> PV")
+    logger.info("  - GC -> SST")
+    logger.info("  - MC -> PV")
+    logger.info("  - MC -> SST")
+    logger.info("\nKept intact:")
+    logger.info("  - All inhibitory connections involving interneurons")
+    logger.info("  - External drive (MEC -> GC, MEC -> MC)")
+    logger.info("="*80 + "\n")
     
     circuit_params = CircuitParams()
     opsin_params = OpsinParams()
@@ -3815,13 +3820,13 @@ def test_intrinsic_excitation(
     }
     
     for target in target_populations:
-        print(f"\n{'='*60}")
-        print(f"Testing {target.upper()} stimulation")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
         
         # Run full network (control)
-        print("\n1. Full Network (Control)")
-        print("-"*60)
+        logger.info("\n1. Full Network (Control)")
+        logger.info("-"*60)
         experiment_full = OptogeneticExperiment(
             circuit_params, base_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3832,7 +3837,7 @@ def test_intrinsic_excitation(
         
         full_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_full.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3882,8 +3887,8 @@ def test_intrinsic_excitation(
         results['full_network'][target] = full_results
         
         # Run with blocked recurrent excitation
-        print("\n2. Blocked Intrinsic Excitation")
-        print("-"*60)
+        logger.info("\n2. Blocked Intrinsic Excitation")
+        logger.info("-"*60)
         experiment_blocked = OptogeneticExperiment(
             circuit_params, blocked_synaptic_params, opsin_params,
             optimization_json_file=optimization_json_file,
@@ -3894,7 +3899,7 @@ def test_intrinsic_excitation(
         
         blocked_results = {}
         for intensity in intensities:
-            print(f"\n  Testing intensity: {intensity}")
+            logger.info(f"\n  Testing intensity: {intensity}")
             result = experiment_blocked.simulate_stimulation(
                 target, intensity,
                 stim_start=stim_start,
@@ -3930,26 +3935,26 @@ def test_intrinsic_excitation(
         results['blocked_intrinsic_exc'][target] = blocked_results
         
         # Print comparison
-        print(f"\n{'='*60}")
-        print(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
-        print('='*60)
-        print(f"{'Population':<12} {'Full Network':<20} {'Blocked Intrinsic Exc':<20} {'Change':<15}")
-        print('-'*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"SUMMARY: {target.upper()} stimulation at intensity {intensities[-1]}")
+        logger.info('='*60)
+        logger.info(f"{'Population':<12} {'Full Network':<20} {'Blocked Intrinsic Exc':<20} {'Change':<15}")
+        logger.info('-'*60)
         
         for pop in ['gc', 'mc']:  # Focus on principal cells for this test
             full_exc = full_results[intensities[-1]][f'{pop}_excited']
             blocked_exc = blocked_results[intensities[-1]][f'{pop}_excited']
             change = blocked_exc - full_exc
             
-            print(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
+            logger.info(f"{pop.upper():<12} {full_exc:>6.1%}              {blocked_exc:>6.1%}              {change:>+6.1%}")
             
             if abs(change) > 0.05:
-                print(f"             -> Intrinsic excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
+                logger.info(f"             -> Intrinsic excitation {'amplifies' if change < 0 else 'suppresses'} paradoxical response")
     
     if save_results_file:
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
-        print(f"\nResults saved to: {save_results_file}")
+        logger.info(f"\nResults saved to: {save_results_file}")
     
     return results
 
@@ -3993,19 +3998,19 @@ def run_all_ablation_tests(
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
     
-    print("\n" + "="*80)
-    print("ABLATION TEST SUITE")
-    print("="*80)
-    print(f"\nTesting {len(target_populations)} populations with {n_trials} trials each")
-    print(f"Results will be saved to: {output_dir}")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("ABLATION TEST SUITE")
+    logger.info("="*80)
+    logger.info(f"\nTesting {len(target_populations)} populations with {n_trials} trials each")
+    logger.info(f"Results will be saved to: {output_dir}")
+    logger.info("="*80)
     
     all_results = {}
     
     # Test 1: Interneuron-interneuron interactions
-    print("\n\n" + "#"*80)
-    print("# TEST 1: Interneuron-Interneuron Interactions")
-    print("#"*80)
+    logger.info("\n\n" + "#"*80)
+    logger.info("# TEST 1: Interneuron-Interneuron Interactions")
+    logger.info("#"*80)
     results_int_int = test_interneuron_interactions(
         optimization_json_file=optimization_json_file,
         target_populations=target_populations,
@@ -4025,9 +4030,9 @@ def run_all_ablation_tests(
     all_results['interneuron_interactions'] = results_int_int
     
     # Test 2: Excitation to interneurons (key disinhibition test)
-    print("\n\n" + "#"*80)
-    print("# TEST 2: Excitation to Interneurons (Disinhibition Test)")
-    print("#"*80)
+    logger.info("\n\n" + "#"*80)
+    logger.info("# TEST 2: Excitation to Interneurons (Disinhibition Test)")
+    logger.info("#"*80)
     results_exc_int = test_excitation_to_interneurons(
         optimization_json_file=optimization_json_file,
         target_populations=target_populations,
@@ -4047,9 +4052,9 @@ def run_all_ablation_tests(
     all_results['excitation_to_interneurons'] = results_exc_int
     
     # Test 3: Recurrent excitation
-    print("\n\n" + "#"*80)
-    print("# TEST 3: Recurrent Excitation")
-    print("#"*80)
+    logger.info("\n\n" + "#"*80)
+    logger.info("# TEST 3: Recurrent Excitation")
+    logger.info("#"*80)
     results_recurrent = test_recurrent_excitation(
         optimization_json_file=optimization_json_file,
         target_populations=target_populations,
@@ -4069,9 +4074,9 @@ def run_all_ablation_tests(
     all_results['recurrent_excitation'] = results_recurrent
 
     # Test 4: All excitation
-    print("\n\n" + "#"*80)
-    print("# TEST 4: All intrinsic excitation")
-    print("#"*80)
+    logger.info("\n\n" + "#"*80)
+    logger.info("# TEST 4: All intrinsic excitation")
+    logger.info("#"*80)
     results_intrinsic_exc = test_intrinsic_excitation(
         optimization_json_file=optimization_json_file,
         target_populations=target_populations,
@@ -4090,68 +4095,68 @@ def run_all_ablation_tests(
     all_results['intrinsic_excitation'] = results_intrinsic_exc
     
     # Create summary comparison
-    print("\n\n" + "="*80)
-    print("ABLATION TEST SUMMARY")
-    print("="*80)
+    logger.info("\n\n" + "="*80)
+    logger.info("ABLATION TEST SUMMARY")
+    logger.info("="*80)
     
     intensity = intensities[-1]
     
     for target in target_populations:
-        print(f"\n{target.upper()} Stimulation at intensity {intensity}")
-        print("-"*80)
-        print(f"{'Manipulation':<30} {'GC Excited':<15} {'MC Excited':<15} {'Effect':<15}")
-        print("-"*80)
+        logger.info(f"\n{target.upper()} Stimulation at intensity {intensity}")
+        logger.info("-"*80)
+        logger.info(f"{'Manipulation':<30} {'GC Excited':<15} {'MC Excited':<15} {'Effect':<15}")
+        logger.info("-"*80)
         
         # Full network baseline
         full_gc = results_exc_int['full_network'][target][intensity]['gc_excited']
         full_mc = results_exc_int['full_network'][target][intensity]['mc_excited']
-        print(f"{'Full Network (baseline)':<30} {full_gc:>6.1%}          {full_mc:>6.1%}          -")
+        logger.info(f"{'Full Network (baseline)':<30} {full_gc:>6.1%}          {full_mc:>6.1%}          -")
         
         # Test 1: Block interneuron interactions
         test1_gc = results_int_int['blocked_int_int'][target][intensity]['gc_excited']
         test1_mc = results_int_int['blocked_int_int'][target][intensity]['mc_excited']
         change1_gc = (test1_gc - full_gc) / (full_gc + 1e-6)
         change1_mc = (test1_mc - full_mc) / (full_mc + 1e-6)
-        print(f"{'Block Int-Int':<30} {test1_gc:>6.1%}          {test1_mc:>6.1%}          {(change1_gc+change1_mc)/2:>+6.1%}")
+        logger.info(f"{'Block Int-Int':<30} {test1_gc:>6.1%}          {test1_mc:>6.1%}          {(change1_gc+change1_mc)/2:>+6.1%}")
         
         # Test 2: Block excitation to interneurons
         test2_gc = results_exc_int['blocked_exc_to_int'][target][intensity]['gc_excited']
         test2_mc = results_exc_int['blocked_exc_to_int'][target][intensity]['mc_excited']
         change2_gc = (test2_gc - full_gc) / (full_gc + 1e-6)
         change2_mc = (test2_mc - full_mc) / (full_mc + 1e-6)
-        print(f"{'Block Exc->Int (KEY TEST)':<30} {test2_gc:>6.1%}          {test2_mc:>6.1%}          {(change2_gc+change2_mc)/2:>+6.1%}")
+        logger.info(f"{'Block Exc->Int (KEY TEST)':<30} {test2_gc:>6.1%}          {test2_mc:>6.1%}          {(change2_gc+change2_mc)/2:>+6.1%}")
         
         # Test 3: Block recurrent excitation
         test3_gc = results_recurrent['blocked_recurrent'][target][intensity]['gc_excited']
         test3_mc = results_recurrent['blocked_recurrent'][target][intensity]['mc_excited']
         change3_gc = (test3_gc - full_gc) / (full_gc + 1e-6)
         change3_mc = (test3_mc - full_mc) / (full_mc + 1e-6)
-        print(f"{'Block Recurrent':<30} {test3_gc:>6.1%}          {test3_mc:>6.1%}          {(change3_gc+change3_mc)/2:>+6.1%}")
+        logger.info(f"{'Block Recurrent':<30} {test3_gc:>6.1%}          {test3_mc:>6.1%}          {(change3_gc+change3_mc)/2:>+6.1%}")
 
         # Test 3: Block intrinsic excitation (all except MEC)
         test4_gc = results_intrinsic_exc['blocked_intrinsic_exc'][target][intensity]['gc_excited']
         test4_mc = results_intrinsic_exc['blocked_intrinsic_exc'][target][intensity]['mc_excited']
         change4_gc = (test3_gc - full_gc) / (full_gc + 1e-6)
         change4_mc = (test3_mc - full_mc) / (full_mc + 1e-6)
-        print(f"{'Block Intrinsic exc':<30} {test4_gc:>6.1%}          {test4_mc:>6.1%}          {(change4_gc+change3_mc)/2:>+6.1%}")
+        logger.info(f"{'Block Intrinsic exc':<30} {test4_gc:>6.1%}          {test4_mc:>6.1%}          {(change4_gc+change3_mc)/2:>+6.1%}")
         
-        print("\nInterpretation:")
+        logger.info("\nInterpretation:")
         avg_change2 = (change2_gc + change2_mc) / 2
         if avg_change2 < -0.5:
-            print("  STRONG support for disinhibition hypothesis")
-            print("  (>50% reduction when blocking exc. to interneurons)")
+            logger.info("  STRONG support for disinhibition hypothesis")
+            logger.info("  (>50% reduction when blocking exc. to interneurons)")
         elif avg_change2 < -0.3:
-            print("  MODERATE support for disinhibition hypothesis")
-            print("    (30-50% reduction when blocking exc. to interneurons)")
+            logger.info("  MODERATE support for disinhibition hypothesis")
+            logger.info("    (30-50% reduction when blocking exc. to interneurons)")
         else:
-            print("  WEAK support for disinhibition hypothesis")
-            print("    (<30% reduction suggests other mechanisms)")
+            logger.info("  WEAK support for disinhibition hypothesis")
+            logger.info("    (<30% reduction suggests other mechanisms)")
     
     # Save combined results
     combined_file = output_path / "all_ablation_tests.pkl"
     with open(combined_file, 'wb') as f:
         pickle.dump(all_results, f)
-    print(f"\n\nAll results saved to: {combined_file}")
+    logger.info(f"\n\nAll results saved to: {combined_file}")
     
     return all_results
 
@@ -4318,7 +4323,7 @@ def plot_ablation_test_results(all_results: Dict,
                    dpi=300, bbox_inches='tight')
         plt.savefig(save_dir / f'ablation_results_intensity_{intensity}.png', 
                    dpi=300, bbox_inches='tight')
-        print(f"\nSaved ablation plots to {save_dir}")
+        logger.info(f"\nSaved ablation plots to {save_dir}")
     
     plt.show()
 
@@ -4371,15 +4376,15 @@ def test_opsin_expression_levels(
         from dendritic_somatic_transfer import get_default_device
         device = get_default_device()
     
-    print("\n" + "="*80)
-    print("TEST: Opsin Expression Level Dependence")
-    print("="*80)
-    print(f"\nTesting {len(expression_levels)} expression levels:")
-    print(f"  Expression levels: {expression_levels}")
-    print(f"  Trials per condition: {n_trials}")
+    logger.info("\n" + "="*80)
+    logger.info("TEST: Opsin Expression Level Dependence")
+    logger.info("="*80)
+    logger.info(f"\nTesting {len(expression_levels)} expression levels:")
+    logger.info(f"  Expression levels: {expression_levels}")
+    logger.info(f"  Trials per condition: {n_trials}")
     if include_ablations:
-        print(f"  Including key ablation conditions")
-    print("="*80 + "\n")
+        logger.info(f"  Including key ablation conditions")
+    logger.info("="*80 + "\n")
     
     from DG_circuit_dendritic_somatic_transfer import (
         CircuitParams, PerConnectionSynapticParams, OpsinParams
@@ -4410,16 +4415,16 @@ def test_opsin_expression_levels(
               for config_name in ablation_configs.keys()}
     
     for target in target_populations:
-        print(f"\n{'='*60}")
-        print(f"Testing {target.upper()} stimulation")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
         
         for config_name, synaptic_params in ablation_configs.items():
-            print(f"\n{config_name.replace('_', ' ').title()}")
-            print('-'*60)
+            logger.info(f"\n{config_name.replace('_', ' ').title()}")
+            logger.info('-'*60)
             
             for expr_level in expression_levels:
-                print(f"  Expression level: {expr_level:.1f}")
+                logger.info(f"  Expression level: {expr_level:.1f}")
                 
                 # Create opsin parameters with this expression level
                 opsin_params = OpsinParams(
@@ -4493,7 +4498,7 @@ def test_opsin_expression_levels(
     if save_results_file:
         with open(save_results_file, 'wb') as f:
             pickle.dump(results, f)
-        print(f"\nResults saved to: {save_results_file}")
+        logger.info(f"\nResults saved to: {save_results_file}")
     
     return results
 
@@ -4628,7 +4633,7 @@ def plot_expression_level_results(
                    dpi=300, bbox_inches='tight')
         plt.savefig(save_dir / 'expression_level_results.png',
                    dpi=300, bbox_inches='tight')
-        print(f"\nSaved expression level plots to {save_dir}")
+        logger.info(f"\nSaved expression level plots to {save_dir}")
     
     plt.show()
 
@@ -4720,13 +4725,13 @@ def plot_combined_ablation_and_expression(
             # Color interneuron titles differently
             if pop.endswith('_nonexpr'):
                 base_pop = pop.replace('_nonexpr', '')
-                ax.set_title(f'{target.upper()}→{target.upper()}†', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{target.upper()}†', fontsize=10, 
                            fontweight='bold', color='purple')
             elif pop in ['pv', 'sst']:
-                ax.set_title(f'{target.upper()}→{pop.upper()}*', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}*', fontsize=10, 
                            fontweight='bold', color='darkred')
             else:
-                ax.set_title(f'{target.upper()}→{pop.upper()}', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}', fontsize=10, 
                            fontweight='bold')
             
             ax.grid(True, alpha=0.3, axis='y')
@@ -4792,13 +4797,13 @@ def plot_combined_ablation_and_expression(
             # Color interneuron titles differently
             if pop.endswith('_nonexpr'):
                 base_pop = pop.replace('_nonexpr', '')
-                ax.set_title(f'{target.upper()}→{target.upper()}†', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{target.upper()}†', fontsize=10, 
                            fontweight='bold', color='purple')
             elif pop in ['pv', 'sst']:
-                ax.set_title(f'{target.upper()}→{pop.upper()}*', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}*', fontsize=10, 
                            fontweight='bold', color='darkred')
             else:
-                ax.set_title(f'{target.upper()}→{pop.upper()}', fontsize=10, 
+                ax.set_title(f'{target.upper()}->{pop.upper()}', fontsize=10, 
                            fontweight='bold')
             
             ax.grid(True, alpha=0.3)
@@ -4823,7 +4828,7 @@ def plot_combined_ablation_and_expression(
                    dpi=300, bbox_inches='tight')
         plt.savefig(save_dir / 'combined_ablation_expression.png',
                    dpi=300, bbox_inches='tight')
-        print(f"\nSaved combined plot to {save_dir}")
+        logger.info(f"\nSaved combined plot to {save_dir}")
     
     plt.show()
 
@@ -4853,12 +4858,12 @@ def plot_recorded_currents(circuit, recorded_currents, current_analysis,
     stim_end = stim_start + stim_duration
     
     # Current traces for each population
-    print("\nGenerating current trace plots...")
+    logger.info("\nGenerating current trace plots...")
     for pop in ['gc', 'mc', 'pv', 'sst']:
         if pop not in recorded_currents['by_type']:
             continue
         
-        print(f"   - {pop.upper()} current traces")
+        logger.info(f"   - {pop.upper()} current traces")
         fig = vis.plot_current_traces(
             recorded_currents,
             population=pop,
@@ -4870,14 +4875,14 @@ def plot_recorded_currents(circuit, recorded_currents, current_analysis,
         plt.close(fig)
     
     # Current sources for each population
-    print("\nGenerating current source plots...")
+    logger.info("\nGenerating current source plots...")
     for pop in ['gc', 'mc', 'pv', 'sst']:
         if pop not in recorded_currents['by_source']:
             continue
         
         # Only plot if there are sources
         if len(recorded_currents['by_source'][pop]) > 0:
-            print(f"   - {pop.upper()} current sources")
+            logger.info(f"   - {pop.upper()} current sources")
             fig = vis.plot_current_sources(
                 recorded_currents,
                 population=pop,
@@ -4889,7 +4894,7 @@ def plot_recorded_currents(circuit, recorded_currents, current_analysis,
             plt.close(fig)
     
     # Comparison bar plots
-    print("\nGenerating comparison bar plots...")
+    logger.info("\nGenerating comparison bar plots...")
     fig = vis.plot_current_comparison_bar(
         current_analysis,
         target_population=target_population,
@@ -4899,10 +4904,10 @@ def plot_recorded_currents(circuit, recorded_currents, current_analysis,
     plt.close(fig)
     
     # Current heatmaps for key populations
-    print("\nGenerating current heatmaps...")
+    logger.info("\nGenerating current heatmaps...")
     for pop in ['gc', 'mc']:
         for current_type in ['net', 'total_exc', 'total_inh']:
-            print(f"   - {pop.upper()} {current_type} heatmap")
+            logger.info(f"   - {pop.upper()} {current_type} heatmap")
             fig = vis.plot_current_heatmap(
                 recorded_currents,
                 population=pop,
@@ -4933,14 +4938,14 @@ def plot_synaptic_distributions(circuit,
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    print(f"\nGenerating synaptic weight distributions for {target_population.upper()} stimulation:")
-    print(f"  Output directory: {output_path}")
+    logger.info(f"\nGenerating synaptic weight distributions for {target_population.upper()} stimulation:")
+    logger.info(f"  Output directory: {output_path}")
     
     vis = DGCircuitVisualization(circuit)
     
     # Plot weights to each post-synaptic population
     for post_pop in ['gc', 'mc', 'pv', 'sst']:
-        print(f"  Plotting weights to {post_pop.upper()}...")
+        logger.info(f"  Plotting weights to {post_pop.upper()}...")
         
         # 1. Input weight distribution (histogram + violin plots)
         distribution_path = output_path / f'{target_population}_stim_to_{post_pop}_weight_distribution.pdf'
@@ -4954,9 +4959,9 @@ def plot_synaptic_distributions(circuit,
             )
             if fig is not None:
                 plt.close(fig)
-                print(f"  Saved distribution: {distribution_path.name}")
+                logger.info(f"  Saved distribution: {distribution_path.name}")
         except Exception as e:
-            print(f"    Error creating distribution plot: {e}")
+            logger.info(f"    Error creating distribution plot: {e}")
         
         # 2. Weight heatmap by cell
         heatmap_path = output_path / f'{target_population}_stim_to_{post_pop}_weight_heatmap.pdf'
@@ -4968,9 +4973,9 @@ def plot_synaptic_distributions(circuit,
             )
             if fig is not None:
                 plt.close(fig)
-                print(f"  Saved heatmap: {heatmap_path.name}")
+                logger.info(f"  Saved heatmap: {heatmap_path.name}")
         except Exception as e:
-            print(f"  Error creating heatmap: {e}")
+            logger.info(f"  Error creating heatmap: {e}")
         
         # 3. Weight correlation matrix
         correlation_path = output_path / f'{target_population}_stim_to_{post_pop}_weight_correlation.pdf'
@@ -4982,11 +4987,11 @@ def plot_synaptic_distributions(circuit,
             )
             if fig is not None:
                 plt.close(fig)
-                print(f"  Saved correlation: {correlation_path.name}")
+                logger.info(f"  Saved correlation: {correlation_path.name}")
         except Exception as e:
-            print(f"  Error creating correlation plot: {e}")
+            logger.info(f"  Error creating correlation plot: {e}")
     
-    print(f"\nCompleted synaptic weight plotting for {target_population.upper()}")
+    logger.info(f"\nCompleted synaptic weight plotting for {target_population.upper()}")
                 
             
         
@@ -4996,36 +5001,36 @@ def plot_synaptic_distributions(circuit,
 
 def print_current_analysis(current_analysis):
     
-    print("\n" + "-"*80)
-    print("Current analysis summary")
-    print("-"*80)
+    logger.info("\n" + "-"*80)
+    logger.info("Current analysis summary")
+    logger.info("-"*80)
     
     for pop in ['gc', 'mc', 'pv', 'sst']:
         if pop not in current_analysis['baseline']:
             continue
         
-        print(f"\n{pop.upper()}:")
+        logger.info(f"\n{pop.upper()}:")
         
         baseline = current_analysis['baseline'][pop]['by_type']
         stim = current_analysis['stimulation'][pop]['by_type']
         change = current_analysis['change'][pop]['by_type']
         
-        print(f"  Excitatory: {baseline['total_exc']['mean']:>7.2f} → "
+        logger.info(f"  Excitatory: {baseline['total_exc']['mean']:>7.2f} -> "
               f"{stim['total_exc']['mean']:>7.2f} pA "
               f"(Δ = {change['total_exc']['mean']:>+7.2f} pA)")
         
-        print(f"  Inhibitory: {baseline['total_inh']['mean']:>7.2f} → "
+        logger.info(f"  Inhibitory: {baseline['total_inh']['mean']:>7.2f} -> "
               f"{stim['total_inh']['mean']:>7.2f} pA "
               f"(Δ = {change['total_inh']['mean']:>+7.2f} pA)")
         
-        print(f"  Net:        {baseline['net']['mean']:>7.2f} → "
+        logger.info(f"  Net:        {baseline['net']['mean']:>7.2f} -> "
               f"{stim['net']['mean']:>7.2f} pA "
               f"(Δ = {change['net']['mean']:>+7.2f} pA)")
         
         # E/I ratio
         baseline_ei = abs(baseline['total_exc']['mean']) / (abs(baseline['total_inh']['mean']) + 1e-6)
         stim_ei = abs(stim['total_exc']['mean']) / (abs(stim['total_inh']['mean']) + 1e-6)
-        print(f"  E/I Ratio:  {baseline_ei:>7.3f} → {stim_ei:>7.3f}")
+        logger.info(f"  E/I Ratio:  {baseline_ei:>7.3f} -> {stim_ei:>7.3f}")
     
 
 def reconstruct_circuit_from_metadata(metadata: Dict,
@@ -5045,7 +5050,7 @@ def reconstruct_circuit_from_metadata(metadata: Dict,
     if device is None:
         device = get_default_device()
     
-    print("\nReconstructing circuit from saved metadata...")
+    logger.info("\nReconstructing circuit from saved metadata...")
     
     # Extract circuit parameters from metadata
     circuit_config = metadata.get('circuit_params', {})
@@ -5089,10 +5094,10 @@ def reconstruct_circuit_from_metadata(metadata: Dict,
             device=device
         )
     
-    print(f"  Circuit reconstructed with {circuit_params.n_gc} GC, "
+    logger.info(f"  Circuit reconstructed with {circuit_params.n_gc} GC, "
           f"{circuit_params.n_mc} MC, {circuit_params.n_pv} PV, "
           f"{circuit_params.n_sst} SST cells")
-    print(f"  Using seed: {base_seed}")
+    logger.info(f"  Using seed: {base_seed}")
     
     return circuit, opsin_expression_dict
 
@@ -5113,9 +5118,9 @@ def plot_synaptic_weights_from_results(results: Dict,
         optimization_json_file: Optional path to optimization file
         device: Device to create circuit on
     """
-    print("\n" + "="*80)
-    print("Generating Synaptic Weight Distribution Plots")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("Generating Synaptic Weight Distribution Plots")
+    logger.info("="*80)
     
     # Reconstruct circuit
     circuit, opsin_expression_dict = reconstruct_circuit_from_metadata(
@@ -5128,26 +5133,26 @@ def plot_synaptic_weights_from_results(results: Dict,
     weights_base_dir = output_path / 'synaptic_weights'
     weights_base_dir.mkdir(exist_ok=True, parents=True)
     
-    print(f"\nBase output directory: {weights_base_dir}")
+    logger.info(f"\nBase output directory: {weights_base_dir}")
     
     # Plot for each target population
     for target_pop in ['pv', 'sst']:
         if target_pop not in results:
-            print(f"\nSkipping {target_pop.upper()} - no results found")
+            logger.info(f"\nSkipping {target_pop.upper()} - no results found")
             continue
         
         # Use highest intensity for weight visualization
         intensities = sorted(results[target_pop].keys())
         if len(intensities) == 0:
-            print(f"\nSkipping {target_pop.upper()} - no intensities found")
+            logger.info(f"\nSkipping {target_pop.upper()} - no intensities found")
             continue
         
         intensity = intensities[-1]  # Highest intensity
         experiment_data = results[target_pop][intensity]
         
-        print(f"\n{'='*60}")
-        print(f"Processing {target_pop.upper()} stimulation at intensity {intensity}")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing {target_pop.upper()} stimulation at intensity {intensity}")
+        logger.info('='*60)
         
         # Get opsin expression levels
         if 'opsin_expression_mean' in experiment_data:
@@ -5179,9 +5184,9 @@ def plot_synaptic_weights_from_results(results: Dict,
             output_dir=str(target_output_dir)
         )
     
-    print(f"\n{'='*80}")
-    print(f"All synaptic weight plots saved to: {weights_base_dir}")
-    print('='*80)
+    logger.info(f"\n{'='*80}")
+    logger.info(f"All synaptic weight plots saved to: {weights_base_dir}")
+    logger.info('='*80)
 
 
 def plot_currents_from_results(results: Dict,
@@ -5199,9 +5204,9 @@ def plot_currents_from_results(results: Dict,
         optimization_json_file: Optional path to optimization file
         device: Device to create circuit on
     """
-    print("\n" + "="*80)
-    print("Generating Synaptic Current Plots")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("Generating Synaptic Current Plots")
+    logger.info("="*80)
     
     # Check if any results contain current data
     has_current_data = False
@@ -5215,8 +5220,8 @@ def plot_currents_from_results(results: Dict,
                 break
     
     if not has_current_data:
-        print("No current recording data found in results")
-        print("Note: Current recording must be enabled during simulation with --record-currents")
+        logger.info("No current recording data found in results")
+        logger.info("Note: Current recording must be enabled during simulation with --record-currents")
         return
     
     # Reconstruct circuit from metadata
@@ -5235,16 +5240,16 @@ def plot_currents_from_results(results: Dict,
     stim_duration = metadata.get('stim_duration', 1000.0)
     baseline_start = metadata.get('warmup', 500.0)
     
-    print(f"\nStimulation parameters:")
-    print(f"  Baseline: {baseline_start} - {stim_start} ms")
-    print(f"  Stimulation: {stim_start} - {stim_start + stim_duration} ms")
+    logger.info(f"\nStimulation parameters:")
+    logger.info(f"  Baseline: {baseline_start} - {stim_start} ms")
+    logger.info(f"  Stimulation: {stim_start} - {stim_start + stim_duration} ms")
     
     # Plot for each target population and intensity with current data
     for target_pop in ['pv', 'sst']:
         if target_pop not in results:
             continue
         
-        print(f"\nProcessing {target_pop.upper()} stimulation:")
+        logger.info(f"\nProcessing {target_pop.upper()} stimulation:")
         
         for intensity in sorted(results[target_pop].keys()):
             experiment_data = results[target_pop][intensity]
@@ -5261,7 +5266,7 @@ def plot_currents_from_results(results: Dict,
             if recorded_currents is None or current_analysis is None:
                 continue
             
-            print(f"  Plotting currents for intensity {intensity}")
+            logger.info(f"  Plotting currents for intensity {intensity}")
             
             condition_dir = currents_output / f"{target_pop}_intensity_{intensity}"
             condition_dir.mkdir(exist_ok=True, parents=True)
@@ -5277,7 +5282,7 @@ def plot_currents_from_results(results: Dict,
                 output_dir=str(condition_dir)
             )
     
-    print(f"\nSynaptic current plots saved to: {currents_output}")
+    logger.info(f"\nSynaptic current plots saved to: {currents_output}")
     
 
 def analyze_and_plot_weights_by_response(
@@ -5356,19 +5361,19 @@ def analyze_and_plot_weights_by_response(
     if save_path:
         output_dir = Path(save_path) / f'{target_population}_weights_by_response'
         output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\nSaving analysis of weights by response to: {output_dir}")
+        logger.info(f"\nSaving analysis of weights by response to: {output_dir}")
     
     # Analyze and plot for each post-synaptic population
     all_analyses = {}
     all_figures = []
     
-    print(f"\n{'='*60}")
-    print(f"Analyzing synaptic weights by post-synaptic response")
-    print(f"Target: {target_population.upper()} stimulation")
-    print('='*60)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Analyzing synaptic weights by post-synaptic response")
+    logger.info(f"Target: {target_population.upper()} stimulation")
+    logger.info('='*60)
     
     for post_pop in post_populations:
-        print(f"\nAnalyzing weights to {post_pop.upper()}...")
+        logger.info(f"\nAnalyzing weights to {post_pop.upper()}...")
         
         # Analyze
         analysis = vis.analyze_weights_by_response_type(
@@ -5384,9 +5389,9 @@ def analyze_and_plot_weights_by_response(
         all_analyses[post_pop] = analysis
         
         # Print summary
-        print(f"  Excited cells: {analysis['n_excited']}")
-        print(f"  Suppressed cells: {analysis['n_suppressed']}")
-        print(f"  Unchanged cells: {analysis['n_unchanged']}")
+        logger.info(f"  Excited cells: {analysis['n_excited']}")
+        logger.info(f"  Suppressed cells: {analysis['n_suppressed']}")
+        logger.info(f"  Unchanged cells: {analysis['n_unchanged']}")
         
         # Plot
         if save_path:
@@ -5402,9 +5407,9 @@ def analyze_and_plot_weights_by_response(
         if fig is not None:
             all_figures.append(fig)
     
-    print(f"\n{'='*60}")
-    print(f"Completed weights by response analysis")
-    print('='*60)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Completed weights by response analysis")
+    logger.info('='*60)
     
     return all_analyses, all_figures
 
@@ -5447,21 +5452,21 @@ def analyze_synaptic_weights_by_response_from_results(results: Dict,
     # Plot for each target population
     for target_pop in ['pv', 'sst']:
         if target_pop not in results:
-            print(f"\nSkipping {target_pop.upper()} - no results found")
+            logger.info(f"\nSkipping {target_pop.upper()} - no results found")
             continue
         
         # Use highest intensity for weight visualization
         intensities = sorted(results[target_pop].keys())
         if len(intensities) == 0:
-            print(f"\nSkipping {target_pop.upper()} - no intensities found")
+            logger.info(f"\nSkipping {target_pop.upper()} - no intensities found")
             continue
         
         intensity = intensities[-1]  # Highest intensity
         experiment_data = results[target_pop][intensity]
         
-        print(f"\n{'='*60}")
-        print(f"Processing {target_pop.upper()} stimulation at intensity {intensity}")
-        print('='*60)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing {target_pop.upper()} stimulation at intensity {intensity}")
+        logger.info('='*60)
         
         # Create subdirectory for this target population
         target_output_dir = weights_base_dir / f'{target_pop}_stimulation'
@@ -5519,7 +5524,6 @@ def run_nested_effect_size_analysis(
     print("\n" + "="*80)
     print("Nested Bootstrap Effect Size Analysis")
     print("="*80)
-    print(f"Loading results from: {nested_results_file}")
     
     # Load nested experiment results
     nested_results = nested_data['nested_results']
@@ -5606,7 +5610,7 @@ def run_nested_effect_size_analysis(
             
             # Analyze each post-synaptic population
             for post_pop in post_populations:
-                print(f"\n    Analyzing {target.upper()} → {post_pop.upper()}")
+                print(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
                 
                 # Run bootstrap analysis
                 analysis_results = analyze_effect_size_all_sources_nested(
@@ -6086,8 +6090,8 @@ def print_cross_population_summary(
 
     
 if __name__ == "__main__":
-    print("Dentate Gyrus Circuit with Anatomical Connectivity")
-    print("=========================================================")
+    logger.info("Dentate Gyrus Circuit with Anatomical Connectivity")
+    logger.info("=========================================================")
     
     # Parse command line arguments
     import argparse
@@ -6108,6 +6112,10 @@ Examples:
       --load-ablation-results protocol/ablation_tests/all_ablation_tests.pkl \\
       --load-expression-results protocol/expression_tests/expression_results.pkl
         """)
+    
+    parser.add_argument('--output-dir', type=str, default='protocol',
+                        metavar='DIR',
+                        help='Output plots and save files to directory')
     
     # Execution mode
     parser.add_argument('--plot-only', action='store_true',
@@ -6265,7 +6273,7 @@ Examples:
             parser.error("--plot-only requires at least one of: --load-comparative-results, "
                          "--load-ablation-results, --load-expression-results, --load-nested-results")
             
-    output_dir = "protocol"
+    output_dir = args.output_dir
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
     
@@ -6283,25 +6291,25 @@ Examples:
         
         # Load comparative results
         if args.load_comparative_results:
-            print(f"\nLoading comparative results from: {args.load_comparative_results}")
+            logger.info(f"\nLoading comparative results from: {args.load_comparative_results}")
             results, connectivity_analysis, conductance_analysis, metadata = \
                 load_experiment_results(args.load_comparative_results)
         
         # Load ablation results
         if args.load_ablation_results:
-            print(f"\nLoading ablation results from: {args.load_ablation_results}")
+            logger.info(f"\nLoading ablation results from: {args.load_ablation_results}")
             with open(args.load_ablation_results, 'rb') as f:
                 ablation_results = pickle.load(f)
         
         # Load expression results
         if args.load_expression_results:
-            print(f"\nLoading expression results from: {args.load_expression_results}")
+            logger.info(f"\nLoading expression results from: {args.load_expression_results}")
             with open(args.load_expression_results, 'rb') as f:
                 expression_results = pickle.load(f)
         
         # Plot comparative results
         if results is not None:
-            print("\nPlotting comparative experiment results...")
+            logger.info("\nPlotting comparative experiment results...")
             for intensity in [0.5, 1.0, 1.5]:
                 if intensity in results['pv']:
                     plot_comparative_experiment_results(
@@ -6322,7 +6330,7 @@ Examples:
         
         # Plot ablation results
         if ablation_results is not None:
-            print("\nPlotting ablation test results...")
+            logger.info("\nPlotting ablation test results...")
             for intensity in [0.5, 1.0, 1.5]:
                 # Check if this intensity was tested
                 try:
@@ -6338,7 +6346,7 @@ Examples:
         
         # Plot expression results
         if expression_results is not None:
-            print("\nPlotting expression level results...")
+            logger.info("\nPlotting expression level results...")
             plot_expression_level_results(
                 expression_results,
                 save_path=str(output_path / "expression_tests")
@@ -6346,7 +6354,7 @@ Examples:
         
         # Plot combined figure if we have both ablation and expression results
         if ablation_results is not None and expression_results is not None:
-            print("\nPlotting combined ablation and expression analysis...")
+            logger.info("\nPlotting combined ablation and expression analysis...")
             plot_combined_ablation_and_expression(
                 ablation_results,
                 expression_results,
@@ -6374,7 +6382,7 @@ Examples:
 
         # Statistical testing with bootstrap (new)
         if args.test_weights_by_response and results is not None and metadata is not None:
-            print("\nPerforming statistical testing of weights by response...")
+            logger.info("\nPerforming statistical testing of weights by response...")
 
             # Reconstruct circuit
             circuit, _ = reconstruct_circuit_from_metadata(
@@ -6397,7 +6405,7 @@ Examples:
 
                 intensity = intensities[-1]
 
-                print(f"\n  Testing {target_pop.upper()} stimulation at intensity {intensity}...")
+                logger.info(f"\n  Testing {target_pop.upper()} stimulation at intensity {intensity}...")
 
                 # Run statistical analysis
                 response_analysis = analyze_weights_by_average_response(
@@ -6432,7 +6440,7 @@ Examples:
         nested_results = None
 
         if args.load_nested_results:
-            print(f"\nLoading nested experiment results from: {args.load_nested_results}")
+            logger.info(f"\nLoading nested experiment results from: {args.load_nested_results}")
             with open(args.load_nested_results, 'rb') as f:
                 nested_results = pickle.load(f)
 
@@ -6447,7 +6455,7 @@ Examples:
                     intensities = sorted(nested_results['metadata']['intensities'])
 
             if args.plot_variance_decomposition:
-                print("\nPlotting variance decomposition...")
+                logger.info("\nPlotting variance decomposition...")
                 plot_variance_decomposition(
                     nested_results['variance_analysis'],
                     nested_results['regime_classification'],
@@ -6455,7 +6463,7 @@ Examples:
                 )
 
             if args.plot_connectivity_variance:
-                print("\nPlotting connectivity instance variance...")
+                logger.info("\nPlotting connectivity instance variance...")
                 intensities = None
                 if 'metadata' in nested_results and 'intensities' in nested_results['metadata']:
                     intensities = sorted(nested_results['metadata']['intensities'])
@@ -6468,7 +6476,7 @@ Examples:
                 )
 
             if args.plot_connectivity_variance_details:
-                print("\nPlotting detailed connectivity instance variance...")
+                logger.info("\nPlotting detailed connectivity instance variance...")
 
                 intensity = intensities[-1]
                 
@@ -6516,11 +6524,9 @@ Examples:
             
         sys.exit(0)
 
-        
-        
-    print("\n" + "="*80)
-    print("Executing all experiments")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("Executing all experiments")
+    logger.info("="*80)
     
     # Auto-detect device or use specified
     if args.device is None:
@@ -6537,10 +6543,10 @@ Examples:
             gradient_high=args.adaptive_gradient_high,
         )
 
-    print(f"\nUsing device: {device}")
+    logger.info(f"\nUsing device: {device}")
     if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(device)}")
-        print(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
+        logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
+        logger.info(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
         
     if args.nested_experiment:
 
@@ -6581,7 +6587,7 @@ Examples:
 
         # Generate variance decomposition plots
         if args.plot_variance_decomposition:
-            print("\nGenerating variance decomposition plots...")
+            logger.info("\nGenerating variance decomposition plots...")
             plot_variance_decomposition(
                 nested_results['variance_analysis'],
                 nested_results['regime_classification'],
@@ -6598,14 +6604,14 @@ Examples:
         sys.exit(0)
         
     
-    print(f"Number of trials: {args.n_trials}")
-    print(f"Base seed: {args.base_seed}")
-    print(f"Auto-save: {not args.no_auto_save}")
+    logger.info(f"Number of trials: {args.n_trials}")
+    logger.info(f"Base seed: {args.base_seed}")
+    logger.info(f"Auto-save: {not args.no_auto_save}")
 
     # Run main comparative experiment
-    print("\n" + "#"*80)
-    print("# Comparative PV vs SST Stimulation")
-    print("#"*80)
+    logger.info("\n" + "#"*80)
+    logger.info("# Comparative PV vs SST Stimulation")
+    logger.info("#"*80)
     
     
     experiment, results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
@@ -6639,19 +6645,19 @@ Examples:
 
     # Print comparative results summary
     mec_conn = connectivity_analysis['mec_connectivity']
-    print(f"\nMEC Connectivity Summary:")
-    print(f"  MEC -> PV: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
-    print(f"  MEC -> GC: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
-    print(f"  MEC -> MC: {mec_conn['mec_to_mc']}")
-    print(f"  MEC -> SST: {mec_conn['mec_to_sst']}")
+    logger.info(f"\nMEC Connectivity Summary:")
+    logger.info(f"  MEC -> PV: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
+    logger.info(f"  MEC -> GC: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
+    logger.info(f"  MEC -> MC: {mec_conn['mec_to_mc']}")
+    logger.info(f"  MEC -> SST: {mec_conn['mec_to_sst']}")
 
     for target in ['pv', 'sst']:
-        print(f"\n{target.upper()} Stimulation Results (n={args.n_trials} trials):")
-        print("-" * 50)
+        logger.info(f"\n{target.upper()} Stimulation Results (n={args.n_trials} trials):")
+        logger.info("-" * 50)
 
         for intensity in [0.5, 1.0, 1.5]:
             analysis = results[target][intensity]
-            print(f"\nIntensity {intensity}:")
+            logger.info(f"\nIntensity {intensity}:")
 
             for pop in ['gc', 'mc', 'pv', 'sst']:
                 if f'{pop}_excited' in analysis:
@@ -6663,16 +6669,16 @@ Examples:
                     mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
                     mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
 
-                    print(f"  {pop.upper()}:")
-                    print(f"    Excited: {excited:.2f} +/- {excited_std:.2f}")
-                    print(f"    Inhibited: {inhibited:.2f}")
-                    print(f"    Rate: {mean_baseline_rate:.1f} -> {mean_stim_rate:.1f} Hz")
-                    print(f"    Change: {mean_change:.2f} +/- {mean_change_std:.2f} Hz")
+                    logger.info(f"  {pop.upper()}:")
+                    logger.info(f"    Excited: {excited:.2f} +/- {excited_std:.2f}")
+                    logger.info(f"    Inhibited: {inhibited:.2f}")
+                    logger.info(f"    Rate: {mean_baseline_rate:.1f} -> {mean_stim_rate:.1f} Hz")
+                    logger.info(f"    Change: {mean_change:.2f} +/- {mean_change_std:.2f} Hz")
 
     plotted_synaptic_weights = False
                     
     # Plot comparative results
-    print("\nGenerating comparative experiment plots...")
+    logger.info("\nGenerating comparative experiment plots...")
     for intensity in [0.5, 1.0, 1.5]:
         plot_comparative_experiment_results(
             results, connectivity_analysis, 
@@ -6725,9 +6731,9 @@ Examples:
                 # Create subdirectory for this target population
                 target_output_dir = weights_base_dir / f'{target_pop}_stimulation'
 
-                print(f"\n{'='*60}")
-                print(f"Plotting synaptic weights for {target_pop.upper()} stimulation")
-                print('='*60)
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Plotting synaptic weights for {target_pop.upper()} stimulation")
+                logger.info('='*60)
 
                 # Plot with proper directory structure
                 plot_synaptic_distributions(
@@ -6738,14 +6744,14 @@ Examples:
                 )
 
             plotted_synaptic_weights = True
-            print(f"\nAll synaptic weight plots saved to: {weights_base_dir}")
+            logger.info(f"\nAll synaptic weight plots saved to: {weights_base_dir}")
 
 
     # Visualization-based analysis of weights
     if args.plot_weights_by_response and not args.plot_only:
-        print("\n" + "#"*80)
-        print("# Synaptic Weight Distribution by Response Type")
-        print("#"*80)
+        logger.info("\n" + "#"*80)
+        logger.info("# Synaptic Weight Distribution by Response Type")
+        logger.info("#"*80)
 
         # Create output directory
         weights_viz_output = output_path / "weights_by_response_viz"
@@ -6762,9 +6768,9 @@ Examples:
             intensity = intensities[-1]
             experiment_data = results[target_pop][intensity]
 
-            print(f"\n{'='*60}")
-            print(f"Visualizing {target_pop.upper()} stimulation at intensity {intensity}")
-            print('='*60)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Visualizing {target_pop.upper()} stimulation at intensity {intensity}")
+            logger.info('='*60)
 
             # Get opsin expression for this target
             opsin_expression_array = experiment_data['opsin_expression_mean']
@@ -6796,9 +6802,9 @@ Examples:
 
     # Statistical testing with bootstrap
     if args.test_weights_by_response and not args.plot_only:
-        print("\n" + "#"*80)
-        print("# Statistical Testing: Weights by Response")
-        print("#"*80)
+        logger.info("\n" + "#"*80)
+        logger.info("# Statistical Testing: Weights by Response")
+        logger.info("#"*80)
 
         # Create output directory
         weights_stats_output = output_path / "weights_statistical_tests"
@@ -6808,9 +6814,9 @@ Examples:
         all_statistical_analyses = {}
 
         for target_pop in ['pv', 'sst']:
-            print(f"\n{'='*60}")
-            print(f"Statistical testing for {target_pop.upper()} stimulation")
-            print('='*60)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Statistical testing for {target_pop.upper()} stimulation")
+            logger.info('='*60)
 
             # Use highest intensity
             intensities = sorted(results[target_pop].keys())
@@ -6838,7 +6844,7 @@ Examples:
             all_statistical_analyses[target_pop] = response_analysis
 
             # Generate plots
-            print(f"\nGenerating statistical plots for {target_pop.upper()}...")
+            logger.info(f"\nGenerating statistical plots for {target_pop.upper()}...")
             fig = plot_weights_by_average_response(
                 response_analysis,
                 target_population=target_pop,
@@ -6848,9 +6854,9 @@ Examples:
             plt.close(fig)
 
             # Print mechanistic interpretation
-            print(f"\n{'='*60}")
-            print(f"Mechanistic Interpretation for {target_pop.upper()} Stimulation:")
-            print('='*60)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Mechanistic Interpretation for {target_pop.upper()} Stimulation:")
+            logger.info('='*60)
 
             for post_pop in ['gc', 'mc', 'pv', 'sst']:
                 if post_pop == target_pop:
@@ -6861,21 +6867,21 @@ Examples:
 
                 stats = response_analysis[post_pop]['statistics']
 
-                print(f"\n{post_pop.upper()} cells:")
+                logger.info(f"\n{post_pop.upper()} cells:")
 
                 # Check direct inhibition from target
                 if target_pop in stats and not np.isnan(stats[target_pop]['mann_whitney_p']):
                     target_stats = stats[target_pop]
                     if target_stats['bonferroni_significant']:
                         if target_stats['cohens_d'] < 0:
-                            print(f"  Excited cells receive LESS direct inhibition from {target_pop.upper()}")
-                            print(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
+                            logger.info(f"  Excited cells receive LESS direct inhibition from {target_pop.upper()}")
+                            logger.info(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
                                   f"[{target_stats['cohens_d_ci_lower']:.3f}, {target_stats['cohens_d_ci_upper']:.3f}]")
-                            print(f"    Δ = {target_stats['mean_diff']:.3f} nS "
+                            logger.info(f"    Δ = {target_stats['mean_diff']:.3f} nS "
                                   f"[{target_stats['mean_diff_ci_lower']:.3f}, {target_stats['mean_diff_ci_upper']:.3f}]")
                         else:
-                            print(f"  Excited cells receive MORE direct inhibition from {target_pop.upper()}")
-                            print(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
+                            logger.info(f"  Excited cells receive MORE direct inhibition from {target_pop.upper()}")
+                            logger.info(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
                                   f"[{target_stats['cohens_d_ci_lower']:.3f}, {target_stats['cohens_d_ci_upper']:.3f}]")
 
                 # Check other significant sources
@@ -6885,26 +6891,26 @@ Examples:
                                       and stats[s]['bonferroni_significant']]
 
                 if significant_sources:
-                    print(f"  Other significant differences:")
+                    logger.info(f"  Other significant differences:")
                     for source in significant_sources:
                         s = stats[source]
                         direction = "MORE" if s['cohens_d'] > 0 else "LESS"
-                        print(f"    {source.upper()}: {direction} input")
-                        print(f"      d = {s['cohens_d']:.3f} [{s['cohens_d_ci_lower']:.3f}, {s['cohens_d_ci_upper']:.3f}], "
+                        logger.info(f"    {source.upper()}: {direction} input")
+                        logger.info(f"      d = {s['cohens_d']:.3f} [{s['cohens_d_ci_lower']:.3f}, {s['cohens_d_ci_upper']:.3f}], "
                               f"Δ = {s['mean_diff']:.3f} nS")
 
         # Save all statistical analyses
         stats_file = weights_stats_output / "statistical_analysis_results.pkl"
         with open(stats_file, 'wb') as f:
             pickle.dump(all_statistical_analyses, f)
-        print(f"\nStatistical analysis results saved to: {stats_file}")
+        logger.info(f"\nStatistical analysis results saved to: {stats_file}")
 
         # Generate cross-population summary
-        print(f"\n{'='*60}")
-        print("Cross-Population Summary: Direct Inhibition Effects")
-        print('='*60)
-        print(f"\n{'Target':<8} {'Post':<6} {'Cohen d':<25} {'Mean Diff (nS)':<25} {'Sig':<5}")
-        print(f"{'-'*8} {'-'*6} {'-'*25} {'-'*25} {'-'*5}")
+        logger.info(f"\n{'='*60}")
+        logger.info("Cross-Population Summary: Direct Inhibition Effects")
+        logger.info('='*60)
+        logger.info(f"\n{'Target':<8} {'Post':<6} {'Cohen d':<25} {'Mean Diff (nS)':<25} {'Sig':<5}")
+        logger.info(f"{'-'*8} {'-'*6} {'-'*25} {'-'*25} {'-'*5}")
 
         for target_pop in ['pv', 'sst']:
             if target_pop not in all_statistical_analyses:
@@ -6922,13 +6928,13 @@ Examples:
                     diff_str = f"{s['mean_diff']:>6.3f} [{s['mean_diff_ci_lower']:>6.3f}, {s['mean_diff_ci_upper']:>6.3f}]"
                     sig = '***' if s['bonferroni_significant'] else ('*' if s['significant'] else 'n.s.')
 
-                    print(f"{target_pop.upper():<8} {post_pop.upper():<6} {d_str:<25} {diff_str:<25} {sig:<5}")
+                    logger.info(f"{target_pop.upper():<8} {post_pop.upper():<6} {d_str:<25} {diff_str:<25} {sig:<5}")
         
             
     # Run ablation tests
-    print("\n" + "#"*80)
-    print("# Ablation Tests")
-    print("#"*80)
+    logger.info("\n" + "#"*80)
+    logger.info("# Ablation Tests")
+    logger.info("#"*80)
     
     ablation_output = output_path / "ablation_tests"
     ablation_results = run_all_ablation_tests(
@@ -6954,7 +6960,7 @@ Examples:
     )
     
     # Plot ablation results
-    print("\nGenerating ablation test plots...")
+    logger.info("\nGenerating ablation test plots...")
     for intensity in [0.5, 1.0, 1.5]:
         plot_ablation_test_results(
             ablation_results,
@@ -6963,9 +6969,9 @@ Examples:
         )
     
     # Run expression level test
-    print("\n" + "#"*80)
-    print("# Opsin Expression Level Test")
-    print("#"*80)
+    logger.info("\n" + "#"*80)
+    logger.info("# Opsin Expression Level Test")
+    logger.info("#"*80)
     
     expression_output = output_path / "expression_tests"
     expression_output.mkdir(exist_ok=True)
@@ -6996,14 +7002,14 @@ Examples:
     )
     
     # Plot expression level results
-    print("\nGenerating expression level plots...")
+    logger.info("\nGenerating expression level plots...")
     plot_expression_level_results(
         expression_results,
         save_path=str(expression_output)
     )
     
     # Create combined analysis plot
-    print("\nGenerating combined analysis figure...")
+    logger.info("\nGenerating combined analysis figure...")
     plot_combined_ablation_and_expression(
         ablation_results,
         expression_results,
@@ -7012,11 +7018,11 @@ Examples:
     )
     
     # Final summary
-    print("\n" + "="*80)
-    print("Experiments complete")
-    print("="*80)
-    print(f"\nResults saved to:")
-    print(f"  Comparative: {output_path}/")
-    print(f"  Ablation: {ablation_output}/")
-    print(f"  Expression: {expression_output}/")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("Experiments complete")
+    logger.info("="*80)
+    logger.info(f"\nResults saved to:")
+    logger.info(f"  Comparative: {output_path}/")
+    logger.info(f"  Ablation: {ablation_output}/")
+    logger.info(f"  Expression: {expression_output}/")
+    logger.info("="*80)
