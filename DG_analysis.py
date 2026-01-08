@@ -831,7 +831,7 @@ def cmd_nested_weights_analysis(args):
     # Determine intensities and populations to analyze
     target_populations = args.target_populations or ['pv', 'sst']
     post_populations = args.post_populations or ['gc', 'mc', 'pv', 'sst']
-    source_populations = args.source_populations or ['pv', 'sst', 'mc', 'mec']
+    source_populations = args.source_populations or ['gc', 'mc', 'pv', 'sst', 'mec']
     
     if args.intensities is None:
         intensities = metadata['intensities']
@@ -1391,7 +1391,7 @@ Examples:
                                 nargs='+',
                                 default=None,
                                 metavar='POP',
-                                help='Source populations for weight analysis (default: pv sst mc mec)')
+                                help='Source populations for weight analysis (default: gc pv sst mc mec)')
     parser_weights.add_argument('--intensities',
                                 type=float,
                                 nargs='+',
