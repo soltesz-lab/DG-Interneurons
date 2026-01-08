@@ -669,7 +669,6 @@ def plot_weights_by_average_response_nested(
             ax.set_xticklabels([f'C{i}' for i in range(n_conn)], fontsize=8)
     
     # Panel B: Mean weights with between-connectivity error bars
-# Panel B: Mean weights with between-connectivity error bars
     for source_idx, source_pop in enumerate(source_populations):
         ax = fig.add_subplot(gs[1, source_idx])
         
@@ -748,6 +747,9 @@ def plot_weights_by_average_response_nested(
     
     y_positions = np.arange(n_sources)
     
+    # Collect x-axis bounds to properly position labels
+    x_min, x_max = np.inf, -np.inf
+    
     for i, source_pop in enumerate(source_populations):
         boot_result = bootstrap_results[source_pop]
         
@@ -756,6 +758,10 @@ def plot_weights_by_average_response_nested(
             ci_lower = boot_result['ci_lower']
             ci_upper = boot_result['ci_upper']
             p_val = boot_result['p_value']
+            
+            # Update x-axis bounds
+            x_min = min(x_min, ci_lower)
+            x_max = max(x_max, ci_upper)
             
             # Color by significance
             color = 'red' if p_val < 0.001 else ('orange' if p_val < 0.05 else 'gray')
@@ -778,19 +784,25 @@ def plot_weights_by_average_response_nested(
             else:
                 stars = 'n.s.'
             
-            # Annotation
-            ax_forest.text(ci_upper + 0.02, y_positions[i],
-                          f"{mean_val:.3f} [{ci_lower:.3f}, {ci_upper:.3f}] {stars}",
-                          va='center', fontsize=9)
+            # Annotation - use axes transform for x position to prevent shifting
+            # Position text at right edge of plot (95% of width)
+            ax_forest.text(0.95, y_positions[i],
+                           f"{mean_val:.3f} [{ci_lower:.3f}, {ci_upper:.3f}] {stars}",
+                           va='center', ha='right', fontsize=9,
+                           transform=ax_forest.get_yaxis_transform())
     
+    # Set x-axis limits with padding
+    if np.isfinite(x_min) and np.isfinite(x_max):
+        x_range = x_max - x_min
+        ax_forest.set_xlim(x_min - 0.1 * x_range, x_max + 0.1 * x_range)
     ax_forest.axvline(0, color='black', linestyle='--', alpha=0.5, zorder=1)
     ax_forest.set_yticks(y_positions)
     ax_forest.set_yticklabels([f'{s.upper()} $\\rightarrow$ {post_pop.upper()}' 
                                for s in source_populations], fontsize=10)
     ax_forest.set_xlabel('Weight Difference: Excited - Suppressed (nS)\n(Bootstrap 95% CI)',
-                        fontsize=11, fontweight='bold')
+                         fontsize=11, fontweight='bold')
     ax_forest.set_title('Between-Connectivity Weight Differences',
-                       fontsize=12, fontweight='bold')
+                        fontsize=12, fontweight='bold')
     ax_forest.grid(True, alpha=0.3, axis='x')
     
     # Panel D: Bootstrap distributions
@@ -803,17 +815,17 @@ def plot_weights_by_average_response_nested(
             bootstrap_dist = boot_result['bootstrap_distribution']
             
             ax.hist(bootstrap_dist, bins=50, color='steelblue',
-                   alpha=0.7, edgecolor='black')
+                    alpha=0.7, edgecolor='black')
             
             # Mark observed mean
             ax.axvline(boot_result['mean'], color='red',
-                      linestyle='--', linewidth=2, label='Observed', zorder=3)
+                       linestyle='--', linewidth=2, label='Observed', zorder=3)
             
             # Mark CI bounds
             ax.axvline(boot_result['ci_lower'], color='orange',
-                      linestyle=':', linewidth=2, zorder=3)
+                       linestyle=':', linewidth=2, zorder=3)
             ax.axvline(boot_result['ci_upper'], color='orange',
-                      linestyle=':', linewidth=2, label='95% CI', zorder=3)
+                       linestyle=':', linewidth=2, label='95% CI', zorder=3)
             
             # Mark zero
             ax.axvline(0, color='black', linestyle='--', alpha=0.5, zorder=2)
@@ -955,3 +967,284 @@ def plot_connectivity_weight_comparison(
         print(f"Saved connectivity comparison plot to: {save_path}")
     
     return fig
+
+
+def plot_summary_forest_plot_all_targets(
+    analysis_results_by_target: Dict[str, Dict],
+    stimulated_population: str,
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (14, 10)
+) -> plt.Figure:
+    """
+    Create unified forest plot showing weight differences across all postsynaptic targets
+    
+    This function consolidates results from multiple nested weight analyses
+    (one per postsynaptic population) into a single comprehensive forest plot.
+    
+    Args:
+        analysis_results_by_target: Dict mapping postsynaptic population names to
+            their respective analysis results from analyze_weights_by_average_response_nested()
+            e.g., {'gc': gc_analysis_results, 'mc': mc_analysis_results, ...}
+        stimulated_population: Name of stimulated population (for title)
+        save_path: Optional path to save figure
+        figsize: Figure size (width, height)
+        
+    Returns:
+        matplotlib Figure object
+        
+    Example:
+        >>> # After running nested analysis for each target
+        >>> gc_results = analyze_weights_by_average_response_nested(
+        ...     nested_results, circuit, 'pv', 'gc', source_pops, ...)
+        >>> mc_results = analyze_weights_by_average_response_nested(
+        ...     nested_results, circuit, 'pv', 'mc', source_pops, ...)
+        >>> 
+        >>> # Create summary plot
+        >>> fig = plot_summary_forest_plot_all_targets(
+        ...     {'gc': gc_results, 'mc': mc_results, 'pv': pv_results, 'sst': sst_results},
+        ...     stimulated_population='pv',
+        ...     save_path='summary_forest_plot.pdf'
+        ... )
+    """
+    # Organize data: for each (source, target) pair, extract bootstrap results
+    data_rows = []
+    
+    for target_pop, analysis_results in analysis_results_by_target.items():
+        bootstrap_results = analysis_results['bootstrap_results']
+        
+        for source_pop, boot_result in bootstrap_results.items():
+            if not np.isnan(boot_result['mean']):
+                data_rows.append({
+                    'source': source_pop,
+                    'target': target_pop,
+                    'mean': boot_result['mean'],
+                    'ci_lower': boot_result['ci_lower'],
+                    'ci_upper': boot_result['ci_upper'],
+                    'p_value': boot_result['p_value'],
+                    'n_connectivity': boot_result['n_connectivity']
+                })
+    
+    if len(data_rows) == 0:
+        print("Warning: No valid data to plot in summary forest plot")
+        return None
+    
+    # Sort by target then source for organized display
+    data_rows = sorted(data_rows, key=lambda x: (x['target'], x['source']))
+    
+    n_rows = len(data_rows)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    y_positions = np.arange(n_rows)
+    
+    # Define colors by significance
+    def get_color(p_val):
+        if p_val < 0.001:
+            return 'red'
+        elif p_val < 0.01:
+            return 'darkorange'
+        elif p_val < 0.05:
+            return 'orange'
+        else:
+            return 'gray'
+    
+    def get_stars(p_val):
+        if p_val < 0.001:
+            return '***'
+        elif p_val < 0.01:
+            return '**'
+        elif p_val < 0.05:
+            return '*'
+        else:
+            return 'n.s.'
+    
+    # Track x-axis bounds
+    x_min, x_max = np.inf, -np.inf
+    
+    # Plot each row
+    for i, row_data in enumerate(data_rows):
+        mean_val = row_data['mean']
+        ci_lower = row_data['ci_lower']
+        ci_upper = row_data['ci_upper']
+        p_val = row_data['p_value']
+        
+        # Update bounds
+        x_min = min(x_min, ci_lower)
+        x_max = max(x_max, ci_upper)
+        
+        color = get_color(p_val)
+        stars = get_stars(p_val)
+        
+        # Plot point estimate
+        ax.plot(mean_val, y_positions[i], 'o',
+                color=color, markersize=10, zorder=3)
+        
+        # Plot CI
+        ax.plot([ci_lower, ci_upper], [y_positions[i], y_positions[i]],
+                '-', color=color, linewidth=2.5, zorder=2)
+        
+        # Add text annotation with statistics
+        # Position at 95% of x-axis width using transform
+        ax.text(0.95, y_positions[i],
+                f"{mean_val:.3f} [{ci_lower:.3f}, {ci_upper:.3f}] {stars}",
+                va='center', ha='right', fontsize=8,
+                transform=ax.get_yaxis_transform())
+    
+    # Set x-axis limits with padding
+    if np.isfinite(x_min) and np.isfinite(x_max):
+        x_range = x_max - x_min
+        ax.set_xlim(x_min - 0.15 * x_range, x_max + 0.15 * x_range)
+    
+    # Reference line at zero
+    ax.axvline(0, color='black', linestyle='--', alpha=0.5, zorder=1)
+    
+    # Y-axis labels: "SOURCE → TARGET"
+    y_labels = [f"{row['source'].upper()} $\\rightarrow$ {row['target'].upper()}"
+                for row in data_rows]
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(y_labels, fontsize=10)
+    
+    # Add horizontal lines to separate targets
+    target_boundaries = []
+    current_target = data_rows[0]['target']
+    for i, row in enumerate(data_rows[1:], 1):
+        if row['target'] != current_target:
+            target_boundaries.append(i - 0.5)
+            current_target = row['target']
+    
+    for boundary in target_boundaries:
+        ax.axhline(boundary, color='black', linestyle='-', alpha=0.3, linewidth=1)
+    
+    # Labels and title
+    ax.set_xlabel('Weight Difference: Excited - Suppressed (nS)\n(Bootstrap 95% CI)',
+                  fontsize=12, fontweight='bold')
+    ax.set_title(f'Synaptic Weight Differences Across All Targets\n'
+                f'{stimulated_population.upper()} Stimulation',
+                fontsize=14, fontweight='bold')
+    
+    # Grid
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    # Add legend for significance levels
+    legend_elements = [
+        mpatches.Patch(color='red', label='p < 0.001 (***)'),
+        mpatches.Patch(color='darkorange', label='p < 0.01 (**)'),
+        mpatches.Patch(color='orange', label='p < 0.05 (*)'),
+        mpatches.Patch(color='gray', label='n.s.')
+    ]
+    ax.legend(handles=legend_elements, loc='lower right', 
+              fontsize=9, title='Significance', title_fontsize=10)
+    
+    # Add sample size note
+    n_conn_values = set(row['n_connectivity'] for row in data_rows)
+    if len(n_conn_values) == 1:
+        n_conn_text = f"N = {n_conn_values.pop()} connectivity instances"
+    else:
+        n_conn_text = f"N = {min(n_conn_values)}-{max(n_conn_values)} connectivity instances"
+    
+    ax.text(0.02, 0.98, n_conn_text,
+            transform=ax.transAxes, fontsize=9,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved summary forest plot to: {save_path}")
+    
+    return fig
+
+
+def create_summary_forest_plots_batch(
+    nested_results: List,
+    circuit,
+    stimulated_population: str,
+    target_populations: List[str],
+    source_populations: List[str],
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    output_dir: str,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    n_bootstrap: int = 10000,
+    random_seed: Optional[int] = None
+):
+    """
+    Batch function to run nested weight analysis for all targets and create summary plot
+    
+    Args:
+        nested_results: List of NestedTrialResult objects
+        circuit: DentateCircuit instance
+        stimulated_population: Stimulated population name
+        target_populations: List of postsynaptic populations to analyze
+        source_populations: List of source populations
+        stim_start: Stimulation start time (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Baseline period start (ms)
+        output_dir: Directory to save outputs
+        threshold_std: Classification threshold
+        expression_threshold: Opsin expression threshold
+        n_bootstrap: Number of bootstrap samples
+        random_seed: Random seed
+        
+    Returns:
+        tuple: (analysis_results_by_target, summary_fig)
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    analysis_results_by_target = {}
+    
+    # Run analysis for each target population
+    print(f"\n{'='*80}")
+    print(f"Running nested weight analysis for all postsynaptic targets")
+    print(f"Stimulated population: {stimulated_population.upper()}")
+    print('='*80)
+    
+    for target_pop in target_populations:
+        print(f"\n--- Analyzing {target_pop.upper()} target population ---")
+        
+        analysis_results = analyze_weights_by_average_response_nested(
+            nested_results=nested_results,
+            circuit=circuit,
+            target_population=stimulated_population,
+            post_population=target_pop,
+            source_populations=source_populations,
+            stim_start=stim_start,
+            stim_duration=stim_duration,
+            warmup=warmup,
+            threshold_std=threshold_std,
+            expression_threshold=expression_threshold,
+            n_bootstrap=n_bootstrap,
+            random_seed=random_seed
+        )
+        
+        analysis_results_by_target[target_pop] = analysis_results
+        
+        # Save individual target plot
+        individual_plot_path = output_path / f'{stimulated_population}_to_{target_pop}_nested_weights.pdf'
+        plot_weights_by_average_response_nested(
+            analysis_results,
+            save_path=individual_plot_path
+        )
+    
+    # Create summary forest plot
+    print(f"\n{'='*80}")
+    print(f"Creating summary forest plot across all targets")
+    print('='*80)
+    
+    summary_plot_path = output_path / f'{stimulated_population}_all_targets_summary_forest.pdf'
+    summary_fig = plot_summary_forest_plot_all_targets(
+        analysis_results_by_target=analysis_results_by_target,
+        stimulated_population=stimulated_population,
+        save_path=summary_plot_path
+    )
+    
+    print(f"\nBatch analysis complete. Outputs saved to: {output_path}")
+    
+    return analysis_results_by_target, summary_fig

@@ -84,6 +84,7 @@ from nested_weights_analysis import (
     analyze_weights_by_average_response_nested,
     plot_weights_by_average_response_nested,
     plot_connectivity_weight_comparison,
+    plot_summary_forest_plot_all_targets,
 )
 # Configure logging
 logging.basicConfig(
@@ -904,6 +905,8 @@ def cmd_nested_weights_analysis(args):
                 device=device,
                 base_seed=first_conn_seed
             )
+
+            analysis_results_by_post = {}
             
             # Analyze each post-synaptic population
             for post_pop in post_populations:
@@ -932,6 +935,9 @@ def cmd_nested_weights_analysis(args):
                     if intensity not in all_analyses[target]:
                         all_analyses[target][intensity] = {}
                     all_analyses[target][intensity][post_pop] = analysis_results
+
+                    # Store results for this post-population
+                    analysis_results_by_post[post_pop] = analysis_results
                     
                     # Generate visualization
                     if args.plot:
@@ -963,7 +969,28 @@ def cmd_nested_weights_analysis(args):
                     import traceback
                     logger.error(traceback.format_exc())
                     continue
-            
+
+            # Generate summary forest plot across all post-populations
+            if args.plot and len(analysis_results_by_post) > 0:
+                logger.info(f"\n    Generating summary forest plot across all targets...")
+                try:
+                    vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    summary_fig = plot_summary_forest_plot_all_targets(
+                        analysis_results_by_target=analysis_results_by_post,
+                        stimulated_population=target,
+                        save_path=str(vis_dir / f'{target}_all_targets_summary_forest.pdf')
+                    )
+                    if summary_fig is not None:
+                        plt.close(summary_fig)
+                        logger.info(f"      Saved summary forest plot")
+                except Exception as e:
+                    logger.error(f"      Failed to generate summary forest plot: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                       
+                
             # Clean up circuit
             del experiment
             if device.type == 'cuda':
