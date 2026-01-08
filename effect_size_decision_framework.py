@@ -300,7 +300,7 @@ def assess_biological_significance(
         
         # Biological meaningfulness
         is_meaningful = (abs_d >= min_meaningful_effect_size and 
-                        abs(mean_diff) >= min_meaningful_diff_nS)
+                         abs(mean_diff) >= min_meaningful_diff_nS)
         
         # Interpretation
         if is_meaningful:
