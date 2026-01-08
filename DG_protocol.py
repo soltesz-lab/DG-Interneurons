@@ -6258,8 +6258,8 @@ Examples:
                                      help='Maximum feasible sample size (default: 30)')
     efsz_decision_group.add_argument('--decision-min-effect', type=float, default=0.5,
                                      help='Minimum meaningful effect size (Cohen\'s d, default: 0.5)')
-    efsz_decision_group.add_argument('--decision-min-diff-nS', type=float, default=0.05,
-                                     help='Minimum meaningful weight difference (nS, default: 0.05)')
+    efsz_decision_group.add_argument('--decision-min-diff-nS', type=float, default=0.001,
+                                     help='Minimum meaningful weight difference (nS, default: 0.001)')
     efsz_decision_group.add_argument('--decision-output-dir', type=str,
                                      default='./effect_size_decision',
                                      help='Output directory for decision analysis')
