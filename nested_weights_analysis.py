@@ -88,7 +88,17 @@ def extract_weight_distributions_by_connectivity(
                 weights_by_connectivity[conn_idx][source_pop] = {}
             
             for response_type in ['excited', 'suppressed', 'unchanged']:
-                cell_indices = classification[f'{response_type}_cells']
+
+                # Check if this response type exists in classification
+                # (unchanged_cells is not returned by classify_cells_by_connectivity)
+                cell_key = f'{response_type}_cells'
+                if cell_key not in classification:
+                    # Skip this response type if not available
+                    weights_by_connectivity[conn_idx][source_pop][f'weights_{response_type}'] = np.array([])
+                    weights_by_connectivity[conn_idx][source_pop][f'total_input_{response_type}'] = np.array([])
+                    continue
+                
+                cell_indices = classification[cell_key]
                 
                 if len(cell_indices) > 0:
                     # Individual synapse weights (all incoming connections)
@@ -659,6 +669,7 @@ def plot_weights_by_average_response_nested(
             ax.set_xticklabels([f'C{i}' for i in range(n_conn)], fontsize=8)
     
     # Panel B: Mean weights with between-connectivity error bars
+# Panel B: Mean weights with between-connectivity error bars
     for source_idx, source_pop in enumerate(source_populations):
         ax = fig.add_subplot(gs[1, source_idx])
         
@@ -667,32 +678,53 @@ def plot_weights_by_average_response_nested(
         excited_means = []
         suppressed_means = []
         
+        # Fill data for ALL connectivity indices, use NaN for missing
         for conn_idx in conn_indices:
             if source_pop in stats_by_conn[conn_idx]:
                 data = stats_by_conn[conn_idx][source_pop]
-                excited_means.append(data['mean_excited'] if not np.isnan(data['mean_excited']) else 0)
-                suppressed_means.append(data['mean_suppressed'] if not np.isnan(data['mean_suppressed']) else 0)
+                excited_means.append(data['mean_excited'] if not np.isnan(data['mean_excited']) else np.nan)
+                suppressed_means.append(data['mean_suppressed'] if not np.isnan(data['mean_suppressed']) else np.nan)
+            else:
+                # No data for this connectivity - use NaN to maintain alignment
+                excited_means.append(np.nan)
+                suppressed_means.append(np.nan)
+        
+        # Convert to arrays and check if we have any valid data
+        excited_means = np.array(excited_means)
+        suppressed_means = np.array(suppressed_means)
+        
+        # Skip plotting if no valid data for this source
+        if np.all(np.isnan(excited_means)) and np.all(np.isnan(suppressed_means)):
+            ax.text(0.5, 0.5, f'No {source_pop.upper()} connections',
+                   ha='center', va='center', transform=ax.transAxes,
+                   fontsize=10, style='italic')
+            ax.set_ylabel('Mean Weight (nS)', fontsize=10)
+            ax.set_xlabel('Connectivity Instance', fontsize=10)
+            ax.set_title(f'{source_pop.upper()} $\\rightarrow$ {post_pop.upper()}',
+                        fontsize=11, fontweight='bold')
+            continue
         
         x_pos = np.arange(len(conn_indices))
         width = 0.35
         
-        # Plot bars
+        # Plot bars (matplotlib handles NaN values gracefully)
         ax.bar(x_pos - width/2, excited_means, width,
-              label='Excited', color=colors['excited'], alpha=0.7,
-              edgecolor='black', linewidth=1.5)
+               label='Excited', color=colors['excited'], alpha=0.7,
+               edgecolor='black', linewidth=1.5)
         ax.bar(x_pos + width/2, suppressed_means, width,
-              label='Suppressed', color=colors['suppressed'], alpha=0.7,
-              edgecolor='black', linewidth=1.5)
+               label='Suppressed', color=colors['suppressed'], alpha=0.7,
+               edgecolor='black', linewidth=1.5)
         
-        # Add grand means as horizontal lines
-        summary = summary_stats[source_pop]
-        if not np.isnan(summary['grand_mean_excited']):
-            ax.axhline(summary['grand_mean_excited'], color=colors['excited'],
-                      linestyle='--', linewidth=2, alpha=0.5)
-        if not np.isnan(summary['grand_mean_suppressed']):
-            ax.axhline(summary['grand_mean_suppressed'], color=colors['suppressed'],
-                      linestyle='--', linewidth=2, alpha=0.5)
-        
+        # Add grand means as horizontal lines (only if we have valid data)
+        if source_pop in summary_stats:
+            summary = summary_stats[source_pop]
+            if not np.isnan(summary['grand_mean_excited']):
+                ax.axhline(summary['grand_mean_excited'], color=colors['excited'],
+                          linestyle='--', linewidth=2, alpha=0.5)
+            if not np.isnan(summary['grand_mean_suppressed']):
+                ax.axhline(summary['grand_mean_suppressed'], color=colors['suppressed'],
+                          linestyle='--', linewidth=2, alpha=0.5)
+                
         ax.set_ylabel('Mean Weight (nS)', fontsize=10)
         ax.set_xlabel('Connectivity Instance', fontsize=10)
         ax.set_xticks(x_pos)

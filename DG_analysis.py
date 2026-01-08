@@ -41,6 +41,7 @@ import sys
 import pickle
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
+import matplotlib.pyplot as plt
 import logging
 
 # Import functions from DG_protocol module
