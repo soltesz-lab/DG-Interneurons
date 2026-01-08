@@ -5863,7 +5863,7 @@ def run_nested_effect_size_decision_analysis(
             
             # Analyze each post-synaptic population
             for post_pop in post_populations:
-                print(f"\n    Analyzing {target.upper()} → {post_pop.upper()}")
+                print(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
                 
                 # Create output directory for this combination
                 combo_dir = output_path / f"{target}_intensity_{intensity}" / post_pop
