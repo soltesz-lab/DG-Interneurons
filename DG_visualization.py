@@ -2154,7 +2154,7 @@ class DGCircuitVisualization:
         """
         Bar plot summarizing mean input weights from each source
 
-        Shows mean ± SEM, with separate bars for opsin-expressing vs non-expressing
+        Shows mean +/- SEM, with separate bars for opsin-expressing vs non-expressing
         if opsin_expression is provided.
 
         Args:
