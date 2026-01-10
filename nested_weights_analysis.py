@@ -1355,7 +1355,7 @@ def plot_summary_forest_plot_all_targets(
     analysis_results_by_target: Dict[str, Dict],
     stimulated_population: str,
     save_path: Optional[str] = None,
-    figsize: Tuple[int, int] = (14, 12)
+    figsize: Tuple[int, int] = (14, 8)
 ) -> plt.Figure:
     """Create unified forest plot showing weight differences across all postsynaptic targets
     
@@ -1384,7 +1384,7 @@ def plot_summary_forest_plot_all_targets(
     separate pre-synaptic cells by expression level: "Opsin+
     (exc-sup)" and "Opsin- (exc-sup)" show whether opsin-expressing or
     non-expressing cells preferentially connect to excited versus
-    suppressed targets; "Opsin+/- → excited" and "Opsin+/- →
+    suppressed targets; "Opsin+/- diff → excited" and "Opsin+/- diff →
     suppressed" show whether excited or suppressed targets
     preferentially receive input from opsin+ versus opsin-
     cells. Error bars represent 95% bootstrap confidence intervals (N
@@ -1558,7 +1558,7 @@ def plot_summary_forest_plot_all_targets(
         # Add text annotation
         ax.text(0.95, y_positions[i],
                 f"{mean_val:.3f} [{ci_lower:.3f}, {ci_upper:.3f}] {stars}",
-                va='center', ha='right', fontsize=8,
+                va='center', ha='right', fontsize=9,
                 transform=ax.get_yaxis_transform())
     
     # Set x-axis limits with padding
@@ -1613,7 +1613,7 @@ def plot_summary_forest_plot_all_targets(
                        markersize=8, label='Opsin$^{+/-}$ specific', linestyle='None')
         ])
     
-    ax.legend(handles=legend_elements, loc='lower right', 
+    ax.legend(handles=legend_elements, loc='lower left', 
               fontsize=9, title='Significance & Type', title_fontsize=10,
               ncol=2 if n_opsin_rows > 0 else 1)
     
