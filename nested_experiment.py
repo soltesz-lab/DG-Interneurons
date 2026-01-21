@@ -25,6 +25,16 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import logging
 
+import h5py
+from hdf5_storage import (
+    create_hdf5_experiment_file,
+    save_trial_to_hdf5,
+    load_trial_from_hdf5,
+    aggregate_from_hdf5,
+    compute_variance_from_hdf5,
+    load_metadata_from_hdf5
+)
+
 logger = logging.getLogger('nested_experiment')
 logger.setLevel(logging.INFO)
 ch = logging.StreamHandler()
@@ -102,6 +112,7 @@ def run_nested_comparative_experiment(
     device: Optional[torch.device] = None,
     nested_config: Optional[NestedExperimentConfig] = None,
     save_results_file: Optional[str] = None,
+    use_hdf5: bool = True,
     **optogenetic_kwargs
 ) -> Dict:
     """
@@ -161,146 +172,204 @@ def run_nested_comparative_experiment(
     synaptic_params = PerConnectionSynapticParams()
     opsin_params = OpsinParams()
     
-    # Storage for nested results
-    nested_results = {
-        'pv': {intensity: [] for intensity in intensities},
-        'sst': {intensity: [] for intensity in intensities}
-    }
+    # Initialize storage
+    if use_hdf5:
+        # Create HDF5 file
+        if save_results_file is None:
+            save_results_file = 'nested_experiment_results.h5'
+        
+        # Ensure .h5 extension
+        if not save_results_file.endswith('.h5'):
+            save_results_file = save_results_file.replace('.pkl', '.h5')
+        
+        hdf5_file = create_hdf5_experiment_file(save_results_file, metadata)
+        nested_results = None  # Don't store in memory
+    else:
+        # store everything in memory
+        hdf5_file = None
+        nested_results = {
+            'pv': {intensity: [] for intensity in intensities},
+            'sst': {intensity: [] for intensity in intensities}
+        }
     
     # Main nested loop
-    for target in ['pv', 'sst']:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Testing {target.upper()} stimulation")
-        logger.info('='*60)
-        
-        for intensity in intensities:
-            logger.info(f"\nIntensity: {intensity}")
-            logger.info(f"{'-'*60}")
-            
-            for conn_idx in range(nested_config.n_connectivity_instances):
-                connectivity_seed = seed_structure['connectivity_seeds'][conn_idx]
-                
-                logger.info(f"\n  Connectivity instance {conn_idx + 1}/{nested_config.n_connectivity_instances}")
-                logger.info(f"    Seed: {connectivity_seed}")
-                
-                # Create experiment with this connectivity
-                experiment = OptogeneticExperiment(
-                    circuit_params,
-                    synaptic_params,
-                    opsin_params,
-                    optimization_json_file=optimization_json_file,
-                    device=device,
-                    base_seed=connectivity_seed,
-                    **optogenetic_kwargs
-                )
-                
-                # Inner loop: MEC patterns
-                for mec_idx in range(nested_config.n_mec_patterns_per_connectivity):
-                    mec_seed = seed_structure['mec_pattern_seeds'][conn_idx][mec_idx]
-                    
-                    logger.info(f"    MEC pattern {mec_idx + 1}/{nested_config.n_mec_patterns_per_connectivity} (seed: {mec_seed})")
-                    
-                    # Set seed for MEC pattern generation
-                    set_random_seed(mec_seed, device)
-                    
-                    # Run single trial with this connectivity and MEC pattern
-                    result = experiment.simulate_stimulation(
-                        target_population=target,
-                        light_intensity=intensity,
-                        stim_start=stim_start,
-                        stim_duration=stim_duration,
-                        post_duration=500.0,
-                        mec_current=mec_current,
-                        opsin_current=opsin_current,
-                        plot_activity=False,
-                        n_trials=1,  # Single trial per combination
-                        regenerate_connectivity_per_trial=False  # Connectivity fixed
+    try:
+
+        for target in ['pv', 'sst']:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Testing {target.upper()} stimulation")
+            logger.info('='*60)
+
+            for intensity in intensities:
+                logger.info(f"\nIntensity: {intensity}")
+                logger.info(f"{'-'*60}")
+
+                for conn_idx in range(nested_config.n_connectivity_instances):
+                    connectivity_seed = seed_structure['connectivity_seeds'][conn_idx]
+
+                    logger.info(f"\n  Connectivity instance {conn_idx + 1}/{nested_config.n_connectivity_instances}")
+                    logger.info(f"    Seed: {connectivity_seed}")
+
+                    # Create experiment with this connectivity
+                    experiment = OptogeneticExperiment(
+                        circuit_params,
+                        synaptic_params,
+                        opsin_params,
+                        optimization_json_file=optimization_json_file,
+                        device=device,
+                        base_seed=connectivity_seed,
+                        **optogenetic_kwargs
                     )
 
-                    # Extract opsin expression for target population
-                    if target in experiment.opsin_expression:
-                        opsin_expr = experiment.opsin_expression[target].expression_levels
-                        if hasattr(opsin_expr, 'cpu'):
-                            opsin_expr = opsin_expr.cpu().numpy()
+                    # Inner loop: MEC patterns
+                    for mec_idx in range(nested_config.n_mec_patterns_per_connectivity):
+                        mec_seed = seed_structure['mec_pattern_seeds'][conn_idx][mec_idx]
+
+                        logger.info(f"    MEC pattern {mec_idx + 1}/{nested_config.n_mec_patterns_per_connectivity} (seed: {mec_seed})")
+
+                        # Set seed for MEC pattern generation
+                        set_random_seed(mec_seed, device)
+
+                        # Run single trial with this connectivity and MEC pattern
+                        result = experiment.simulate_stimulation(
+                            target_population=target,
+                            light_intensity=intensity,
+                            stim_start=stim_start,
+                            stim_duration=stim_duration,
+                            post_duration=500.0,
+                            mec_current=mec_current,
+                            opsin_current=opsin_current,
+                            plot_activity=False,
+                            n_trials=1,  # Single trial per combination
+                            regenerate_connectivity_per_trial=False  # Connectivity fixed
+                        )
+
+                        # Extract opsin expression for target population
+                        if target in experiment.opsin_expression:
+                            opsin_expr = experiment.opsin_expression[target].expression_levels
+                            if hasattr(opsin_expr, 'cpu'):
+                                opsin_expr = opsin_expr.cpu().numpy()
+                            else:
+                                opsin_expr = np.array(opsin_expr)
                         else:
-                            opsin_expr = np.array(opsin_expr)
-                    else:
-                        # Fallback: create zero array if expression not available
-                        n_cells = getattr(experiment.circuit_params, f'n_{target}')
-                        opsin_expr = np.zeros(n_cells)
-                    
-                    # Store with proper indexing and opsin expression
-                    trial_result = NestedTrialResult(
-                        connectivity_idx=conn_idx,
-                        mec_pattern_idx=mec_idx,
-                        seed=mec_seed,
-                        results=result,
-                        target_population=target,
-                        opsin_expression=opsin_expr
-                    )
-                    
-                    nested_results[target][intensity].append(trial_result)
-                
-                # Clean up circuit to save memory
-                del experiment
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
-    
-    # Aggregate results
-    logger.info("\n" + "="*80)
-    logger.info("Aggregating nested results")
-    logger.info("="*80)
-    
-    aggregated_results = aggregate_nested_results(
-        nested_results,
-        nested_config,
-        stim_start,
-        stim_duration,
-        warmup
-    )
-    
-    # Compute variance decomposition
-    variance_analysis = compute_variance_decomposition(
-        nested_results,
-        nested_config,
-        stim_start,
-        stim_duration,
-        warmup
-    )
-    
-    # Classify regime (connectivity-driven vs. input-driven)
-    regime_classification = classify_mechanism_regime(
-        variance_analysis,
-        nested_config
-    )
-    
-    # Package complete results
-    complete_results = {
-        'nested_results': nested_results if nested_config.save_nested_trials else None,
-        'aggregated_results': aggregated_results,
-        'variance_analysis': variance_analysis,
-        'regime_classification': regime_classification,
-        'config': nested_config,
-        'seed_structure': seed_structure,
-        'metadata': {
-            'optimization_file': optimization_json_file,
-            'intensities': intensities,
-            'mec_current': mec_current,
-            'opsin_current': opsin_current,
-            'stim_start': stim_start,
-            'stim_duration': stim_duration,
-            'warmup': warmup
+                            # Fallback: create zero array if expression not available
+                            n_cells = getattr(experiment.circuit_params, f'n_{target}')
+                            opsin_expr = np.zeros(n_cells)
+
+                        # Save to HDF5 immediately or store in memory
+                        if use_hdf5:
+                            save_trial_to_hdf5(
+                                hdf5_file,
+                                target,
+                                intensity,
+                                conn_idx,
+                                mec_idx,
+                                result,
+                                save_full_activity=nested_config.save_full_activity
+                            )
+                            # Flush to disk
+                            hdf5_file.flush()
+                        else:
+                            # Store in memory with indexing and opsin expression
+                            if target in experiment.opsin_expression:
+                                opsin_expr = experiment.opsin_expression[target].expression_levels
+                                if hasattr(opsin_expr, 'cpu'):
+                                    opsin_expr = opsin_expr.cpu().numpy()
+                                else:
+                                    opsin_expr = np.array(opsin_expr)
+                            else:
+                                n_cells = getattr(experiment.circuit_params, f'n_{target}')
+                                opsin_expr = np.zeros(n_cells)
+
+                            trial_result = NestedTrialResult(
+                                connectivity_idx=conn_idx,
+                                mec_pattern_idx=mec_idx,
+                                seed=mec_seed,
+                                results=result,
+                                target_population=target,
+                                opsin_expression=opsin_expr
+                            )
+                            nested_results[target][intensity].append(trial_result)
+
+                    # Clean up circuit to save memory
+                    del experiment
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+        # Aggregate results
+        logger.info("\n" + "="*80)
+        logger.info("Aggregating nested results")
+        logger.info("="*80)
+        if use_hdf5:
+            # Compute from HDF5 file
+            aggregated_results = aggregate_nested_results_from_hdf5(
+                hdf5_file, nested_config, stim_start, stim_duration, warmup
+            )
+
+            variance_analysis = compute_variance_decomposition_from_hdf5(
+                hdf5_file, nested_config, stim_start, stim_duration, warmup
+            )
+        else:
+            aggregated_results = aggregate_nested_results(
+                nested_results,
+                nested_config,
+                stim_start,
+                stim_duration,
+                warmup
+            )
+
+            # Compute variance decomposition
+            variance_analysis = compute_variance_decomposition(
+                nested_results,
+                nested_config,
+                stim_start,
+                stim_duration,
+                warmup
+            )
+
+        # Classify regime (connectivity-driven vs. input-driven)
+        regime_classification = classify_mechanism_regime(
+            variance_analysis,
+            nested_config
+        )
+
+        # Package complete results
+        complete_results = {
+            'nested_results': nested_results if nested_config.save_nested_trials else None,
+            'aggregated_results': aggregated_results,
+            'variance_analysis': variance_analysis,
+            'regime_classification': regime_classification,
+            'config': nested_config,
+            'seed_structure': seed_structure,
+            'metadata': {
+                'optimization_file': optimization_json_file,
+                'intensities': intensities,
+                'mec_current': mec_current,
+                'opsin_current': opsin_current,
+                'stim_start': stim_start,
+                'stim_duration': stim_duration,
+                'warmup': warmup
+            }
         }
-    }
-    
-    # Save if requested
-    if save_results_file:
-        save_nested_experiment_results(complete_results, save_results_file)
-    
-    # Print summary
-    print_nested_experiment_summary(complete_results)
-    
-    return complete_results
+
+        # Save or update HDF5
+        if use_hdf5:
+            # Store aggregated results and variance analysis in HDF5
+            _save_analysis_to_hdf5(hdf5_file, aggregated_results, 
+                                  variance_analysis, regime_classification)
+        elif save_results_file:
+            save_nested_experiment_results(complete_results, save_results_file)
+
+        # Print summary
+        print_nested_experiment_summary(complete_results)
+
+        return complete_results
+
+    finally:
+        # Always close HDF5 file
+        if hdf5_file is not None:
+            hdf5_file.close()
+            logger.info(f"\nHDF5 file closed: {save_results_file}")
 
 
 # ============================================================================
@@ -855,6 +924,232 @@ def _hierarchical_variance_decomposition(grouped_data: List[List[float]],
         'n_total': n_total,
         'test_method': test_method  # track which test was used
     }    
+
+
+
+def aggregate_nested_results_from_hdf5(
+    f: h5py.File,
+    config: NestedExperimentConfig,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float
+) -> Dict:
+    """
+    Aggregate nested results directly from HDF5 file
+    
+    Memory-efficient version that doesn't load all data at once.
+    """
+    aggregated = {
+        'by_connectivity': {},
+        'grand_mean': {},
+        'across_connectivity': {}
+    }
+    
+    for target in ['pv', 'sst']:
+        aggregated['by_connectivity'][target] = {}
+        aggregated['grand_mean'][target] = {}
+        aggregated['across_connectivity'][target] = {}
+        
+        # Get all intensities from HDF5
+        intensities = [float(k.split('_')[1]) for k in f[target].keys() 
+                      if k.startswith('intensity_')]
+        
+        for intensity in intensities:
+            # Aggregate within each connectivity
+            by_conn = aggregate_from_hdf5(
+                f, target, intensity, stim_start, stim_duration, warmup
+            )
+            
+            aggregated['by_connectivity'][target][intensity] = by_conn
+            
+            # Grand mean: load all trials and aggregate
+            # (still memory-efficient as we process one trial at a time)
+            all_trials = []
+            for conn_idx in range(config.n_connectivity_instances):
+                for pattern_idx in range(config.n_mec_patterns_per_connectivity):
+                    trial_data = load_trial_from_hdf5(f, target, intensity,
+                                                     conn_idx, pattern_idx)
+                    trial_result = NestedTrialResult(
+                        connectivity_idx=conn_idx,
+                        mec_pattern_idx=pattern_idx,
+                        seed=0,
+                        results=trial_data,
+                        target_population=trial_data['target_population'],
+                        opsin_expression=trial_data['opsin_expression']
+                    )
+                    all_trials.append(trial_result)
+            
+            aggregated['grand_mean'][target][intensity] = _aggregate_trial_group(
+                all_trials, stim_start, stim_duration, warmup
+            )
+            
+            # Across connectivity
+            aggregated['across_connectivity'][target][intensity] = \
+                _aggregate_connectivity_means(by_conn)
+    
+    return aggregated
+
+
+def compute_variance_decomposition_from_hdf5(
+    f: h5py.File,
+    config: NestedExperimentConfig,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float
+) -> Dict:
+    """
+    Compute variance decomposition from HDF5 file
+    
+    Memory-efficient version.
+    """
+    variance_analysis = {}
+    
+    for target in ['pv', 'sst']:
+        variance_analysis[target] = {}
+        
+        # Get intensities
+        intensities = [float(k.split('_')[1]) for k in f[target].keys()
+                      if k.startswith('intensity_')]
+        
+        for intensity in intensities:
+            pop_variance = compute_variance_from_hdf5(
+                f, target, intensity, stim_start, stim_duration, warmup
+            )
+            
+            variance_analysis[target][intensity] = pop_variance
+    
+    return variance_analysis
+
+
+def _save_analysis_to_hdf5(f: h5py.File,
+                           aggregated_results: Dict,
+                           variance_analysis: Dict,
+                           regime_classification: Dict) -> None:
+    """
+    Save aggregated analysis results to HDF5 file
+    
+    Stores summary statistics computed from the trial data.
+    """
+    # Create analysis group
+    if 'analysis' in f:
+        del f['analysis']
+    
+    analysis_grp = f.create_group('analysis')
+    
+    # Save regime classification as attributes
+    regime_grp = analysis_grp.create_group('regime_classification')
+    for target in regime_classification.keys():
+        target_grp = regime_grp.create_group(target)
+        for intensity, pop_data in regime_classification[target].items():
+            intensity_grp = target_grp.create_group(f'intensity_{intensity}')
+            for pop, regime_data in pop_data.items():
+                pop_grp = intensity_grp.create_group(pop)
+                for key, value in regime_data.items():
+                    if isinstance(value, str):
+                        pop_grp.attrs[key] = value
+                    else:
+                        pop_grp.attrs[key] = value if value is not None else np.nan
+    
+    # Save variance analysis
+    var_grp = analysis_grp.create_group('variance_analysis')
+    for target in variance_analysis.keys():
+        target_grp = var_grp.create_group(target)
+        for intensity, pop_data in variance_analysis[target].items():
+            intensity_grp = target_grp.create_group(f'intensity_{intensity}')
+            for pop, var_data in pop_data.items():
+                pop_grp = intensity_grp.create_group(pop)
+                
+                # Flatten nested dict structure for HDF5
+                def save_nested_dict(grp, data, prefix=''):
+                    for key, value in data.items():
+                        if isinstance(value, dict):
+                            save_nested_dict(grp, value, f'{prefix}{key}_')
+                        else:
+                            grp.attrs[f'{prefix}{key}'] = value if value is not None else np.nan
+                
+                save_nested_dict(pop_grp, var_data)
+    
+    f.flush()
+
+
+def load_nested_experiment_from_hdf5(filepath: str) -> Dict:
+    """
+    Load complete nested experiment results from HDF5 file
+    
+    Returns dict compatible with original format, with lazy loading
+    of trial data.
+    """
+    from dataclasses import asdict
+    
+    metadata = load_metadata_from_hdf5(filepath)
+    
+    # Open file for reading
+    with h5py.File(filepath, 'r') as f:
+        # Load analysis results
+        analysis_grp = f.get('analysis')
+        
+        if analysis_grp is not None:
+            # Load regime classification
+            regime_classification = {}
+            regime_grp = analysis_grp['regime_classification']
+            for target in regime_grp.keys():
+                regime_classification[target] = {}
+                for intensity_key in regime_grp[target].keys():
+                    intensity = float(intensity_key.split('_')[1])
+                    regime_classification[target][intensity] = {}
+                    
+                    for pop in regime_grp[target][intensity_key].keys():
+                        regime_data = dict(regime_grp[target][intensity_key][pop].attrs)
+                        regime_classification[target][intensity][pop] = regime_data
+            
+            # Load variance analysis
+            variance_analysis = {}
+            var_grp = analysis_grp['variance_analysis']
+            for target in var_grp.keys():
+                variance_analysis[target] = {}
+                for intensity_key in var_grp[target].keys():
+                    intensity = float(intensity_key.split('_')[1])
+                    variance_analysis[target][intensity] = {}
+                    
+                    for pop in var_grp[target][intensity_key].keys():
+                        var_data_flat = dict(var_grp[target][intensity_key][pop].attrs)
+                        
+                        # Reconstruct nested structure
+                        var_data = {}
+                        for key, value in var_data_flat.items():
+                            parts = key.split('_')
+                            if len(parts) >= 2:
+                                metric = parts[0]
+                                subkey = '_'.join(parts[1:])
+                                
+                                if metric not in var_data:
+                                    var_data[metric] = {}
+                                var_data[metric][subkey] = value
+                            else:
+                                var_data[key] = value
+                        
+                        variance_analysis[target][intensity][pop] = var_data
+        else:
+            regime_classification = None
+            variance_analysis = None
+        
+        # Reconstruct config
+        config = NestedExperimentConfig(
+            n_connectivity_instances=metadata['n_connectivity_instances'],
+            n_mec_patterns_per_connectivity=metadata['n_mec_patterns_per_connectivity'],
+            base_seed=metadata.get('seed_structure', {}).get('connectivity_seeds', [42])[0]
+        )
+    
+    return {
+        'nested_results': None,  # Not loaded (use HDF5 file directly)
+        'aggregated_results': None,  # Can be recomputed if needed
+        'variance_analysis': variance_analysis,
+        'regime_classification': regime_classification,
+        'config': config,
+        'seed_structure': metadata.get('seed_structure'),
+        'metadata': metadata,
+        'hdf5_file': filepath
+    }
 
 
 def classify_mechanism_regime(

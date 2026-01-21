@@ -14,6 +14,9 @@ from scipy.spatial.distance import cdist
 from pathlib import Path
 import tqdm
 import logging
+from hdf5_storage import load_nested_experiment_from_hdf5, load_metadata_from_hdf5
+import h5py
+
 
 logger = logging.getLogger('DG_protocol')
 logger.setLevel(logging.INFO)
@@ -5524,11 +5527,20 @@ def run_nested_effect_size_analysis(
     print("\n" + "="*80)
     print("Nested Bootstrap Effect Size Analysis")
     print("="*80)
+
+    # Check if this is HDF5 or pickle format
+    hdf5_file_path = nested_data.get('hdf5_file')
+    use_hdf5 = hdf5_file_path is not None
     
-    # Load nested experiment results
-    nested_results = nested_data['nested_results']
-    metadata = nested_data['metadata']
-    seed_structure = nested_data['seed_structure']
+    if use_hdf5:
+        print(f"  Loading from HDF5: {hdf5_file_path}")
+        metadata = nested_data['metadata']
+        seed_structure = nested_data['seed_structure']
+    else:
+        # Original pickle format
+        nested_results = nested_data['nested_results']
+        metadata = nested_data['metadata']
+        seed_structure = nested_data['seed_structure']
     
     # Extract experiment parameters
     stim_start = metadata['stim_start']
@@ -5551,141 +5563,156 @@ def run_nested_effect_size_analysis(
     
     # Storage for all results
     all_analyses = {}
+    # Open HDF5 file if needed
+    hdf5_file = h5py.File(hdf5_file_path, 'r') if use_hdf5 else None
     
-    # Analyze each target population
-    for target in target_populations:
-        if target not in nested_results:
-            print(f"\nSkipping {target.upper()} - no results found")
-            continue
-        
-        all_analyses[target] = {}
-        
-        print(f"\n{'='*60}")
-        print(f"Analyzing {target.upper()} stimulation")
-        print('='*60)
-        
-        for intensity in intensities:
-            if intensity not in nested_results[target]:
-                continue
-            
-            all_analyses[target][intensity] = {}
-            
-            print(f"\n  Intensity: {intensity}")
-            
-            # Get trials for this condition
-            trials = nested_results[target][intensity]
-            
-            print(f"    Total trials: {len(trials)}")
-            print(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
-            
-            # Recreate circuit (use seed from first connectivity instance)
-            first_conn_seed = seed_structure['connectivity_seeds'][0]
-            
-            print(f"    Recreating circuit with seed: {first_conn_seed}")
-            
-            # Import necessary classes
-            from DG_circuit_dendritic_somatic_transfer import (
-                CircuitParams, PerConnectionSynapticParams, OpsinParams
-            )
-            
-            circuit_params = CircuitParams()
-            synaptic_params = PerConnectionSynapticParams()
-            opsin_params = OpsinParams()
-            
-            # Apply optimization if available
-            optimization_file = metadata.get('optimization_file')
-            if optimization_file:
-                print(f"    Applying optimization from: {optimization_file}")
-            
-            # Create circuit
-            set_random_seed(first_conn_seed, device)
-            experiment = OptogeneticExperiment(
-                circuit_params,
-                synaptic_params,
-                opsin_params,
-                optimization_json_file=optimization_file,
-                device=device,
-                base_seed=first_conn_seed
-            )
-            
-            # Analyze each post-synaptic population
-            for post_pop in post_populations:
-                print(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
-                
-                # Run bootstrap analysis
-                analysis_results = analyze_effect_size_all_sources_nested(
-                    nested_results=trials,
-                    circuit=experiment.circuit,
-                    target_population=target,
-                    post_population=post_pop,
-                    source_populations=source_populations,
-                    stim_start=stim_start,
-                    stim_duration=stim_duration,
-                    warmup=warmup,
-                    n_bootstrap=n_bootstrap,
-                    threshold_std=threshold_std,
-                    expression_threshold=expression_threshold,
-                    random_seed=random_seed
-                )
-                
-                if not analysis_results:
-                    print(f"      No valid results for {post_pop.upper()}")
+    try:
+        # Analyze each target population
+        for target in target_populations:
+            # Check if target exists
+            if use_hdf5:
+                if target not in hdf5_file:
+                    print(f"\nSkipping {target.upper()} - no results found")
                     continue
+            else:
+                if target not in nested_results:
+                    print(f"\nSkipping {target.upper()} - no results found")
+                    continue
+            
+            all_analyses[target] = {}
+            
+            print(f"\n{'='*60}")
+            print(f"Analyzing {target.upper()} stimulation")
+            print('='*60)
+            
+            for intensity in intensities:
+                all_analyses[target][intensity] = {}
                 
-                # Store results
-                all_analyses[target][intensity][post_pop] = analysis_results
+                print(f"\n  Intensity: {intensity}")
                 
-                # Print summary
-                print_nested_effect_size_analysis_summary(
-                    analysis_results,
-                    target,
-                    post_pop
+                # Get trials for this condition
+                if use_hdf5:
+                    trials = _load_trials_from_hdf5(hdf5_file, target, intensity,
+                                                   metadata, expression_threshold)
+                else:
+                    trials = nested_results[target][intensity]
+                
+                print(f"    Total trials: {len(trials)}")
+                print(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
+                
+                # Recreate circuit (use seed from first connectivity instance)
+                first_conn_seed = seed_structure['connectivity_seeds'][0]
+                
+                print(f"    Recreating circuit with seed: {first_conn_seed}")
+                
+                # Import necessary classes
+                from DG_circuit_dendritic_somatic_transfer import (
+                    CircuitParams, PerConnectionSynapticParams, OpsinParams
                 )
                 
-                # Create visualizations
-                vis_dir = output_path / f"{target}_intensity_{intensity}" / post_pop
-                vis_dir.mkdir(parents=True, exist_ok=True)
+                circuit_params = CircuitParams()
+                synaptic_params = PerConnectionSynapticParams()
+                opsin_params = OpsinParams()
                 
-                # Forest plot
-                print(f"      Generating forest plot...")
-                fig_forest = plot_effect_sizes_forest(
-                    analysis_results,
-                    target,
-                    post_pop,
-                    save_path=str(vis_dir / 'effect_sizes_forest.pdf')
+                # Apply optimization if available
+                optimization_file = metadata.get('optimization_file')
+                if optimization_file:
+                    print(f"    Applying optimization from: {optimization_file}")
+                
+                # Create circuit
+                set_random_seed(first_conn_seed, device)
+                experiment = OptogeneticExperiment(
+                    circuit_params,
+                    synaptic_params,
+                    opsin_params,
+                    optimization_json_file=optimization_file,
+                    device=device,
+                    base_seed=first_conn_seed
                 )
-                plt.close(fig_forest)
                 
-                # Bootstrap distributions for each source
-                for source_pop in analysis_results.keys():
-                    print(f"      Generating bootstrap plot for {source_pop.upper()}...")
-                    fig_bootstrap = plot_bootstrap_distributions(
+                # Analyze each post-synaptic population
+                for post_pop in post_populations:
+                    print(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
+                    
+                    # Run bootstrap analysis
+                    analysis_results = analyze_effect_size_all_sources_nested(
+                        nested_results=trials,
+                        circuit=experiment.circuit,
+                        target_population=target,
+                        post_population=post_pop,
+                        source_populations=source_populations,
+                        stim_start=stim_start,
+                        stim_duration=stim_duration,
+                        warmup=warmup,
+                        n_bootstrap=n_bootstrap,
+                        threshold_std=threshold_std,
+                        expression_threshold=expression_threshold,
+                        random_seed=random_seed
+                    )
+                    
+                    if not analysis_results:
+                        print(f"      No valid results for {post_pop.upper()}")
+                        continue
+                    
+                    # Store results
+                    all_analyses[target][intensity][post_pop] = analysis_results
+                    
+                    # Print summary
+                    print_nested_effect_size_analysis_summary(
                         analysis_results,
-                        source_pop,
+                        target,
+                        post_pop
+                    )
+                    
+                    # Create visualizations
+                    vis_dir = output_path / f"{target}_intensity_{intensity}" / post_pop
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Forest plot
+                    print(f"      Generating forest plot...")
+                    fig_forest = plot_effect_sizes_forest(
+                        analysis_results,
                         target,
                         post_pop,
-                        save_path=str(vis_dir / f'bootstrap_dist_{source_pop}.pdf')
+                        save_path=str(vis_dir / 'effect_sizes_forest.pdf')
                     )
-                    plt.close(fig_bootstrap)
+                    plt.close(fig_forest)
                     
-                    # Weight distributions for first connectivity
-                    try:
-                        fig_weights = plot_weight_distributions_by_response(
+                    # Bootstrap distributions for each source
+                    for source_pop in analysis_results.keys():
+                        print(f"      Generating bootstrap plot for {source_pop.upper()}...")
+                        fig_bootstrap = plot_bootstrap_distributions(
                             analysis_results,
                             source_pop,
-                            connectivity_idx=0,
-                            target_population=target,
-                            post_population=post_pop,
-                            save_path=str(vis_dir / f'weight_distributions_{source_pop}_conn0.pdf')
+                            target,
+                            post_pop,
+                            save_path=str(vis_dir / f'bootstrap_dist_{source_pop}.pdf')
                         )
-                        plt.close(fig_weights)
-                    except Exception as e:
-                        print(f"        Warning: Could not plot weight distributions for {source_pop}: {e}")
-            
-            # Clean up circuit
-            del experiment
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+                        plt.close(fig_bootstrap)
+                        
+                        # Weight distributions for first connectivity
+                        try:
+                            fig_weights = plot_weight_distributions_by_response(
+                                analysis_results,
+                                source_pop,
+                                connectivity_idx=0,
+                                target_population=target,
+                                post_population=post_pop,
+                                save_path=str(vis_dir / f'weight_distributions_{source_pop}_conn0.pdf')
+                            )
+                            plt.close(fig_weights)
+                        except Exception as e:
+                            print(f"        Warning: Could not plot weight distributions for {source_pop}: {e}")
+                
+                # Clean up circuit
+                del experiment
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+    
+    finally:
+        # Close HDF5 file
+        if hdf5_file is not None:
+            hdf5_file.close()
     
     # Save complete analysis results
     analysis_file = output_path / 'bootstrap_analysis_results.pkl'
@@ -5707,6 +5734,54 @@ def run_nested_effect_size_analysis(
     print('='*80)
     
     return all_analyses
+
+
+def _load_trials_from_hdf5(hdf5_file: h5py.File,
+                           target: str,
+                           intensity: float,
+                           metadata: Dict,
+                           expression_threshold: float = 0.2) -> List:
+    """
+    Load all trials for a specific target/intensity from HDF5
+    
+    Returns list of NestedTrialResult objects.
+    """
+    from nested_experiment import NestedTrialResult
+    from hdf5_storage import load_trial_from_hdf5
+    
+    intensity_key = f"intensity_{intensity}"
+    
+    if intensity_key not in hdf5_file[target]:
+        return []
+    
+    trials = []
+    n_connectivity = metadata['n_connectivity_instances']
+    n_mec_patterns = metadata['n_mec_patterns_per_connectivity']
+    
+    for conn_idx in range(n_connectivity):
+        for pattern_idx in range(n_mec_patterns):
+            try:
+                trial_data = load_trial_from_hdf5(
+                    hdf5_file, target, intensity, conn_idx, pattern_idx
+                )
+                
+                # Create NestedTrialResult
+                trial_result = NestedTrialResult(
+                    connectivity_idx=conn_idx,
+                    mec_pattern_idx=pattern_idx,
+                    seed=0,  # Not critical for analysis
+                    results=trial_data,
+                    target_population=trial_data['target_population'],
+                    opsin_expression=trial_data['opsin_expression']
+                )
+                
+                trials.append(trial_result)
+                
+            except Exception as e:
+                logger.warning(f"Could not load trial conn={conn_idx}, pattern={pattern_idx}: {e}")
+                continue
+    
+    return trials
 
 
 
@@ -6090,488 +6165,154 @@ def print_cross_population_summary(
 
     
 if __name__ == "__main__":
-    logger.info("Dentate Gyrus Circuit with Anatomical Connectivity")
-    logger.info("=========================================================")
+    logger.info("Dentate Gyrus Optogenetic Protocol")
+    logger.info("="*80)
+    logger.info("\nFor analysis of saved results, use: python DG_analysis.py --help\n")
+    logger.info("="*80)
     
     # Parse command line arguments
     import argparse
     parser = argparse.ArgumentParser(
-        description='DG Optogenetic Protocol with Multi-Trial Support',
+        description='Run DG optogenetic experiments',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run all experiments (default):
-  python DG_protocol.py --n-trials 3
+  # Run comparative experiment
+  %(prog)s --comparative --n-trials 5
   
-  # Plot previously saved results:
-  python DG_protocol.py --plot-only --load-comparative-results results.pkl
+  # Run nested experiment  
+  %(prog)s --nested --n-connectivity 10 --n-mec-patterns 5
   
-  # Plot all results:
-  python DG_protocol.py --plot-only \\
-      --load-comparative-results protocol/results.pkl \\
-      --load-ablation-results protocol/ablation_tests/all_ablation_tests.pkl \\
-      --load-expression-results protocol/expression_tests/expression_results.pkl
-        """)
-    
-    parser.add_argument('--output-dir', type=str, default='protocol',
-                        metavar='DIR',
-                        help='Output plots and save files to directory')
-    
-    # Execution mode
-    parser.add_argument('--plot-only', action='store_true',
-                        help='Only plot results (requires at least one --load-* option)')
-    parser.add_argument('--plot-synaptic-weights', action='store_true',
-                        help='Plot synaptic weight distribution')
-    parser.add_argument('--plot-weights-by-response', action='store_true',
-                        help='Plot synaptic weight distributions by response type (violin plots)')
-    parser.add_argument('--test-weights-by-response', action='store_true',
-                        help='Statistical testing of weights by response with bootstrap CIs')
-    parser.add_argument('--response-threshold-std', type=float, default=1.0,
-                        help='Standard deviation threshold for response classification (default: 1.0)')
-    parser.add_argument('--n-bootstrap', type=int, default=10000,
-                        help='Number of bootstrap samples for confidence intervals (default: 10000)')
+  # Run ablation tests
+  %(prog)s --ablations --n-trials 3
+  
+  # Run all experiments
+  %(prog)s --all --n-trials 5
+  
+  # Analyze results (separate script)
+  python DG_analysis.py plot-comparative results.pkl
+  python DG_analysis.py bootstrap-analysis nested_results.pkl
 
-    # Loading options (for plot-only mode)
-    parser.add_argument('--load-comparative-results', type=str, default=None,
-                        metavar='FILE',
-                        help='Load comparative experiment results from FILE')
-    parser.add_argument('--load-ablation-results', type=str, default=None,
-                        metavar='FILE',
-                        help='Load ablation test results from FILE')
-    parser.add_argument('--load-expression-results', type=str, default=None,
-                        metavar='FILE',
-                        help='Load expression level test results from FILE')
+For detailed analysis options, see: python DG_analysis.py --help
+        """
+    )
     
-    # Circuit and simulation parameters
-    parser.add_argument('--optimization-file', type=str, default=None,
-                        help='Path to optimization JSON file')
-    parser.add_argument('--device', type=str, default=None,
-                        choices=['cpu', 'cuda', None],
-                        help='Device to run on (default: auto-detect)')
+    # Experiment selection
+    parser.add_argument('--comparative', action='store_true',
+                       help='Run comparative PV vs SST experiment')
+    parser.add_argument('--nested', action='store_true',
+                       help='Run nested (connectivity x MEC) experiment')
+    parser.add_argument('--ablations', action='store_true',
+                       help='Run ablation tests')
+    parser.add_argument('--expression', action='store_true',
+                       help='Run expression level tests')
+    parser.add_argument('--all', action='store_true',
+                       help='Run all experiments')
+    
+    # Output options
+    parser.add_argument('--output-dir', type=str, default='protocol',
+                       metavar='DIR',
+                       help='Output directory for results (default: protocol)')
+    
+    # Common simulation parameters
     parser.add_argument('--n-trials', type=int, default=3,
-                        help='Number of trials to average (default: 3)')
-    parser.add_argument('--regenerate-connectivity', action='store_true',
-                        help='Regenerate circuit connectivity for each trial')
+                       help='Number of trials to average (default: 3)')
     parser.add_argument('--base-seed', type=int, default=42,
-                        help='Base random seed (default: 42)')
+                       help='Base random seed (default: 42)')
+    parser.add_argument('--regenerate-connectivity', action='store_true',
+                       help='Regenerate circuit connectivity for each trial')
+    parser.add_argument('--device', type=str, default=None,
+                       choices=['cpu', 'cuda', None],
+                       help='Device to run on (default: auto-detect)')
+    
+    # Circuit and stimulation parameters
+    parser.add_argument('--optimization-file', type=str, default=None,
+                       help='Path to optimization JSON file')
     parser.add_argument('--mec-current', type=float, default=40.0,
-                        help='MEC drive current in pA (default: 40.0)')
+                       help='MEC drive current in pA (default: 40.0)')
     parser.add_argument('--opsin-current', type=float, default=200.0,
-                        help='Optogenetic current in pA (default: 200.0)')
+                       help='Optogenetic current in pA (default: 200.0)')
     parser.add_argument('--stim-start', type=float, default=1500.0,
-                        help='Optogenetic stimulus start time [ms] (default: 1500.0)')
+                       help='Stimulus start time [ms] (default: 1500.0)')
     parser.add_argument('--stim-duration', type=float, default=1000.0,
-                        help='Optogenetic stimulus duration [ms] (default: 1000.0)')
+                       help='Stimulus duration [ms] (default: 1000.0)')
+    
+    # Data saving options
     parser.add_argument('--no-auto-save', action='store_true',
-                        help='Disable automatic saving of results')
+                       help='Disable automatic saving of results')
     parser.add_argument('--save-full-activity', action='store_true',
-                        help='Save activity traces and synaptic currents')
+                       help='Save complete activity traces (larger files)')
+    parser.add_argument('--record-currents', action='store_true',
+                       help='Record synaptic currents')
     
     # Adaptive stepping
     parser.add_argument('--adaptive-step', action='store_true',
-                        help='Use gradient-driven adaptive time stepping')
+                       help='Use gradient-driven adaptive time stepping')
     parser.add_argument('--adaptive-dt-min', type=float, default=0.05,
-                        help='Minimum time step for adaptive stepping (ms)')
+                       help='Minimum time step for adaptive stepping (ms)')
     parser.add_argument('--adaptive-dt-max', type=float, default=0.25,
-                        help='Maximum time step for adaptive stepping (ms)')
+                       help='Maximum time step for adaptive stepping (ms)')
     parser.add_argument('--adaptive-gradient-low', type=float, default=0.5,
-                        help='Low gradient threshold (Hz/ms)')
+                       help='Low gradient threshold (Hz/ms)')
     parser.add_argument('--adaptive-gradient-high', type=float, default=10.0,
-                        help='High gradient threshold (Hz/ms)')
+                       help='High gradient threshold (Hz/ms)')
     
     # MEC input patterns
     parser.add_argument('--time-varying-mec', action='store_true',
-                        help='Enable time-varying MEC input')
+                       help='Enable time-varying MEC input')
     parser.add_argument('--mec-pattern-type', type=str, default='oscillatory',
-                        choices=['oscillatory', 'drift', 'noisy', 'constant'],
-                        help='Type of temporal pattern for MEC input')
+                       choices=['oscillatory', 'drift', 'noisy', 'constant'],
+                       help='Type of temporal pattern for MEC input')
     parser.add_argument('--mec-theta-freq', type=float, default=5.0,
-                        help='Theta oscillation frequency (Hz)')
+                       help='Theta oscillation frequency (Hz)')
     parser.add_argument('--mec-theta-amplitude', type=float, default=0.3,
-                        help='Theta modulation depth (0-1)')
+                       help='Theta modulation depth (0-1)')
     parser.add_argument('--mec-gamma-freq', type=float, default=20.0,
-                        help='Gamma oscillation frequency (Hz)')
+                       help='Gamma oscillation frequency (Hz)')
     parser.add_argument('--mec-gamma-amplitude', type=float, default=0.15,
-                        help='Gamma modulation depth (0-1)')
-    parser.add_argument('--mec-rotation-groups', type=int, default=3,
-                        help='Number of groups for spatial rotation')
+                       help='Gamma modulation depth (0-1)')
     parser.add_argument('--mec-gamma-coupling', type=float, default=0.8,
-                        help='Gamma-theta coupling strength (0=independent, 1=fully coupled)')
+                       help='Gamma-theta coupling strength (0-1)')
     parser.add_argument('--mec-gamma-phase', type=float, default=0.0,
-                        help='Preferred theta phase for gamma peak (radians)')
+                       help='Preferred theta phase for gamma peak (radians)')
+    parser.add_argument('--mec-rotation-groups', type=int, default=3,
+                       help='Number of groups for spatial rotation')
     
-    # Expression level test parameters
-    parser.add_argument('--expression-levels', type=float, nargs='+',
-                        default=[0.2, 0.4, 0.6, 0.8, 1.0],
-                        help='Expression levels to test (default: 0.2 0.4 0.6 0.8 1.0)')
-
-    # Parameters for synaptic current recording
-    parser.add_argument('--record-currents', action='store_true',
-                        help='Record synaptic currents and generate current plots')
-
-    # Command-line arguments for nested experiments (connectivity x MEC input patterns)
+    # Nested experiment options
     nested_group = parser.add_argument_group('Nested Experiment Options')
-    
-    nested_group.add_argument('--nested-experiment', action='store_true',
-                              help='Run nested experiment (connectivity x input patterns)')
     nested_group.add_argument('--n-connectivity', type=int, default=5,
-                              help='Number of connectivity instances (default: 5)')
+                             help='Number of connectivity instances (default: 5)')
     nested_group.add_argument('--n-mec-patterns', type=int, default=3,
-                              help='Number of MEC patterns per connectivity (default: 3)')
-    nested_group.add_argument('--load-nested-results', type=str, default=None,
-                              help='Load nested experiment results from file')
-    nested_group.add_argument('--plot-variance-decomposition', action='store_true',
-                              help='Plot variance decomposition')
-    nested_group.add_argument('--plot-connectivity-variance', action='store_true',
-                              help='Plot connectivity variance')
-    nested_group.add_argument('--plot-connectivity-variance-details', action='store_true',
-                              help='Plot connectivity variance details')
-
-    # Bootstrap analysis options
-    bootstrap_group = parser.add_argument_group('Bootstrap Effect Size Analysis')
+                             help='Number of MEC patterns per connectivity (default: 3)')
     
-    bootstrap_group.add_argument('--run-bootstrap-analysis', action='store_true',
-                                 help='Run bootstrap effect size analysis on nested experiment results')
-    bootstrap_group.add_argument('--bootstrap-n-samples', type=int, default=10000,
-                                 help='Number of bootstrap samples (default: 10000)')
-    bootstrap_group.add_argument('--bootstrap-threshold-std', type=float, default=1.0,
-                                 help='Classification threshold in std deviations (default: 1.0)')
-    bootstrap_group.add_argument('--bootstrap-expression-threshold', type=float, default=0.2,
-                                 help='Opsin expression threshold for non-expressing cells (default: 0.2)')
-    bootstrap_group.add_argument('--bootstrap-seed', type=int, default=None,
-                                 help='Random seed for bootstrap analysis')
-    bootstrap_group.add_argument('--bootstrap-output-dir', type=str, 
-                                 default='./bootstrap_analysis',
-                                 help='Output directory for bootstrap analysis results')
-    bootstrap_group.add_argument('--bootstrap-intensities', type=float, nargs='+',
-                                 default=None,
-                                 help='Intensities to analyze (default: all available)')
-
-    # Effect size decision framework options
-    efsz_decision_group = parser.add_argument_group('Effect Size Decision Framework')
-
-    efsz_decision_group.add_argument('--run-decision-analysis', action='store_true',
-                                     help='Run effect size decision analysis on nested results')
-    efsz_decision_group.add_argument('--decision-target-power', type=float, default=0.80,
-                                     help='Target statistical power (default: 0.80)')
-    efsz_decision_group.add_argument('--decision-max-feasible-n', type=int, default=30,
-                                     help='Maximum feasible sample size (default: 30)')
-    efsz_decision_group.add_argument('--decision-min-effect', type=float, default=0.5,
-                                     help='Minimum meaningful effect size (Cohen\'s d, default: 0.5)')
-    efsz_decision_group.add_argument('--decision-min-diff-nS', type=float, default=0.001,
-                                     help='Minimum meaningful weight difference (nS, default: 0.001)')
-    efsz_decision_group.add_argument('--decision-output-dir', type=str,
-                                     default='./effect_size_decision',
-                                     help='Output directory for decision analysis')
+    # Expression level test options
+    parser.add_argument('--expression-levels', type=float, nargs='+',
+                       default=[0.2, 0.4, 0.6, 0.8, 1.0],
+                       help='Expression levels to test (default: 0.2 0.4 0.6 0.8 1.0)')
     
     args = parser.parse_args()
-
-    # Validate arguments
-    if args.plot_only:
-        if not any([args.load_comparative_results, args.load_ablation_results, 
-                    args.load_expression_results, args.load_nested_results]):
-            parser.error("--plot-only requires at least one of: --load-comparative-results, "
-                         "--load-ablation-results, --load-expression-results, --load-nested-results")
-            
+    
+    # Validate that at least one experiment type is selected
+    if not any([args.comparative, args.nested, args.ablations, args.expression, args.all]):
+        parser.error("No experiment selected. Use --comparative, --nested, --ablations, "
+                    "--expression, or --all")
+    
+    # Setup
     output_dir = args.output_dir
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
     
-    # =========================================================================
-    # PLOT-ONLY MODE: Load and plot results
-    # =========================================================================oo
-    
-    if args.plot_only:
-        
-        results = None
-        connectivity_analysis = None
-        conductance_analysis = None
-        ablation_results = None
-        expression_results = None
-        
-        # Load comparative results
-        if args.load_comparative_results:
-            logger.info(f"\nLoading comparative results from: {args.load_comparative_results}")
-            results, connectivity_analysis, conductance_analysis, metadata = \
-                load_experiment_results(args.load_comparative_results)
-        
-        # Load ablation results
-        if args.load_ablation_results:
-            logger.info(f"\nLoading ablation results from: {args.load_ablation_results}")
-            with open(args.load_ablation_results, 'rb') as f:
-                ablation_results = pickle.load(f)
-        
-        # Load expression results
-        if args.load_expression_results:
-            logger.info(f"\nLoading expression results from: {args.load_expression_results}")
-            with open(args.load_expression_results, 'rb') as f:
-                expression_results = pickle.load(f)
-        
-        # Plot comparative results
-        if results is not None:
-            logger.info("\nPlotting comparative experiment results...")
-            for intensity in [0.5, 1.0, 1.5]:
-                if intensity in results['pv']:
-                    plot_comparative_experiment_results(
-                        results, connectivity_analysis, 
-                        stimulation_level=intensity, 
-                        save_path=str(output_path)
-                    )
-
-            # Plot current analysis using reconstructed circuit
-            if metadata is not None:
-                plot_currents_from_results(
-                    results=results,
-                    metadata=metadata,
-                    output_path=output_path,
-                    optimization_json_file=metadata.get('optimization_file')
-                )        
-
-        
-        # Plot ablation results
-        if ablation_results is not None:
-            logger.info("\nPlotting ablation test results...")
-            for intensity in [0.5, 1.0, 1.5]:
-                # Check if this intensity was tested
-                try:
-                    test_intensity = list(ablation_results['excitation_to_interneurons']['full_network']['pv'].keys())[0]
-                    if intensity == test_intensity or intensity == 1.0:
-                        plot_ablation_test_results(
-                            ablation_results,
-                            intensity=intensity,
-                            save_path=str(output_path / "ablation_tests")
-                        )
-                except:
-                    pass
-        
-        # Plot expression results
-        if expression_results is not None:
-            logger.info("\nPlotting expression level results...")
-            plot_expression_level_results(
-                expression_results,
-                save_path=str(output_path / "expression_tests")
-            )
-        
-        # Plot combined figure if we have both ablation and expression results
-        if ablation_results is not None and expression_results is not None:
-            logger.info("\nPlotting combined ablation and expression analysis...")
-            plot_combined_ablation_and_expression(
-                ablation_results,
-                expression_results,
-                intensity=1.5,
-                save_path=str(output_path)
-            )
-
-        # Add synaptic weight plotting if requested
-        if args.plot_synaptic_weights and results is not None and metadata is not None:
-            plot_synaptic_weights_from_results(
-                results=results,
-                metadata=metadata,
-                output_path=output_path,
-                optimization_json_file=metadata.get('optimization_file')
-            )
-            
-        # Analyze synaptic weights by response if requested
-        if args.plot_weights_by_response and results is not None and metadata is not None:
-            analyze_synaptic_weights_by_response_from_results(
-                results=results,
-                metadata=metadata,
-                output_path=output_path,
-                optimization_json_file=metadata.get('optimization_file')
-            )
-
-        # Statistical testing with bootstrap (new)
-        if args.test_weights_by_response and results is not None and metadata is not None:
-            logger.info("\nPerforming statistical testing of weights by response...")
-
-            # Reconstruct circuit
-            circuit, _ = reconstruct_circuit_from_metadata(
-                metadata,
-                optimization_json_file=metadata.get('optimization_file')
-            )
-
-            # Create output directory
-            weights_stats_dir = output_path / 'weights_statistical_tests'
-            weights_stats_dir.mkdir(exist_ok=True, parents=True)
-
-            # Analyze for each target at highest intensity
-            for target_pop in ['pv', 'sst']:
-                if target_pop not in results:
-                    continue
-
-                intensities = sorted(results[target_pop].keys())
-                if len(intensities) == 0:
-                    continue
-
-                intensity = intensities[-1]
-
-                logger.info(f"\n  Testing {target_pop.upper()} stimulation at intensity {intensity}...")
-
-                # Run statistical analysis
-                response_analysis = analyze_weights_by_average_response(
-                    comparative_results=results,
-                    circuit=circuit,
-                    target_population=target_pop,
-                    intensity=intensity,
-                    baseline_start=metadata.get('warmup', 500.0),
-                    stim_start=metadata.get('stim_start', 1500.0),
-                    stim_duration=metadata.get('stim_duration', 1000.0),
-                    post_populations=['gc', 'mc', 'pv', 'sst'],
-                    threshold_std=args.response_threshold_std,
-                    n_permutations=10000,
-                    n_bootstrap=args.n_bootstrap,
-                    confidence_level=0.95
-                )
-
-                # Plot
-                fig = plot_weights_by_average_response(
-                    response_analysis,
-                    target_population=target_pop,
-                    post_populations=['gc', 'mc', 'pv', 'sst'],
-                    save_path=str(weights_stats_dir / f'{target_pop}_statistical_tests.pdf')
-                )
-                plt.close(fig)
-
-                # Save analysis results
-                with open(weights_stats_dir / f'{target_pop}_statistical_analysis.pkl', 'wb') as f:
-                    pickle.dump(response_analysis, f)
-        
-        # Nested experiment results plotting
-        nested_results = None
-
-        if args.load_nested_results:
-            logger.info(f"\nLoading nested experiment results from: {args.load_nested_results}")
-            with open(args.load_nested_results, 'rb') as f:
-                nested_results = pickle.load(f)
-
-        if nested_results is not None:
-
-            metadata = None
-            intensities = None
-            
-            if 'metadata' in nested_results:
-                metadata = nested_results['metadata']
-                if 'intensities' in metadata:
-                    intensities = sorted(nested_results['metadata']['intensities'])
-
-            if args.plot_variance_decomposition:
-                logger.info("\nPlotting variance decomposition...")
-                plot_variance_decomposition(
-                    nested_results['variance_analysis'],
-                    nested_results['regime_classification'],
-                    save_path=str(output_path / "variance_decomposition.pdf")
-                )
-
-            if args.plot_connectivity_variance:
-                logger.info("\nPlotting connectivity instance variance...")
-                intensities = None
-                if 'metadata' in nested_results and 'intensities' in nested_results['metadata']:
-                    intensities = sorted(nested_results['metadata']['intensities'])
-                intensity = intensities[-1]
-
-                plot_connectivity_instance_variance(
-                    nested_results['aggregated_results'],
-                    intensity=intensity,
-                    save_path=str(output_path / "connectivity_instance_variance.pdf")
-                )
-
-            if args.plot_connectivity_variance_details:
-                logger.info("\nPlotting detailed connectivity instance variance...")
-
-                intensity = intensities[-1]
-                
-                plot_connectivity_instance_variance_detailed(
-                    nested_results,
-                    intensity=intensity,
-                    warmup=metadata.get('warmup', 500.0),
-                    stim_start=metadata.get('stim_start', 1500.0),
-                    stim_duration=metadata.get('stim_duration', 1000.0),
-                    save_path=str(output_path / "connectivity_instance_variance_detailed.pdf")
-                )
-
-
-            # Print regime classification summary
-            print_nested_experiment_summary(nested_results)
-
-            if args.run_bootstrap_analysis:
-                if nested_results is None:
-                    parser.error("--run-bootstrap-analysis requires --load-nested-results")
-
-                print("\n" + "="*80)
-                print("Bootstrap Effect Size Analysis Mode")
-                print("="*80)
-    
-                # Determine device
-                if args.device is None:
-                    device = get_default_device()
-                else:
-                    device = torch.device(args.device)
-    
-                # Run analysis
-                bootstrap_results = run_nested_effect_size_analysis(
-                    nested_data=nested_results,
-                    target_populations=['pv', 'sst'],
-                    post_populations=['gc', 'mc', 'pv', 'sst'],
-                    intensities=args.bootstrap_intensities,
-                    source_populations=['pv', 'sst', 'mc', 'mec'],
-                    n_bootstrap=args.bootstrap_n_samples,
-                    threshold_std=args.bootstrap_threshold_std,
-                    expression_threshold=args.bootstrap_expression_threshold,
-                    random_seed=args.bootstrap_seed,
-                    output_dir=args.bootstrap_output_dir,
-                    device=device
-                )
-
-        if args.run_decision_analysis:
-            if nested_results is None:
-                parser.error("--run-decision-analysis requires --load-nested-results")
-
-            print("\n" + "="*80)
-            print("Effect Size Decision Analysis Mode")
-            print("="*80)
-
-            # Determine device
-            if args.device is None:
-                device = get_default_device()
-            else:
-                device = torch.device(args.device)
-
-            # Run decision analysis
-            decision_results = run_nested_effect_size_decision_analysis(
-                nested_data=nested_results,
-                target_populations=['pv', 'sst'],
-                post_populations=['gc', 'mc'],
-                intensities=args.bootstrap_intensities,  # Reuse bootstrap intensities arg
-                source_populations=['pv', 'sst', 'mc', 'mec'],
-                n_bootstrap=args.bootstrap_n_samples,
-                threshold_std=args.bootstrap_threshold_std,
-                expression_threshold=args.bootstrap_expression_threshold,
-                current_n=None,  # Auto-detect from nested results
-                target_power=args.decision_target_power,
-                max_feasible_n=args.decision_max_feasible_n,
-                min_meaningful_effect=args.decision_min_effect,
-                min_meaningful_diff_nS=args.decision_min_diff_nS,
-                random_seed=args.bootstrap_seed,
-                output_dir=args.decision_output_dir,
-                device=device
-            )
-
-            print("\nDecision analysis complete!")
-            print(f"Results saved to: {args.decision_output_dir}")
-                
-                
-        sys.exit(0)
-
-    logger.info("\n" + "="*80)
-    logger.info("Executing all experiments")
-    logger.info("="*80)
-    
-    # Auto-detect device or use specified
+    # Auto-detect device
     if args.device is None:
         device = get_default_device()
     else:
         device = torch.device(args.device)
-
+    
+    logger.info(f"\nUsing device: {device}")
+    if device.type == 'cuda':
+        logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
+    
+    # Create adaptive config if requested
     adaptive_config = None
     if args.adaptive_step:
         adaptive_config = GradientAdaptiveStepConfig(
@@ -6580,15 +6321,23 @@ Examples:
             gradient_low=args.adaptive_gradient_low,
             gradient_high=args.adaptive_gradient_high,
         )
-
-    logger.info(f"\nUsing device: {device}")
-    if device.type == 'cuda':
-        logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
-        logger.info(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GB")
+    
+    logger.info(f"\nExperiment configuration:")
+    logger.info(f"  Trials per condition: {args.n_trials}")
+    logger.info(f"  Base seed: {args.base_seed}")
+    logger.info(f"  Auto-save: {not args.no_auto_save}")
+    logger.info(f"  Output directory: {output_path}")
+    
+    # =========================================================================
+    # RUN EXPERIMENTS
+    # =========================================================================
+    
+    # Nested experiment
+    if args.nested or args.all:
+        logger.info("\n" + "="*80)
+        logger.info("Running Nested Experiment (Connectivity × MEC Patterns)")
+        logger.info("="*80)
         
-    if args.nested_experiment:
-
-        # Configure nested experiment
         nested_config = NestedExperimentConfig(
             n_connectivity_instances=args.n_connectivity,
             n_mec_patterns_per_connectivity=args.n_mec_patterns,
@@ -6597,7 +6346,12 @@ Examples:
             save_full_activity=args.save_full_activity
         )
 
-        # Run nested experiment
+        # Determine save file path
+        if args.save_results_file:
+            save_file = args.save_results_file
+        else:
+            save_file = str(output_path / 'nested_experiment_results.h5')
+        
         nested_results = run_nested_comparative_experiment(
             optimization_json_file=args.optimization_file,
             intensities=[1.0, 1.5],
@@ -6608,8 +6362,7 @@ Examples:
             warmup=500.0,
             device=device,
             nested_config=nested_config,
-            save_results_file=str(output_path / 'nested_experiment_results.pkl'),
-            # Pass through MEC pattern parameters
+            save_results_file=save_file,
             use_time_varying_mec=args.time_varying_mec,
             mec_pattern_type=args.mec_pattern_type,
             mec_theta_freq=args.mec_theta_freq,
@@ -6619,448 +6372,115 @@ Examples:
             mec_gamma_coupling_strength=args.mec_gamma_coupling,
             mec_gamma_preferred_phase=args.mec_gamma_phase,
             mec_rotation_groups=args.mec_rotation_groups,
-            # Adaptive stepping
-            adaptive_config=adaptive_config if args.adaptive_step else None
+            adaptive_config=adaptive_config
         )
-
-        # Generate variance decomposition plots
-        if args.plot_variance_decomposition:
-            logger.info("\nGenerating variance decomposition plots...")
-            plot_variance_decomposition(
-                nested_results['variance_analysis'],
-                nested_results['regime_classification'],
-                save_path=str(output_path / 'variance_decomposition.pdf')
-            )
-
-        # Save summary to memory bank
-        if nested_results is not None:
-            save_nested_experiment_summary(
-                nested_results,
-                output_dir=output_path
-            )
-            
-        sys.exit(0)
         
+        save_nested_experiment_summary(nested_results, output_dir=output_path)
     
-    logger.info(f"Number of trials: {args.n_trials}")
-    logger.info(f"Base seed: {args.base_seed}")
-    logger.info(f"Auto-save: {not args.no_auto_save}")
-
-    # Run main comparative experiment
-    logger.info("\n" + "#"*80)
-    logger.info("# Comparative PV vs SST Stimulation")
-    logger.info("#"*80)
-    
-    
-    experiment, results, connectivity_analysis, conductance_analysis = run_comparative_experiment(
-        optimization_json_file=args.optimization_file,
-        intensities=[0.5, 1.0, 1.5],
-        mec_current=args.mec_current,
-        opsin_current=args.opsin_current,
-        device=device,
-        n_trials=args.n_trials,
-        regenerate_connectivity_per_trial=args.regenerate_connectivity,
-        base_seed=args.base_seed,
-        stim_start=args.stim_start,
-        stim_duration=args.stim_duration,
-        load_results_file=args.load_comparative_results,
-        save_results_file=None,  # Let auto_save handle it
-        auto_save=not args.no_auto_save,
-        adaptive_step=args.adaptive_step,
-        adaptive_config=adaptive_config,
-        use_time_varying_mec=args.time_varying_mec,
-        mec_pattern_type=args.mec_pattern_type,
-        mec_theta_freq=args.mec_theta_freq,
-        mec_theta_amplitude=args.mec_theta_amplitude,
-        mec_gamma_freq=args.mec_gamma_freq,
-        mec_gamma_amplitude=args.mec_gamma_amplitude,
-        mec_gamma_coupling_strength=args.mec_gamma_coupling,
-        mec_gamma_preferred_phase=args.mec_gamma_phase,
-        mec_rotation_groups=args.mec_rotation_groups,
-        record_currents=args.record_currents,
-        save_full_activity=args.save_full_activity
-    )
-
-    # Print comparative results summary
-    mec_conn = connectivity_analysis['mec_connectivity']
-    logger.info(f"\nMEC Connectivity Summary:")
-    logger.info(f"  MEC -> PV: {mec_conn['mec_to_pv']} ({mec_conn['pv_fraction']:.3f})")
-    logger.info(f"  MEC -> GC: {mec_conn['mec_to_gc']} ({mec_conn['gc_fraction']:.3f})")
-    logger.info(f"  MEC -> MC: {mec_conn['mec_to_mc']}")
-    logger.info(f"  MEC -> SST: {mec_conn['mec_to_sst']}")
-
-    for target in ['pv', 'sst']:
-        logger.info(f"\n{target.upper()} Stimulation Results (n={args.n_trials} trials):")
-        logger.info("-" * 50)
-
-        for intensity in [0.5, 1.0, 1.5]:
-            analysis = results[target][intensity]
-            logger.info(f"\nIntensity {intensity}:")
-
-            for pop in ['gc', 'mc', 'pv', 'sst']:
-                if f'{pop}_excited' in analysis:
-                    excited = analysis[f'{pop}_excited']
-                    excited_std = analysis.get(f'{pop}_excited_std', 0.0)
-                    inhibited = analysis[f'{pop}_inhibited'] 
-                    mean_change = analysis[f'{pop}_mean_change']
-                    mean_change_std = analysis.get(f'{pop}_mean_change_std', 0.0)
-                    mean_stim_rate = analysis[f'{pop}_mean_stim_rate']
-                    mean_baseline_rate = analysis[f'{pop}_mean_baseline_rate']
-
-                    logger.info(f"  {pop.upper()}:")
-                    logger.info(f"    Excited: {excited:.2f} +/- {excited_std:.2f}")
-                    logger.info(f"    Inhibited: {inhibited:.2f}")
-                    logger.info(f"    Rate: {mean_baseline_rate:.1f} -> {mean_stim_rate:.1f} Hz")
-                    logger.info(f"    Change: {mean_change:.2f} +/- {mean_change_std:.2f} Hz")
-
-    plotted_synaptic_weights = False
-                    
-    # Plot comparative results
-    logger.info("\nGenerating comparative experiment plots...")
-    for intensity in [0.5, 1.0, 1.5]:
-        plot_comparative_experiment_results(
-            results, connectivity_analysis, 
-            stimulation_level=intensity, 
-            save_path=str(output_path)
-        )
-    if args.record_currents:
-        for target_pop in ['pv', 'sst']:
-            if (intensity in results[target_pop]) and ('current_analysis' in results[target_pop][intensity]):
-                experiment_data = results[target_pop][intensity]
-                recorded_currents = experiment_data.get('recorded_currents', None)
-                current_analysis = experiment_data.get('current_analysis', None)
-
-                # Use the actual experiment circuit
-                stim_start = args.stim_start
-                stim_duration = args.stim_duration
-                baseline_start = 500.0
-
-                plot_recorded_currents(
-                    experiment.circuit,
-                    recorded_currents, 
-                    current_analysis,
-                    target_population=target_pop, 
-                    baseline_start=baseline_start,
-                    stim_start=stim_start, 
-                    stim_duration=stim_duration,
-                    output_dir=str(output_path)
-                )
-
-    if args.plot_synaptic_weights and (not plotted_synaptic_weights):
-        if intensity > 1.0:
-            # Create base weights directory
-            weights_base_dir = output_path / 'synaptic_weights'
-            weights_base_dir.mkdir(exist_ok=True, parents=True)
-
-            for target_pop in ['pv', 'sst']:
-                experiment_data = results[target_pop][intensity]
-
-                # Get opsin expression for this target
-                opsin_expression_array = experiment_data['opsin_expression_mean']
-                if hasattr(opsin_expression_array, 'cpu'):
-                    opsin_expression_array = opsin_expression_array.cpu().numpy()
-                else:
-                    opsin_expression_array = np.array(opsin_expression_array)
-
-                opsin_expression_dict = {
-                    target_pop: opsin_expression_array
-                }
-
-                # Create subdirectory for this target population
-                target_output_dir = weights_base_dir / f'{target_pop}_stimulation'
-
-                logger.info(f"\n{'='*60}")
-                logger.info(f"Plotting synaptic weights for {target_pop.upper()} stimulation")
-                logger.info('='*60)
-
-                # Plot with proper directory structure
-                plot_synaptic_distributions(
-                    circuit=experiment.circuit,
-                    target_population=target_pop,
-                    opsin_expression=opsin_expression_dict,
-                    output_dir=str(target_output_dir)
-                )
-
-            plotted_synaptic_weights = True
-            logger.info(f"\nAll synaptic weight plots saved to: {weights_base_dir}")
-
-
-    # Visualization-based analysis of weights
-    if args.plot_weights_by_response and not args.plot_only:
-        logger.info("\n" + "#"*80)
-        logger.info("# Synaptic Weight Distribution by Response Type")
-        logger.info("#"*80)
-
-        # Create output directory
-        weights_viz_output = output_path / "weights_by_response_viz"
-        weights_viz_output.mkdir(exist_ok=True)
-
-        for target_pop in ['pv', 'sst']:
-            if target_pop not in results:
-                continue
-
-            intensities = sorted(results[target_pop].keys())
-            if len(intensities) == 0:
-                continue
-
-            intensity = intensities[-1]
-            experiment_data = results[target_pop][intensity]
-
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Visualizing {target_pop.upper()} stimulation at intensity {intensity}")
-            logger.info('='*60)
-
-            # Get opsin expression for this target
-            opsin_expression_array = experiment_data['opsin_expression_mean']
-            if hasattr(opsin_expression_array, 'cpu'):
-                opsin_expression_array = opsin_expression_array.cpu().numpy()
-            else:
-                opsin_expression_array = np.array(opsin_expression_array)
-
-            opsin_expression_dict = {target_pop: opsin_expression_array}
-
-            # Create subdirectory
-            target_viz_dir = weights_viz_output / f'{target_pop}_stimulation'
-
-            # Run visualization analysis
-            viz_analyses, viz_figs = analyze_and_plot_weights_by_response(
-                circuit=experiment.circuit,
-                target_population=target_pop,
-                experiment_results=experiment_data,
-                stim_start=args.stim_start,
-                stim_duration=args.stim_duration,
-                warmup=500.0,
-                post_populations=['gc', 'mc', 'pv', 'sst'],
-                save_path=str(target_viz_dir)
-            )
-
-            # Close figures
-            for fig in viz_figs:
-                plt.close(fig)
-
-    # Statistical testing with bootstrap
-    if args.test_weights_by_response and not args.plot_only:
-        logger.info("\n" + "#"*80)
-        logger.info("# Statistical Testing: Weights by Response")
-        logger.info("#"*80)
-
-        # Create output directory
-        weights_stats_output = output_path / "weights_statistical_tests"
-        weights_stats_output.mkdir(exist_ok=True)
-
-        # Analyze for each target population
-        all_statistical_analyses = {}
-
-        for target_pop in ['pv', 'sst']:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Statistical testing for {target_pop.upper()} stimulation")
-            logger.info('='*60)
-
-            # Use highest intensity
-            intensities = sorted(results[target_pop].keys())
-            if len(intensities) == 0:
-                continue
-
-            intensity = intensities[-1]
-
-            # Run statistical analysis
-            response_analysis = analyze_weights_by_average_response(
-                comparative_results=results,
-                circuit=experiment.circuit,
-                target_population=target_pop,
-                intensity=intensity,
-                baseline_start=500.0,
-                stim_start=args.stim_start,
-                stim_duration=args.stim_duration,
-                post_populations=['gc', 'mc', 'pv', 'sst'],
-                threshold_std=args.response_threshold_std,
-                n_permutations=10000,
-                n_bootstrap=args.n_bootstrap,
-                confidence_level=0.95
-            )
-
-            all_statistical_analyses[target_pop] = response_analysis
-
-            # Generate plots
-            logger.info(f"\nGenerating statistical plots for {target_pop.upper()}...")
-            fig = plot_weights_by_average_response(
-                response_analysis,
-                target_population=target_pop,
-                post_populations=['gc', 'mc', 'pv', 'sst'],
-                save_path=str(weights_stats_output / f'{target_pop}_statistical_tests.pdf')
-            )
-            plt.close(fig)
-
-            # Print mechanistic interpretation
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Mechanistic Interpretation for {target_pop.upper()} Stimulation:")
-            logger.info('='*60)
-
-            for post_pop in ['gc', 'mc', 'pv', 'sst']:
-                if post_pop == target_pop:
-                    continue
-
-                if post_pop not in response_analysis:
-                    continue
-
-                stats = response_analysis[post_pop]['statistics']
-
-                logger.info(f"\n{post_pop.upper()} cells:")
-
-                # Check direct inhibition from target
-                if target_pop in stats and not np.isnan(stats[target_pop]['mann_whitney_p']):
-                    target_stats = stats[target_pop]
-                    if target_stats['bonferroni_significant']:
-                        if target_stats['cohens_d'] < 0:
-                            logger.info(f"  Excited cells receive LESS direct inhibition from {target_pop.upper()}")
-                            logger.info(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
-                                  f"[{target_stats['cohens_d_ci_lower']:.3f}, {target_stats['cohens_d_ci_upper']:.3f}]")
-                            logger.info(f"    Δ = {target_stats['mean_diff']:.3f} nS "
-                                  f"[{target_stats['mean_diff_ci_lower']:.3f}, {target_stats['mean_diff_ci_upper']:.3f}]")
-                        else:
-                            logger.info(f"  Excited cells receive MORE direct inhibition from {target_pop.upper()}")
-                            logger.info(f"  Cohen's d = {target_stats['cohens_d']:.3f} "
-                                  f"[{target_stats['cohens_d_ci_lower']:.3f}, {target_stats['cohens_d_ci_upper']:.3f}]")
-
-                # Check other significant sources
-                other_sources = [s for s in stats.keys() if s != target_pop]
-                significant_sources = [s for s in other_sources 
-                                      if not np.isnan(stats[s]['mann_whitney_p']) 
-                                      and stats[s]['bonferroni_significant']]
-
-                if significant_sources:
-                    logger.info(f"  Other significant differences:")
-                    for source in significant_sources:
-                        s = stats[source]
-                        direction = "MORE" if s['cohens_d'] > 0 else "LESS"
-                        logger.info(f"    {source.upper()}: {direction} input")
-                        logger.info(f"      d = {s['cohens_d']:.3f} [{s['cohens_d_ci_lower']:.3f}, {s['cohens_d_ci_upper']:.3f}], "
-                              f"Δ = {s['mean_diff']:.3f} nS")
-
-        # Save all statistical analyses
-        stats_file = weights_stats_output / "statistical_analysis_results.pkl"
-        with open(stats_file, 'wb') as f:
-            pickle.dump(all_statistical_analyses, f)
-        logger.info(f"\nStatistical analysis results saved to: {stats_file}")
-
-        # Generate cross-population summary
-        logger.info(f"\n{'='*60}")
-        logger.info("Cross-Population Summary: Direct Inhibition Effects")
-        logger.info('='*60)
-        logger.info(f"\n{'Target':<8} {'Post':<6} {'Cohen d':<25} {'Mean Diff (nS)':<25} {'Sig':<5}")
-        logger.info(f"{'-'*8} {'-'*6} {'-'*25} {'-'*25} {'-'*5}")
-
-        for target_pop in ['pv', 'sst']:
-            if target_pop not in all_statistical_analyses:
-                continue
-
-            for post_pop in ['gc', 'mc']:
-                if post_pop not in all_statistical_analyses[target_pop]:
-                    continue
-
-                stats = all_statistical_analyses[target_pop][post_pop]['statistics']
-
-                if target_pop in stats and not np.isnan(stats[target_pop]['cohens_d']):
-                    s = stats[target_pop]
-                    d_str = f"{s['cohens_d']:>6.3f} [{s['cohens_d_ci_lower']:>6.3f}, {s['cohens_d_ci_upper']:>6.3f}]"
-                    diff_str = f"{s['mean_diff']:>6.3f} [{s['mean_diff_ci_lower']:>6.3f}, {s['mean_diff_ci_upper']:>6.3f}]"
-                    sig = '***' if s['bonferroni_significant'] else ('*' if s['significant'] else 'n.s.')
-
-                    logger.info(f"{target_pop.upper():<8} {post_pop.upper():<6} {d_str:<25} {diff_str:<25} {sig:<5}")
+    # Comparative experiment
+    if args.comparative or args.all:
+        logger.info("\n" + "="*80)
+        logger.info("Running Comparative Experiment (PV vs SST)")
+        logger.info("="*80)
         
-            
-    # Run ablation tests
-    logger.info("\n" + "#"*80)
-    logger.info("# Ablation Tests")
-    logger.info("#"*80)
-    
-    ablation_output = output_path / "ablation_tests"
-    ablation_results = run_all_ablation_tests(
-        optimization_json_file=args.optimization_file,
-        intensities=[0.5, 1.0, 1.5],
-        mec_current=args.mec_current,
-        opsin_current=args.opsin_current,
-        stim_start=args.stim_start,
-        stim_duration=args.stim_duration,
-        device=device,
-        n_trials=args.n_trials,
-        base_seed=args.base_seed,
-        output_dir=str(ablation_output),
-        use_time_varying_mec=args.time_varying_mec,
-        mec_pattern_type=args.mec_pattern_type,
-        mec_theta_freq=args.mec_theta_freq,
-        mec_theta_amplitude=args.mec_theta_amplitude,
-        mec_gamma_freq=args.mec_gamma_freq,
-        mec_gamma_amplitude=args.mec_gamma_amplitude,
-        mec_gamma_coupling_strength=args.mec_gamma_coupling,
-        mec_gamma_preferred_phase=args.mec_gamma_phase,
-        mec_rotation_groups=args.mec_rotation_groups
-    )
-    
-    # Plot ablation results
-    logger.info("\nGenerating ablation test plots...")
-    for intensity in [0.5, 1.0, 1.5]:
-        plot_ablation_test_results(
-            ablation_results,
-            intensity=intensity,
-            save_path=str(ablation_output)
+        experiment, results, conn_analysis, cond_analysis = run_comparative_experiment(
+            optimization_json_file=args.optimization_file,
+            intensities=[0.5, 1.0, 1.5],
+            mec_current=args.mec_current,
+            opsin_current=args.opsin_current,
+            device=device,
+            n_trials=args.n_trials,
+            regenerate_connectivity_per_trial=args.regenerate_connectivity,
+            base_seed=args.base_seed,
+            stim_start=args.stim_start,
+            stim_duration=args.stim_duration,
+            auto_save=not args.no_auto_save,
+            save_full_activity=args.save_full_activity,
+            record_currents=args.record_currents,
+            adaptive_step=args.adaptive_step,
+            adaptive_config=adaptive_config,
+            use_time_varying_mec=args.time_varying_mec,
+            mec_pattern_type=args.mec_pattern_type,
+            mec_theta_freq=args.mec_theta_freq,
+            mec_theta_amplitude=args.mec_theta_amplitude,
+            mec_gamma_freq=args.mec_gamma_freq,
+            mec_gamma_amplitude=args.mec_gamma_amplitude,
+            mec_gamma_coupling_strength=args.mec_gamma_coupling,
+            mec_gamma_preferred_phase=args.mec_gamma_phase,
+            mec_rotation_groups=args.mec_rotation_groups
         )
     
-    # Run expression level test
-    logger.info("\n" + "#"*80)
-    logger.info("# Opsin Expression Level Test")
-    logger.info("#"*80)
+    # Ablation tests
+    if args.ablations or args.all:
+        logger.info("\n" + "="*80)
+        logger.info("Running Ablation Tests")
+        logger.info("="*80)
+        
+        ablation_output = output_path / "ablation_tests"
+        ablation_results = run_all_ablation_tests(
+            optimization_json_file=args.optimization_file,
+            intensities=[0.5, 1.0, 1.5],
+            mec_current=args.mec_current,
+            opsin_current=args.opsin_current,
+            stim_start=args.stim_start,
+            stim_duration=args.stim_duration,
+            device=device,
+            n_trials=args.n_trials,
+            base_seed=args.base_seed,
+            output_dir=str(ablation_output),
+            use_time_varying_mec=args.time_varying_mec,
+            mec_pattern_type=args.mec_pattern_type,
+            mec_theta_freq=args.mec_theta_freq,
+            mec_theta_amplitude=args.mec_theta_amplitude,
+            mec_gamma_freq=args.mec_gamma_freq,
+            mec_gamma_amplitude=args.mec_gamma_amplitude,
+            mec_gamma_coupling_strength=args.mec_gamma_coupling,
+            mec_gamma_preferred_phase=args.mec_gamma_phase,
+            mec_rotation_groups=args.mec_rotation_groups
+        )
     
-    expression_output = output_path / "expression_tests"
-    expression_output.mkdir(exist_ok=True)
+    # Expression level tests
+    if args.expression or args.all:
+        logger.info("\n" + "="*80)
+        logger.info("Running Expression Level Tests")
+        logger.info("="*80)
+        
+        expression_output = output_path / "expression_tests"
+        expression_output.mkdir(exist_ok=True)
+        
+        expression_results = test_opsin_expression_levels(
+            optimization_json_file=args.optimization_file,
+            target_populations=['pv', 'sst'],
+            expression_levels=args.expression_levels,
+            intensity=1.5,
+            mec_current=args.mec_current,
+            opsin_current=args.opsin_current,
+            stim_start=args.stim_start,
+            stim_duration=args.stim_duration,
+            device=device,
+            n_trials=args.n_trials,
+            base_seed=args.base_seed,
+            include_ablations=True,
+            save_results_file=str(expression_output / "expression_results.pkl"),
+            use_time_varying_mec=args.time_varying_mec,
+            mec_pattern_type=args.mec_pattern_type,
+            mec_theta_freq=args.mec_theta_freq,
+            mec_theta_amplitude=args.mec_theta_amplitude,
+            mec_gamma_freq=args.mec_gamma_freq,
+            mec_gamma_amplitude=args.mec_gamma_amplitude,
+            mec_gamma_coupling_strength=args.mec_gamma_coupling,
+            mec_gamma_preferred_phase=args.mec_gamma_phase,
+            mec_rotation_groups=args.mec_rotation_groups
+        )
     
-    expression_results = test_opsin_expression_levels(
-        optimization_json_file=args.optimization_file,
-        target_populations=['pv', 'sst'],
-        expression_levels=args.expression_levels,
-        intensity=1.5,
-        mec_current=args.mec_current,
-        opsin_current=args.opsin_current,
-        stim_start=args.stim_start,
-        stim_duration=args.stim_duration,
-        device=device,
-        n_trials=args.n_trials,
-        base_seed=args.base_seed,
-        include_ablations=True,
-        save_results_file=str(expression_output / "expression_results.pkl"),
-        use_time_varying_mec=args.time_varying_mec,
-        mec_pattern_type=args.mec_pattern_type,
-        mec_theta_freq=args.mec_theta_freq,
-        mec_theta_amplitude=args.mec_theta_amplitude,
-        mec_gamma_freq=args.mec_gamma_freq,
-        mec_gamma_amplitude=args.mec_gamma_amplitude,
-        mec_gamma_coupling_strength=args.mec_gamma_coupling,
-        mec_gamma_preferred_phase=args.mec_gamma_phase,
-        mec_rotation_groups=args.mec_rotation_groups
-    )
-    
-    # Plot expression level results
-    logger.info("\nGenerating expression level plots...")
-    plot_expression_level_results(
-        expression_results,
-        save_path=str(expression_output)
-    )
-    
-    # Create combined analysis plot
-    logger.info("\nGenerating combined analysis figure...")
-    plot_combined_ablation_and_expression(
-        ablation_results,
-        expression_results,
-        intensity=1.5,
-        save_path=str(output_path)
-    )
-    
-    # Final summary
+    # Summary
     logger.info("\n" + "="*80)
-    logger.info("Experiments complete")
+    logger.info("All experiments complete!")
     logger.info("="*80)
-    logger.info(f"\nResults saved to:")
-    logger.info(f"  Comparative: {output_path}/")
-    logger.info(f"  Ablation: {ablation_output}/")
-    logger.info(f"  Expression: {expression_output}/")
+    logger.info(f"\nResults saved to: {output_path}")
+    logger.info("\nTo analyze results, use DG_analysis.py:")
+    logger.info("  python DG_analysis.py plot-comparative results.pkl")
+    logger.info("  python DG_analysis.py plot-ablations ablation_tests/all_ablation_tests.pkl")
+    logger.info("  python DG_analysis.py bootstrap-analysis nested_experiment_results.pkl")
+    logger.info("\nFor all analysis options: python DG_analysis.py --help")
     logger.info("="*80)
