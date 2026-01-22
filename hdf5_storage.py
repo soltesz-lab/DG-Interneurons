@@ -3,6 +3,7 @@ HDF5 Storage Utilities for Nested Experiments
 
 Provides incremental saving and loading of nested experimental results
 to avoid memory issues with large experiments.
+
 """
 
 import h5py
@@ -62,7 +63,11 @@ def save_trial_to_hdf5(f: h5py.File,
                        connectivity_idx: int,
                        mec_pattern_idx: int,
                        trial_result: Dict,
-                       save_full_activity: bool = False) -> None:
+                       save_full_activity: bool = False,
+                       stim_start: float = None,
+                       stim_duration: float = None,
+                       warmup: float = None,
+                       expression_threshold: float = 0.2) -> None:
     """
     Save a single trial result to HDF5 file
     
@@ -74,6 +79,10 @@ def save_trial_to_hdf5(f: h5py.File,
         mec_pattern_idx: MEC pattern index
         trial_result: Trial result dict from simulate_stimulation
         save_full_activity: Whether to save complete activity traces
+        stim_start: Stimulation start time (needed for period stats)
+        stim_duration: Stimulation duration (needed for period stats)
+        warmup: Baseline period start (needed for period stats)
+        expression_threshold: Opsin expression threshold for non-expressing cells
     """
     # Create group hierarchy
     intensity_key = f"intensity_{intensity}"
@@ -96,7 +105,8 @@ def save_trial_to_hdf5(f: h5py.File,
         return np.array(x)
     
     # Save essential data
-    trial_grp.create_dataset('time', data=to_numpy(trial_result['time']))
+    time = to_numpy(trial_result['time'])
+    trial_grp.create_dataset('time', data=time)
     
     # Save activity traces (use aggregated if available, otherwise raw)
     if 'activity_trace_mean' in trial_result:
@@ -104,26 +114,79 @@ def save_trial_to_hdf5(f: h5py.File,
     else:
         activity_data = trial_result['activity_trace']
     
+    # Get opsin expression for target population analysis
+    if 'opsin_expression_mean' in trial_result:
+        opsin_expression = to_numpy(trial_result['opsin_expression_mean'])
+    elif 'opsin_expression' in trial_result:
+        opsin_expression = to_numpy(trial_result['opsin_expression'])
+    else:
+        opsin_expression = None
+    
+    # Compute time masks if period info provided
+    if stim_start is not None and stim_duration is not None and warmup is not None:
+        baseline_mask = (time >= warmup) & (time < stim_start)
+        stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+        compute_period_stats = True
+    else:
+        compute_period_stats = False
+    
     for pop in ['gc', 'mc', 'pv', 'sst', 'mec']:
         if pop in activity_data:
             dataset_name = f'activity_{pop}'
+            pop_activity = to_numpy(activity_data[pop])
+            
             if save_full_activity:
+                # Save full traces
                 trial_grp.create_dataset(dataset_name, 
-                                        data=to_numpy(activity_data[pop]),
+                                        data=pop_activity,
                                         compression='gzip', compression_opts=4)
             else:
-                # Save only summary statistics to save space
-                pop_activity = to_numpy(activity_data[pop])
+                # Save summary statistics only
                 trial_grp.attrs[f'{dataset_name}_mean'] = np.mean(pop_activity)
                 trial_grp.attrs[f'{dataset_name}_std'] = np.std(pop_activity)
+                
+                # Save period-specific statistics if period info available
+                if compute_period_stats:
+                    # Compute statistics per cell for baseline and stim periods
+                    baseline_rates = np.mean(pop_activity[:, baseline_mask], axis=1)
+                    stim_rates = np.mean(pop_activity[:, stim_mask], axis=1)
+                    rate_changes = stim_rates - baseline_rates
+                    baseline_std = np.std(baseline_rates)
+                    
+                    # Check if this is target population
+                    is_target = (pop == target)
+                    
+                    if is_target and opsin_expression is not None:
+                        # For target population, also save non-expressing cell stats
+                        non_expressing_mask = opsin_expression < expression_threshold
+                        n_nonexpr = np.sum(non_expressing_mask)
+                        
+                        if n_nonexpr > 0:
+                            baseline_rates_nonexpr = baseline_rates[non_expressing_mask]
+                            stim_rates_nonexpr = stim_rates[non_expressing_mask]
+                            rate_changes_nonexpr = rate_changes[non_expressing_mask]
+                            baseline_std_nonexpr = np.std(baseline_rates_nonexpr)
+                            
+                            excited_frac_nonexpr = np.mean(rate_changes_nonexpr > baseline_std_nonexpr)
+                            
+                            # Save non-expressing stats
+                            trial_grp.attrs[f'{pop}_excited_nonexpr'] = excited_frac_nonexpr
+                            trial_grp.attrs[f'{pop}_mean_change_nonexpr'] = np.mean(rate_changes_nonexpr)
+                            trial_grp.attrs[f'{pop}_baseline_rate_nonexpr'] = np.mean(baseline_rates_nonexpr)
+                            trial_grp.attrs[f'{pop}_stim_rate_nonexpr'] = np.mean(stim_rates_nonexpr)
+                            trial_grp.attrs[f'{pop}_n_nonexpr'] = n_nonexpr
+                    
+                    # Standard statistics (all cells)
+                    excited_frac = np.mean(rate_changes > baseline_std)
+                    
+                    trial_grp.attrs[f'{pop}_excited'] = excited_frac
+                    trial_grp.attrs[f'{pop}_mean_change'] = np.mean(rate_changes)
+                    trial_grp.attrs[f'{pop}_baseline_rate'] = np.mean(baseline_rates)
+                    trial_grp.attrs[f'{pop}_stim_rate'] = np.mean(stim_rates)
     
     # Save opsin expression
-    if 'opsin_expression_mean' in trial_result:
-        trial_grp.create_dataset('opsin_expression',
-                                data=to_numpy(trial_result['opsin_expression_mean']))
-    elif 'opsin_expression' in trial_result:
-        trial_grp.create_dataset('opsin_expression',
-                                data=to_numpy(trial_result['opsin_expression']))
+    if opsin_expression is not None:
+        trial_grp.create_dataset('opsin_expression', data=opsin_expression)
     
     # Save indices and metadata as attributes
     trial_grp.attrs['connectivity_idx'] = connectivity_idx
@@ -199,113 +262,84 @@ def get_trial_indices(f: h5py.File,
     return indices
 
 
-def aggregate_from_hdf5(f: h5py.File,
-                        target: str,
-                        intensity: float,
-                        stim_start: float,
-                        stim_duration: float,
-                        warmup: float,
-                        expression_threshold: float = 0.2) -> Dict:
+def extract_trial_statistics_from_hdf5(f: h5py.File,
+                                       target: str,
+                                       intensity: float,
+                                       n_connectivity: int,
+                                       n_mec_patterns: int) -> Dict:
     """
-    Compute aggregated statistics directly from HDF5 file
+    Extract per-trial statistics directly from HDF5 attributes
     
-    This enables analysis without loading all data into memory.
+    Pure I/O function - reads pre-computed statistics without any analysis.
+    
+    Args:
+        f: Open h5py.File object
+        target: Target population
+        intensity: Light intensity
+        n_connectivity: Number of connectivity instances
+        n_mec_patterns: Number of MEC patterns per connectivity
+        
+    Returns:
+        Dict mapping conn_idx to list of trial statistics
     """
-    from nested_experiment import _aggregate_trial_group
-    
     intensity_key = f"intensity_{intensity}"
     
     if intensity_key not in f[target]:
         return {}
     
-    # Group by connectivity
+    # Organize by connectivity
     conn_groups = {}
     
-    for conn_key in f[target][intensity_key].keys():
-        conn_idx = int(conn_key.split('_')[1])
+    for conn_idx in range(n_connectivity):
+        conn_key = f"connectivity_{conn_idx}"
+        
+        if conn_key not in f[target][intensity_key]:
+            continue
+        
         conn_groups[conn_idx] = []
         
-        for pattern_key in f[target][intensity_key][conn_key].keys():
-            pattern_idx = int(pattern_key.split('_')[1])
+        for pattern_idx in range(n_mec_patterns):
+            pattern_key = f"pattern_{pattern_idx}"
             
-            # Load this trial
-            trial_data = load_trial_from_hdf5(f, target, intensity, 
-                                             conn_idx, pattern_idx)
+            if pattern_key not in f[target][intensity_key][conn_key]:
+                continue
             
-            # Create NestedTrialResult-like object
-            from nested_experiment import NestedTrialResult
-            trial_result = NestedTrialResult(
-                connectivity_idx=conn_idx,
-                mec_pattern_idx=pattern_idx,
-                seed=0,  # Not stored in HDF5
-                results=trial_data,
-                target_population=trial_data['target_population'],
-                opsin_expression=trial_data['opsin_expression']
-            )
+            trial_grp = f[target][intensity_key][conn_key][pattern_key]
             
-            conn_groups[conn_idx].append(trial_result)
-    
-    # Aggregate within each connectivity instance
-    by_conn = {}
-    for conn_idx, trials in conn_groups.items():
-        by_conn[conn_idx] = _aggregate_trial_group(
-            trials, stim_start, stim_duration, warmup, expression_threshold
-        )
-    
-    return by_conn
-
-
-def compute_variance_from_hdf5(f: h5py.File,
-                               target: str,
-                               intensity: float,
-                               stim_start: float,
-                               stim_duration: float,
-                               warmup: float) -> Dict:
-    """
-    Compute variance decomposition directly from HDF5
-    
-    Memory-efficient version that processes one connectivity at a time.
-    """
-    from nested_experiment import _decompose_population_variance
-    
-    intensity_key = f"intensity_{intensity}"
-    
-    if intensity_key not in f[target]:
-        return {}
-    
-    # Load trials grouped by connectivity
-    conn_groups = {}
-    
-    for conn_key in f[target][intensity_key].keys():
-        conn_idx = int(conn_key.split('_')[1])
-        conn_groups[conn_idx] = []
-        
-        for pattern_key in f[target][intensity_key][conn_key].keys():
-            pattern_idx = int(pattern_key.split('_')[1])
+            # Extract statistics for all populations
+            trial_stats = {
+                'connectivity_idx': conn_idx,
+                'mec_pattern_idx': pattern_idx,
+                'target_population': trial_grp.attrs['target_population'],
+                'populations': {}
+            }
             
-            trial_data = load_trial_from_hdf5(f, target, intensity,
-                                             conn_idx, pattern_idx)
+            for pop in ['gc', 'mc', 'pv', 'sst']:
+                # Check if this population has data
+                excited_key = f'{pop}_excited'
+                if excited_key not in trial_grp.attrs:
+                    continue
+                
+                pop_stats = {
+                    'excited': trial_grp.attrs[f'{pop}_excited'],
+                    'mean_change': trial_grp.attrs[f'{pop}_mean_change'],
+                    'baseline_rate': trial_grp.attrs[f'{pop}_baseline_rate'],
+                    'stim_rate': trial_grp.attrs[f'{pop}_stim_rate']
+                }
+                
+                # Add non-expressing cell stats if this is target population
+                if pop == target and f'{pop}_excited_nonexpr' in trial_grp.attrs:
+                    pop_stats['excited_nonexpr'] = trial_grp.attrs[f'{pop}_excited_nonexpr']
+                    pop_stats['mean_change_nonexpr'] = trial_grp.attrs[f'{pop}_mean_change_nonexpr']
+                    pop_stats['baseline_rate_nonexpr'] = trial_grp.attrs[f'{pop}_baseline_rate_nonexpr']
+                    pop_stats['stim_rate_nonexpr'] = trial_grp.attrs[f'{pop}_stim_rate_nonexpr']
+                    pop_stats['n_nonexpr'] = trial_grp.attrs.get(f'{pop}_n_nonexpr', 0)
+                
+                trial_stats['populations'][pop] = pop_stats
             
-            from nested_experiment import NestedTrialResult
-            trial_result = NestedTrialResult(
-                connectivity_idx=conn_idx,
-                mec_pattern_idx=pattern_idx,
-                seed=0,
-                results=trial_data,
-                target_population=trial_data['target_population'],
-                opsin_expression=trial_data['opsin_expression']
-            )
-            
-            conn_groups[conn_idx].append(trial_result)
+            conn_groups[conn_idx].append(trial_stats)
     
-    # Compute variance for each population
-    pop_variance = {}
-    for pop in ['gc', 'mc', 'pv', 'sst']:
-        pop_variance[pop] = _decompose_population_variance(
-            conn_groups, pop, stim_start, stim_duration, warmup
-        )
-    
-    return pop_variance
+    return conn_groups
 
 
 def load_metadata_from_hdf5(filepath: str) -> Dict:

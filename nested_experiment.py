@@ -30,9 +30,8 @@ from hdf5_storage import (
     create_hdf5_experiment_file,
     save_trial_to_hdf5,
     load_trial_from_hdf5,
-    aggregate_from_hdf5,
-    compute_variance_from_hdf5,
-    load_metadata_from_hdf5
+    load_metadata_from_hdf5,
+    extract_trial_statistics_from_hdf5
 )
 
 logger = logging.getLogger('nested_experiment')
@@ -72,7 +71,7 @@ class NestedTrialResult(NamedTuple):
     results: Dict  # Standard trial results
     target_population: str  # Which population was stimulated ('pv', 'sst', etc.)
     opsin_expression: np.ndarray  # Expression levels for target population [n_cells]
-    
+
 
 def generate_nested_seeds(config: NestedExperimentConfig) -> Dict[str, List[List[int]]]:
     """
@@ -100,6 +99,188 @@ def generate_nested_seeds(config: NestedExperimentConfig) -> Dict[str, List[List
         'mec_pattern_seeds': mec_pattern_seeds
     }
 
+
+# ============================================================================
+# Analysis Functions (Moved from hdf5_storage.py)
+# ============================================================================
+
+def _aggregate_precomputed_stats(trials: List[Dict], target: str) -> Dict:
+    """
+    Aggregate pre-computed statistics from multiple trials
+    
+    Used when save_full_activity=False to avoid loading full traces.
+    
+    Args:
+        trials: List of trial statistics dicts (from extract_trial_statistics_from_hdf5)
+        target: Target population being stimulated
+        
+    Returns:
+        Aggregated statistics across trials
+    """
+    aggregated = {}
+    
+    # Collect stats for each population
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        metrics = {
+            'excited': [],
+            'mean_change': [],
+            'baseline_rate': [],
+            'stim_rate': []
+        }
+        
+        # Add non-expressing metrics for target population
+        if pop == target:
+            metrics['excited_nonexpr'] = []
+            metrics['mean_change_nonexpr'] = []
+            metrics['n_nonexpr'] = []
+        
+        # Collect from all trials
+        for trial in trials:
+            if pop in trial['stats']:
+                stats = trial['stats'][pop]
+                metrics['excited'].append(stats['excited'])
+                metrics['mean_change'].append(stats['mean_change'])
+                metrics['baseline_rate'].append(stats['baseline_rate'])
+                metrics['stim_rate'].append(stats['stim_rate'])
+                
+                if pop == target and 'excited_nonexpr' in stats:
+                    metrics['excited_nonexpr'].append(stats['excited_nonexpr'])
+                    metrics['mean_change_nonexpr'].append(stats['mean_change_nonexpr'])
+                    metrics['n_nonexpr'].append(stats['n_nonexpr'])
+        
+        # Compute aggregated statistics
+        aggregated[pop] = {
+            'excited_mean': np.mean(metrics['excited']),
+            'excited_std': np.std(metrics['excited']),
+            'excited_sem': np.std(metrics['excited']) / np.sqrt(len(metrics['excited'])),
+            'mean_change_mean': np.mean(metrics['mean_change']),
+            'mean_change_std': np.std(metrics['mean_change']),
+            'baseline_rate_mean': np.mean(metrics['baseline_rate']),
+            'stim_rate_mean': np.mean(metrics['stim_rate']),
+            'n_trials': len(trials)
+        }
+        
+        # Add non-expressing statistics for target population
+        if pop == target and metrics['excited_nonexpr']:
+            aggregated[pop]['excited_nonexpr_mean'] = np.mean(metrics['excited_nonexpr'])
+            aggregated[pop]['excited_nonexpr_std'] = np.std(metrics['excited_nonexpr'])
+            aggregated[pop]['mean_change_nonexpr_mean'] = np.mean(metrics['mean_change_nonexpr'])
+            aggregated[pop]['mean_change_nonexpr_std'] = np.std(metrics['mean_change_nonexpr'])
+            aggregated[pop]['n_nonexpr_mean'] = np.mean(metrics['n_nonexpr'])
+    
+    return aggregated
+
+
+def _aggregate_from_hdf5_storage(f: h5py.File,
+                                  target: str,
+                                  intensity: float,
+                                  stim_start: float,
+                                  stim_duration: float,
+                                  warmup: float,
+                                  expression_threshold: float = 0.2) -> Dict:
+    """
+    Compute aggregated statistics directly from HDF5 file
+    
+    This enables analysis without loading all data into memory.
+    Works with both full activity traces and pre-computed summary stats.
+    
+    Args:
+        f: Open h5py.File object
+        target: Target population
+        intensity: Light intensity
+        stim_start: Stimulation start time (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Baseline period start (ms)
+        expression_threshold: Opsin expression threshold
+        
+    Returns:
+        Dict mapping connectivity_idx to aggregated statistics
+    """
+    intensity_key = f"intensity_{intensity}"
+    
+    if intensity_key not in f[target]:
+        return {}
+    
+    # Group by connectivity
+    conn_groups = {}
+    
+    for conn_key in f[target][intensity_key].keys():
+        conn_idx = int(conn_key.split('_')[1])
+        conn_groups[conn_idx] = []
+        
+        for pattern_key in f[target][intensity_key][conn_key].keys():
+            pattern_idx = int(pattern_key.split('_')[1])
+            trial_grp = f[target][intensity_key][conn_key][pattern_key]
+            
+            # Check if we have pre-computed stats or need to load full activity
+            has_precomputed = 'gc_excited' in trial_grp.attrs
+            
+            if has_precomputed:
+                # Use pre-computed statistics (memory efficient)
+                trial_data = {
+                    'precomputed_stats': True,
+                    'connectivity_idx': conn_idx,
+                    'mec_pattern_idx': pattern_idx,
+                    'target_population': trial_grp.attrs['target_population'],
+                    'opsin_expression': trial_grp['opsin_expression'][:],
+                    'stats': {}
+                }
+                
+                # Extract stats for all populations
+                for pop in ['gc', 'mc', 'pv', 'sst']:
+                    if f'{pop}_excited' in trial_grp.attrs:
+                        trial_data['stats'][pop] = {
+                            'excited': trial_grp.attrs[f'{pop}_excited'],
+                            'mean_change': trial_grp.attrs[f'{pop}_mean_change'],
+                            'baseline_rate': trial_grp.attrs[f'{pop}_baseline_rate'],
+                            'stim_rate': trial_grp.attrs[f'{pop}_stim_rate']
+                        }
+                        
+                        # Add non-expressing cell stats if this is target population
+                        if pop == target and f'{pop}_excited_nonexpr' in trial_grp.attrs:
+                            trial_data['stats'][pop]['excited_nonexpr'] = trial_grp.attrs[f'{pop}_excited_nonexpr']
+                            trial_data['stats'][pop]['mean_change_nonexpr'] = trial_grp.attrs[f'{pop}_mean_change_nonexpr']
+                            trial_data['stats'][pop]['baseline_rate_nonexpr'] = trial_grp.attrs[f'{pop}_baseline_rate_nonexpr']
+                            trial_data['stats'][pop]['stim_rate_nonexpr'] = trial_grp.attrs[f'{pop}_stim_rate_nonexpr']
+                            trial_data['stats'][pop]['n_nonexpr'] = trial_grp.attrs[f'{pop}_n_nonexpr']
+                
+                conn_groups[conn_idx].append(trial_data)
+            else:
+                # Load full activity and compute
+                trial_data = load_trial_from_hdf5(f, target, intensity, 
+                                                 conn_idx, pattern_idx)
+                
+                # Create NestedTrialResult-like object
+                trial_result = NestedTrialResult(
+                    connectivity_idx=conn_idx,
+                    mec_pattern_idx=pattern_idx,
+                    seed=0,
+                    results=trial_data,
+                    target_population=trial_data['target_population'],
+                    opsin_expression=trial_data['opsin_expression']
+                )
+                
+                conn_groups[conn_idx].append(trial_result)
+    
+    # Aggregate within each connectivity instance
+    by_conn = {}
+    for conn_idx, trials in conn_groups.items():
+        # Check if we have pre-computed stats
+        if trials and isinstance(trials[0], dict) and trials[0].get('precomputed_stats'):
+            # Aggregate from pre-computed stats
+            by_conn[conn_idx] = _aggregate_precomputed_stats(trials, target)
+        else:
+            # Use original aggregation (requires full activity)
+            by_conn[conn_idx] = _aggregate_trial_group(
+                trials, stim_start, stim_duration, warmup, expression_threshold
+            )
+    
+    return by_conn
+
+
+# ============================================================================
+# Main Experiment Runner
+# ============================================================================
 
 def run_nested_comparative_experiment(
     optimization_json_file: Optional[str] = None,
@@ -171,6 +352,20 @@ def run_nested_comparative_experiment(
     circuit_params = CircuitParams()
     synaptic_params = PerConnectionSynapticParams()
     opsin_params = OpsinParams()
+
+    metadata = {
+        'optimization_file': optimization_json_file,
+        'intensities': intensities,
+        'mec_current': mec_current,
+        'opsin_current': opsin_current,
+        'stim_start': stim_start,
+        'stim_duration': stim_duration,
+        'warmup': warmup,
+        'seed_structure': seed_structure,
+        'n_connectivity_instances': nested_config.n_connectivity_instances,
+        'n_mec_patterns_per_connectivity': nested_config.n_mec_patterns_per_connectivity,
+        'base_seed': nested_config.base_seed
+    }
     
     # Initialize storage
     if use_hdf5:
@@ -265,7 +460,10 @@ def run_nested_comparative_experiment(
                                 conn_idx,
                                 mec_idx,
                                 result,
-                                save_full_activity=nested_config.save_full_activity
+                                save_full_activity=nested_config.save_full_activity,
+                                stim_start=stim_start,
+                                stim_duration=stim_duration,
+                                warmup=warmup
                             )
                             # Flush to disk
                             hdf5_file.flush()
@@ -341,22 +539,15 @@ def run_nested_comparative_experiment(
             'regime_classification': regime_classification,
             'config': nested_config,
             'seed_structure': seed_structure,
-            'metadata': {
-                'optimization_file': optimization_json_file,
-                'intensities': intensities,
-                'mec_current': mec_current,
-                'opsin_current': opsin_current,
-                'stim_start': stim_start,
-                'stim_duration': stim_duration,
-                'warmup': warmup
-            }
+            'metadata': metadata,
+            'hdf5_file': save_results_file if use_hdf5 else None
         }
 
         # Save or update HDF5
         if use_hdf5:
             # Store aggregated results and variance analysis in HDF5
             _save_analysis_to_hdf5(hdf5_file, aggregated_results, 
-                                  variance_analysis, regime_classification)
+                                   variance_analysis, regime_classification)
         elif save_results_file:
             save_nested_experiment_results(complete_results, save_results_file)
 
@@ -493,7 +684,6 @@ def _aggregate_trial_group(
     
     for trial in trials:
         # Handle both aggregated (activity_trace_mean) and raw (activity_trace) results
-        # When simulate_stimulation is called with n_trials=1, it aggregates and uses 'activity_trace_mean'
         if 'activity_trace_mean' in trial.results:
             activity = trial.results['activity_trace_mean']
         elif 'activity_trace' in trial.results:
@@ -605,6 +795,197 @@ def _aggregate_connectivity_means(by_conn: Dict) -> Dict:
     return aggregated
 
 
+def aggregate_nested_results_from_hdf5(
+    f: h5py.File,
+    config: NestedExperimentConfig,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float
+) -> Dict:
+    """
+    Aggregate nested results directly from HDF5 file
+    
+    Memory-efficient version that doesn't load all data at once.
+    """
+    aggregated = {
+        'by_connectivity': {},
+        'grand_mean': {},
+        'across_connectivity': {}
+    }
+    
+    for target in ['pv', 'sst']:
+        aggregated['by_connectivity'][target] = {}
+        aggregated['grand_mean'][target] = {}
+        aggregated['across_connectivity'][target] = {}
+        
+        # Get all intensities from HDF5
+        intensities = [float(k.split('_')[1]) for k in f[target].keys() 
+                      if k.startswith('intensity_')]
+        
+        for intensity in intensities:
+            # Aggregate within each connectivity using the moved function
+            by_conn = _aggregate_from_hdf5_storage(
+                f, target, intensity, stim_start, stim_duration, warmup
+            )
+            
+            aggregated['by_connectivity'][target][intensity] = by_conn
+            
+            # Grand mean: compute from by-connectivity aggregates
+            aggregated['grand_mean'][target][intensity] = \
+                _compute_grand_mean_from_connectivity_aggregates(by_conn)
+            
+            # Across connectivity
+            aggregated['across_connectivity'][target][intensity] = \
+                _aggregate_connectivity_means(by_conn)
+    
+    return aggregated
+
+
+def _compute_grand_mean_from_connectivity_aggregates(by_conn: Dict) -> Dict:
+    """
+    Compute grand mean statistics from connectivity-level aggregates
+    with proper hierarchical variance decomposition.
+    
+    For nested data (connectivity instances x MEC patterns), properly computes:
+    - Grand mean (weighted by sample sizes)
+    - Total variance (between-connectivity + pooled within-connectivity)
+    - Proper standard error accounting for hierarchical structure
+    
+    Args:
+        by_conn: Dict mapping connectivity_idx to aggregated statistics
+                 (output from _aggregate_from_hdf5_storage)
+    
+    Returns:
+        Grand mean statistics across all connectivity instances
+    """
+    if not by_conn:
+        return {}
+    
+    # Get populations from first connectivity instance
+    populations = list(next(iter(by_conn.values())).keys())
+    
+    grand_mean = {}
+    
+    for pop in populations:
+        # Collect statistics across all connectivity instances
+        connectivity_means = []
+        connectivity_vars = []
+        connectivity_ns = []
+        
+        baseline_rates = []
+        stim_rates = []
+        
+        # For target population (if non-expressing stats available)
+        excited_nonexpr_means = []
+        excited_nonexpr_vars = []
+        mean_change_nonexpr_means = []
+        mean_change_nonexpr_vars = []
+        n_nonexpr_list = []
+        
+        for conn_data in by_conn.values():
+            pop_data = conn_data[pop]
+            
+            # Store connectivity-level statistics
+            connectivity_means.append(pop_data['excited_mean'])
+            connectivity_vars.append(pop_data['excited_std']**2)
+            connectivity_ns.append(pop_data['n_trials'])
+            
+            baseline_rates.append(pop_data['baseline_rate_mean'])
+            stim_rates.append(pop_data['stim_rate_mean'])
+            
+            # Check for non-expressing cell data
+            if 'excited_nonexpr_mean' in pop_data:
+                excited_nonexpr_means.append(pop_data['excited_nonexpr_mean'])
+                excited_nonexpr_vars.append(pop_data.get('excited_nonexpr_std', 0)**2)
+                mean_change_nonexpr_means.append(pop_data['mean_change_nonexpr_mean'])
+                mean_change_nonexpr_vars.append(pop_data.get('mean_change_nonexpr_std', 0)**2)
+                n_nonexpr_list.append(pop_data.get('n_nonexpr_mean', 0))
+        
+        # Convert to numpy arrays
+        connectivity_means = np.array(connectivity_means)
+        connectivity_vars = np.array(connectivity_vars)
+        connectivity_ns = np.array(connectivity_ns)
+        
+        # Compute grand mean (weighted by sample size)
+        total_n = np.sum(connectivity_ns)
+        weights = connectivity_ns / total_n if total_n > 0 else np.ones(len(connectivity_ns)) / len(connectivity_ns)
+        grand_mean_value = np.sum(weights * connectivity_means)
+        
+        # Compute between-connectivity variance (weighted)
+        k = len(connectivity_means)
+        between_var = np.sum(connectivity_ns * (connectivity_means - grand_mean_value)**2) / (k - 1) if k > 1 else 0.0
+        
+        # Compute pooled within-connectivity variance
+        within_var = np.sum((connectivity_ns - 1) * connectivity_vars) / (total_n - k) if total_n > k else 0.0
+        
+        # Total variance
+        total_var = between_var + within_var
+        total_std = np.sqrt(total_var)
+        
+        # Standard error of the grand mean
+        se_grand_mean = np.sqrt(between_var / k + within_var / total_n) if k > 0 and total_n > 0 else 0.0
+        
+        # Do the same for mean_change
+        change_means = []
+        change_vars = []
+        for conn_data in by_conn.values():
+            pop_data = conn_data[pop]
+            change_means.append(pop_data['mean_change_mean'])
+            change_vars.append(pop_data['mean_change_std']**2)
+        
+        change_means = np.array(change_means)
+        change_vars = np.array(change_vars)
+        
+        grand_change_mean = np.sum(weights * change_means)
+        change_between_var = np.sum(connectivity_ns * (change_means - grand_change_mean)**2) / (k - 1) if k > 1 else 0.0
+        change_within_var = np.sum((connectivity_ns - 1) * change_vars) / (total_n - k) if total_n > k else 0.0
+        change_total_var = change_between_var + change_within_var
+        
+        grand_mean[pop] = {
+            'excited_mean': grand_mean_value,
+            'excited_total_var': total_var,
+            'excited_between_var': between_var,
+            'excited_within_var': within_var,
+            'excited_std': total_std,
+            'excited_between_std': np.sqrt(between_var),
+            'excited_within_std': np.sqrt(within_var),
+            'excited_sem': se_grand_mean,
+            'mean_change_mean': grand_change_mean,
+            'mean_change_total_var': change_total_var,
+            'mean_change_std': np.sqrt(change_total_var),
+            'baseline_rate_mean': np.sum(weights * np.array(baseline_rates)),
+            'stim_rate_mean': np.sum(weights * np.array(stim_rates)),
+            'n_trials': int(total_n),
+            'n_connectivity_instances': k
+        }
+        
+        # Add non-expressing cell statistics if available
+        if excited_nonexpr_means:
+            excited_nonexpr_means = np.array(excited_nonexpr_means)
+            excited_nonexpr_vars = np.array(excited_nonexpr_vars)
+            
+            grand_nonexpr_mean = np.sum(weights * excited_nonexpr_means)
+            nonexpr_between_var = np.sum(connectivity_ns * (excited_nonexpr_means - grand_nonexpr_mean)**2) / (k - 1) if k > 1 else 0.0
+            nonexpr_within_var = np.sum((connectivity_ns - 1) * excited_nonexpr_vars) / (total_n - k) if total_n > k else 0.0
+            nonexpr_total_var = nonexpr_between_var + nonexpr_within_var
+            
+            grand_mean[pop].update({
+                'excited_nonexpr_mean': grand_nonexpr_mean,
+                'excited_nonexpr_std': np.sqrt(nonexpr_total_var),
+                'excited_nonexpr_sem': np.sqrt(nonexpr_between_var / k + nonexpr_within_var / total_n) if k > 0 and total_n > 0 else 0.0,
+                'mean_change_nonexpr_mean': np.sum(weights * np.array(mean_change_nonexpr_means)),
+                'mean_change_nonexpr_std': np.sqrt(np.sum(connectivity_ns * (np.array(mean_change_nonexpr_means) - np.sum(weights * np.array(mean_change_nonexpr_means)))**2) / (k - 1) if k > 1 else 0.0 + 
+                                                   np.sum((connectivity_ns - 1) * np.array(mean_change_nonexpr_vars)) / (total_n - k) if total_n > k else 0.0),
+                'n_nonexpr_mean': np.mean(n_nonexpr_list)
+            })
+    
+    return grand_mean
+
+
+# ============================================================================
+# Variance Decomposition
+# ============================================================================
+
 def compute_variance_decomposition(
     nested_results: Dict,
     config: NestedExperimentConfig,
@@ -706,8 +1087,7 @@ def _decompose_population_variance(
             elif 'activity_trace' in trial.results:
                 activity = trial.results['activity_trace'][population]
             else:
-                raise KeyError(f"Trial results missing both 'activity_trace' and 'activity_trace_mean'. "
-                              f"Available keys: {list(trial.results.keys())}")
+                raise KeyError(f"Trial results missing both 'activity_trace' and 'activity_trace_mean'")
             
             baseline_rate = torch.mean(activity[:, baseline_mask], dim=1)
             stim_rate = torch.mean(activity[:, stim_mask], dim=1)
@@ -808,186 +1188,187 @@ def _decompose_population_variance(
     
     return result
 
-def _hierarchical_variance_decomposition(grouped_data: List[List[float]],
-                                         permutation_random_seed=47) -> Dict:
-    """
-    Compute hierarchical variance decomposition with robust statistical testing.
-    
-    Uses permutation test as primary method (better for small samples and discrete data),
-    with fallback to F-test and explicit handling of edge cases.
-    
-    Args:
-        grouped_data: List of lists, where each inner list is data from one group
-        
-    Returns:
-        Dict with variance components:
-            - total_var: Total variance
-            - between_group_var: Variance between group means
-            - within_group_var: Mean variance within groups
-            - f_statistic: F-statistic for ANOVA
-            - p_value: p-value for F-test
-    """
-    from scipy import stats
-    
-    # Flatten for grand mean
-    all_data = [val for group in grouped_data for val in group]
-    grand_mean = np.mean(all_data)
-    
-    # Group means and sizes
-    group_means = [np.mean(group) for group in grouped_data]
-    group_sizes = [len(group) for group in grouped_data]
-    
-    # Total variance
-    total_var = np.var(all_data, ddof=1) if len(all_data) > 1 else 0.0
-    
-    # Between-group variance
-    n_total = sum(group_sizes)
-    if len(group_means) > 1:
-        between_group_var = sum(
-            n * (mean - grand_mean)**2 
-            for n, mean in zip(group_sizes, group_means)
-        ) / (len(group_means) - 1)
-    else:
-        between_group_var = 0.0
-    
-    # Within-group variance
-    within_group_var = np.mean([
-        np.var(group, ddof=1) if len(group) > 1 else 0.0
-        for group in grouped_data
-    ])
-    
-    # Statistical test
-    if len(grouped_data) <= 1:
-        # Only one group - no test possible
-        f_statistic = np.nan
-        p_value = np.nan
-        test_method = 'insufficient_groups'
-        
-    elif within_group_var < 1e-10:
-        # Zero or near-zero within-group variance - handle explicitly
-        group_means_array = np.array(group_means)
-        unique_means = np.unique(group_means_array)
-        
-        if len(unique_means) > 1:
-            # Means differ but no within-group variance
-            # This indicates deterministic separation by group
-            f_statistic = np.inf
-            p_value = 0.0
-            test_method = 'deterministic_separation'
-        else:
-            # All values identical everywhere
-            f_statistic = 0.0
-            p_value = 1.0
-            test_method = 'no_variation'
-    
-    else:
-        # Normal case: use permutation test (primary method)
-        try:
-            def test_statistic(*groups):
-                """F-statistic equivalent: variance of group means"""
-                means = [np.mean(g) for g in groups]
-                return np.var(means, ddof=1)
-            
-            # Run permutation test
-            from scipy.stats import permutation_test
-            
-            result = permutation_test(
-                grouped_data,
-                test_statistic,
-                permutation_type='independent',
-                n_resamples=10000,
-                random_state=permutation_random_seed  # For reproducibility
-            )
-            
-            p_value = result.pvalue
-            f_statistic = test_statistic(*grouped_data)
-            test_method = 'permutation'
-            
-        except Exception as e:
-            # Fallback to parametric F-test
-            try:
-                f_statistic, p_value = stats.f_oneway(*grouped_data)
-                test_method = 'anova_fallback'
-            except Exception as e2:
-                # Ultimate fallback - should rarely happen
-                f_statistic = np.nan
-                p_value = np.nan
-                test_method = f'failed: {str(e2)[:50]}'
-    
-    return {
-        'total_var': total_var,
-        'between_group_var': between_group_var,
-        'within_group_var': within_group_var,
-        'f_statistic': f_statistic,
-        'p_value': p_value,
-        'n_groups': len(grouped_data),
-        'n_total': n_total,
-        'test_method': test_method  # track which test was used
-    }    
 
-
-
-def aggregate_nested_results_from_hdf5(
-    f: h5py.File,
-    config: NestedExperimentConfig,
-    stim_start: float,
-    stim_duration: float,
-    warmup: float
+def _decompose_population_variance_from_stats(
+    conn_groups_stats: Dict,
+    population: str,
+    target_population: str
 ) -> Dict:
     """
-    Aggregate nested results directly from HDF5 file
+    Decompose variance using pre-computed per-trial statistics
     
-    Memory-efficient version that doesn't load all data at once.
+    This version works with summary statistics stored in HDF5,
+    avoiding the need to reload full activity traces.
+    
+    Args:
+        conn_groups_stats: Dict mapping conn_idx to list of trial statistics
+                          (output from extract_trial_statistics_from_hdf5)
+        population: Population to analyze ('gc', 'mc', 'pv', 'sst')
+        target_population: Which population was stimulated
+        
+    Returns:
+        Variance components and ICC values
     """
-    aggregated = {
-        'by_connectivity': {},
-        'grand_mean': {},
-        'across_connectivity': {}
+    is_target = (population == target_population)
+    
+    # Collect data organized by connectivity
+    excited_by_conn = []
+    change_by_conn = []
+    
+    # For target population, also track non-expressing cells
+    if is_target:
+        excited_nonexpr_by_conn = []
+        change_nonexpr_by_conn = []
+    
+    for conn_idx in sorted(conn_groups_stats.keys()):
+        conn_trials = conn_groups_stats[conn_idx]
+        
+        excited_vals = []
+        change_vals = []
+        
+        if is_target:
+            excited_nonexpr_vals = []
+            change_nonexpr_vals = []
+        
+        for trial_stats in conn_trials:
+            # Check if this population has data
+            if population not in trial_stats['populations']:
+                continue
+            
+            pop_stats = trial_stats['populations'][population]
+            
+            # All cells statistics
+            excited_vals.append(pop_stats['excited'])
+            change_vals.append(pop_stats['mean_change'])
+            
+            # Non-expressing cells (for target population only)
+            if is_target and 'excited_nonexpr' in pop_stats:
+                excited_nonexpr_vals.append(pop_stats['excited_nonexpr'])
+                change_nonexpr_vals.append(pop_stats['mean_change_nonexpr'])
+        
+        if excited_vals:  # Only add if we have data
+            excited_by_conn.append(excited_vals)
+            change_by_conn.append(change_vals)
+            
+            if is_target and excited_nonexpr_vals:
+                excited_nonexpr_by_conn.append(excited_nonexpr_vals)
+                change_nonexpr_by_conn.append(change_nonexpr_vals)
+    
+    # Check if we have any data
+    if not excited_by_conn:
+        return {
+            'excited_fraction': {
+                'total_var': 0.0,
+                'between_group_var': 0.0,
+                'within_group_var': 0.0,
+                'icc': 0.0,
+                'f_statistic': np.nan,
+                'p_value': np.nan,
+                'n_groups': 0,
+                'n_total': 0,
+                'test_method': 'no_data'
+            },
+            'mean_change': {
+                'total_var': 0.0,
+                'between_group_var': 0.0,
+                'within_group_var': 0.0,
+                'icc': 0.0,
+                'f_statistic': np.nan,
+                'p_value': np.nan,
+                'n_groups': 0,
+                'n_total': 0,
+                'test_method': 'no_data'
+            }
+        }
+    
+    # Compute variance components
+    excited_variance = _hierarchical_variance_decomposition(excited_by_conn)
+    change_variance = _hierarchical_variance_decomposition(change_by_conn)
+    
+    # Compute ICC
+    excited_icc = (excited_variance['between_group_var'] / 
+                   (excited_variance['between_group_var'] + excited_variance['within_group_var'])
+                   if (excited_variance['between_group_var'] + excited_variance['within_group_var']) > 0
+                   else 0.0)
+    
+    change_icc = (change_variance['between_group_var'] /
+                  (change_variance['between_group_var'] + change_variance['within_group_var'])
+                  if (change_variance['between_group_var'] + change_variance['within_group_var']) > 0
+                  else 0.0)
+    
+    result = {
+        'excited_fraction': {
+            **excited_variance,
+            'icc': excited_icc
+        },
+        'mean_change': {
+            **change_variance,
+            'icc': change_icc
+        }
     }
     
-    for target in ['pv', 'sst']:
-        aggregated['by_connectivity'][target] = {}
-        aggregated['grand_mean'][target] = {}
-        aggregated['across_connectivity'][target] = {}
+    # Add non-expressing cell analysis for target population
+    if is_target and excited_nonexpr_by_conn:
+        excited_nonexpr_variance = _hierarchical_variance_decomposition(excited_nonexpr_by_conn)
+        change_nonexpr_variance = _hierarchical_variance_decomposition(change_nonexpr_by_conn)
         
-        # Get all intensities from HDF5
-        intensities = [float(k.split('_')[1]) for k in f[target].keys() 
-                      if k.startswith('intensity_')]
+        excited_nonexpr_icc = (
+            excited_nonexpr_variance['between_group_var'] / 
+            (excited_nonexpr_variance['between_group_var'] + excited_nonexpr_variance['within_group_var'])
+            if (excited_nonexpr_variance['between_group_var'] + excited_nonexpr_variance['within_group_var']) > 0
+            else 0.0
+        )
         
-        for intensity in intensities:
-            # Aggregate within each connectivity
-            by_conn = aggregate_from_hdf5(
-                f, target, intensity, stim_start, stim_duration, warmup
-            )
-            
-            aggregated['by_connectivity'][target][intensity] = by_conn
-            
-            # Grand mean: load all trials and aggregate
-            # (still memory-efficient as we process one trial at a time)
-            all_trials = []
-            for conn_idx in range(config.n_connectivity_instances):
-                for pattern_idx in range(config.n_mec_patterns_per_connectivity):
-                    trial_data = load_trial_from_hdf5(f, target, intensity,
-                                                     conn_idx, pattern_idx)
-                    trial_result = NestedTrialResult(
-                        connectivity_idx=conn_idx,
-                        mec_pattern_idx=pattern_idx,
-                        seed=0,
-                        results=trial_data,
-                        target_population=trial_data['target_population'],
-                        opsin_expression=trial_data['opsin_expression']
-                    )
-                    all_trials.append(trial_result)
-            
-            aggregated['grand_mean'][target][intensity] = _aggregate_trial_group(
-                all_trials, stim_start, stim_duration, warmup
-            )
-            
-            # Across connectivity
-            aggregated['across_connectivity'][target][intensity] = \
-                _aggregate_connectivity_means(by_conn)
+        result['excited_fraction_nonexpr'] = {
+            **excited_nonexpr_variance,
+            'icc': excited_nonexpr_icc
+        }
+        result['mean_change_nonexpr'] = {
+            **change_nonexpr_variance,
+            'icc': (change_nonexpr_variance['between_group_var'] /
+                   (change_nonexpr_variance['between_group_var'] + change_nonexpr_variance['within_group_var'])
+                   if (change_nonexpr_variance['between_group_var'] + change_nonexpr_variance['within_group_var']) > 0
+                   else 0.0)
+        }
     
-    return aggregated
+    return result
+
+
+def compute_variance_from_hdf5(f: h5py.File,
+                               target: str,
+                               intensity: float,
+                               stim_start: float,
+                               stim_duration: float,
+                               warmup: float) -> Dict:
+    """
+    Compute variance decomposition directly from HDF5
+    
+    Memory-efficient version that uses pre-computed per-trial statistics
+    instead of loading full activity traces.
+    """
+    intensity_key = f"intensity_{intensity}"
+    
+    if intensity_key not in f[target]:
+        return {}
+    
+    # Extract metadata to determine dimensions
+    metadata = dict(f['metadata'].attrs)
+    n_connectivity = metadata['n_connectivity_instances']
+    n_mec_patterns = metadata['n_mec_patterns_per_connectivity']
+    
+    # Extract per-trial statistics (I/O operation)
+    conn_groups_stats = extract_trial_statistics_from_hdf5(
+        f, target, intensity, n_connectivity, n_mec_patterns
+    )
+    
+    # Compute variance for each population (analysis operation)
+    pop_variance = {}
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        pop_variance[pop] = _decompose_population_variance_from_stats(
+            conn_groups_stats, pop, target
+        )
+    
+    return pop_variance
 
 
 def compute_variance_decomposition_from_hdf5(
@@ -1021,22 +1402,228 @@ def compute_variance_decomposition_from_hdf5(
     return variance_analysis
 
 
+def _hierarchical_variance_decomposition(grouped_data: List[List[float]],
+                                         permutation_random_seed=47) -> Dict:
+    """
+    Compute hierarchical variance decomposition with robust statistical testing.
+    
+    Uses permutation test as primary method (better for small samples and discrete data),
+    with fallback to F-test and explicit handling of edge cases.
+    
+    Args:
+        grouped_data: List of lists, where each inner list is data from one group
+        
+    Returns:
+        Dict with variance components and test results
+    """
+    from scipy import stats
+    
+    # Flatten for grand mean
+    all_data = [val for group in grouped_data for val in group]
+    grand_mean = np.mean(all_data)
+    
+    # Group means and sizes
+    group_means = [np.mean(group) for group in grouped_data]
+    group_sizes = [len(group) for group in grouped_data]
+    
+    # Total variance
+    total_var = np.var(all_data, ddof=1) if len(all_data) > 1 else 0.0
+    
+    # Between-group variance
+    n_total = sum(group_sizes)
+    if len(group_means) > 1:
+        between_group_var = sum(
+            n * (mean - grand_mean)**2 
+            for n, mean in zip(group_sizes, group_means)
+        ) / (len(group_means) - 1)
+    else:
+        between_group_var = 0.0
+    
+    # Within-group variance
+    within_group_var = np.mean([
+        np.var(group, ddof=1) if len(group) > 1 else 0.0
+        for group in grouped_data
+    ])
+    
+    # Statistical test
+    if len(grouped_data) <= 1:
+        f_statistic = np.nan
+        p_value = np.nan
+        test_method = 'insufficient_groups'
+        
+    elif within_group_var < 1e-10:
+        # Zero or near-zero within-group variance
+        group_means_array = np.array(group_means)
+        unique_means = np.unique(group_means_array)
+        
+        if len(unique_means) > 1:
+            f_statistic = np.inf
+            p_value = 0.0
+            test_method = 'deterministic_separation'
+        else:
+            f_statistic = 0.0
+            p_value = 1.0
+            test_method = 'no_variation'
+    
+    else:
+        # Normal case: use permutation test
+        try:
+            def test_statistic(*groups):
+                means = [np.mean(g) for g in groups]
+                return np.var(means, ddof=1)
+            
+            from scipy.stats import permutation_test
+            
+            result = permutation_test(
+                grouped_data,
+                test_statistic,
+                permutation_type='independent',
+                n_resamples=10000,
+                random_state=permutation_random_seed
+            )
+            
+            p_value = result.pvalue
+            f_statistic = test_statistic(*grouped_data)
+            test_method = 'permutation'
+            
+        except Exception as e:
+            # Fallback to parametric F-test
+            try:
+                f_statistic, p_value = stats.f_oneway(*grouped_data)
+                test_method = 'anova_fallback'
+            except Exception as e2:
+                f_statistic = np.nan
+                p_value = np.nan
+                test_method = f'failed: {str(e2)[:50]}'
+    
+    return {
+        'total_var': total_var,
+        'between_group_var': between_group_var,
+        'within_group_var': within_group_var,
+        'f_statistic': f_statistic,
+        'p_value': p_value,
+        'n_groups': len(grouped_data),
+        'n_total': n_total,
+        'test_method': test_method
+    }
+
+
+# ============================================================================
+# Regime Classification
+# ============================================================================
+
+def classify_mechanism_regime(
+    variance_analysis: Dict,
+    config: NestedExperimentConfig
+) -> Dict:
+    """
+    Classify mechanism regime with robust handling of edge cases
+    """
+    # Classification thresholds
+    ICC_CONNECTIVITY_THRESHOLD = 0.5
+    ICC_INPUT_THRESHOLD = 0.2
+    P_VALUE_THRESHOLD = config.variance_significance_alpha
+    
+    classification = {}
+    
+    for target in variance_analysis.keys():
+        classification[target] = {}
+        
+        for intensity, pop_analysis in variance_analysis[target].items():
+            classification[target][intensity] = {}
+            
+            for pop, variance_data in pop_analysis.items():
+                excited_data = variance_data['excited_fraction']
+                excited_icc = excited_data['icc']
+                excited_p = excited_data['p_value']
+                test_method = excited_data.get('test_method', 'unknown')
+                
+                # Classify based on test results
+                if np.isnan(excited_p) or np.isnan(excited_icc):
+                    regime = 'insufficient_data'
+                    
+                elif test_method == 'deterministic_separation':
+                    regime = 'connectivity_driven'
+                    
+                elif test_method == 'no_variation':
+                    regime = 'no_significant_variance'
+                    
+                elif excited_p > P_VALUE_THRESHOLD:
+                    regime = 'no_significant_variance'
+                    
+                elif excited_icc > ICC_CONNECTIVITY_THRESHOLD:
+                    regime = 'connectivity_driven'
+                    
+                elif excited_icc < ICC_INPUT_THRESHOLD:
+                    regime = 'input_driven'
+                    
+                else:
+                    regime = 'mixed'
+                
+                classification[target][intensity][pop] = {
+                    'regime': regime,
+                    'excited_icc': excited_icc,
+                    'excited_p_value': excited_p,
+                    'test_method': test_method, 
+                    'interpretation': _get_regime_interpretation(regime, excited_icc, test_method)
+                }
+    
+    return classification
+
+
+def _get_regime_interpretation(regime: str, icc: float, test_method: str = '') -> str:
+    """Generate interpretation text with test method context"""
+    
+    method_note = ""
+    if test_method == 'deterministic_separation':
+        method_note = " (deterministic: zero within-group variance)"
+    elif test_method == 'permutation':
+        method_note = " (permutation test)"
+    elif test_method == 'anova_fallback':
+        method_note = " (ANOVA F-test)"
+    
+    interpretations = {
+        'connectivity_driven': (
+            f"High ICC ({icc:.3f}) indicates paradoxical excitation is primarily "
+            "determined by specific synaptic weight patterns. Different circuit "
+            f"instantiations show distinct response profiles{method_note}."
+        ),
+        'input_driven': (
+            f"Low ICC ({icc:.3f}) indicates paradoxical excitation is primarily "
+            "determined by population-level dynamics. The same connectivity can "
+            f"produce different responses depending on input patterns{method_note}."
+        ),
+        'mixed': (
+            f"Moderate ICC ({icc:.3f}) indicates both connectivity patterns and "
+            f"population dynamics contribute to paradoxical excitation{method_note}."
+        ),
+        'no_significant_variance': (
+            "No significant variance between connectivity instances. "
+            f"Effect may be too small or sample size insufficient{method_note}."
+        ),
+        'insufficient_data': (
+            "Insufficient data for regime classification."
+        )
+    }
+    return interpretations.get(regime, "Unknown regime")
+
+
+# ============================================================================
+# HDF5 Save/Load Utilities
+# ============================================================================
+
 def _save_analysis_to_hdf5(f: h5py.File,
                            aggregated_results: Dict,
                            variance_analysis: Dict,
                            regime_classification: Dict) -> None:
-    """
-    Save aggregated analysis results to HDF5 file
-    
-    Stores summary statistics computed from the trial data.
-    """
+    """Save aggregated analysis results to HDF5 file"""
     # Create analysis group
     if 'analysis' in f:
         del f['analysis']
     
     analysis_grp = f.create_group('analysis')
     
-    # Save regime classification as attributes
+    # Save regime classification
     regime_grp = analysis_grp.create_group('regime_classification')
     for target in regime_classification.keys():
         target_grp = regime_grp.create_group(target)
@@ -1059,7 +1646,7 @@ def _save_analysis_to_hdf5(f: h5py.File,
             for pop, var_data in pop_data.items():
                 pop_grp = intensity_grp.create_group(pop)
                 
-                # Flatten nested dict structure for HDF5
+                # Flatten nested dict structure
                 def save_nested_dict(grp, data, prefix=''):
                     for key, value in data.items():
                         if isinstance(value, dict):
@@ -1073,12 +1660,7 @@ def _save_analysis_to_hdf5(f: h5py.File,
 
 
 def load_nested_experiment_from_hdf5(filepath: str) -> Dict:
-    """
-    Load complete nested experiment results from HDF5 file
-    
-    Returns dict compatible with original format, with lazy loading
-    of trial data.
-    """
+    """Load complete nested experiment results from HDF5 file"""
     from dataclasses import asdict
     
     metadata = load_metadata_from_hdf5(filepath)
@@ -1141,8 +1723,8 @@ def load_nested_experiment_from_hdf5(filepath: str) -> Dict:
         )
     
     return {
-        'nested_results': None,  # Not loaded (use HDF5 file directly)
-        'aggregated_results': None,  # Can be recomputed if needed
+        'nested_results': None,
+        'aggregated_results': None,
         'variance_analysis': variance_analysis,
         'regime_classification': regime_classification,
         'config': config,
@@ -1152,134 +1734,11 @@ def load_nested_experiment_from_hdf5(filepath: str) -> Dict:
     }
 
 
-def classify_mechanism_regime(
-    variance_analysis: Dict,
-    config: NestedExperimentConfig
-) -> Dict:
-    """
-    Classify whether paradoxical excitation is driven by:
-        - Connectivity patterns (high ICC, significant between-connectivity variance)
-        - Population dynamics (low ICC, high within-connectivity variance)
-        
-    Uses ICC thresholds and statistical significance of ANOVA
-    
-    Returns:
-        Classification for each target/intensity/population
-    """
-    # Classification thresholds
-    ICC_CONNECTIVITY_THRESHOLD = 0.5  # ICC > 0.5 suggests connectivity-driven
-    ICC_INPUT_THRESHOLD = 0.2  # ICC < 0.2 suggests input-driven
-    P_VALUE_THRESHOLD = config.variance_significance_alpha
-    
-    classification = {}
-def classify_mechanism_regime(
-    variance_analysis: Dict,
-    config: NestedExperimentConfig
-) -> Dict:
-    """
-    Classify mechanism regime with robust handling of edge cases
-    """
-    # Classification thresholds
-    ICC_CONNECTIVITY_THRESHOLD = 0.5
-    ICC_INPUT_THRESHOLD = 0.2
-    P_VALUE_THRESHOLD = config.variance_significance_alpha
-    
-    classification = {}
-    
-    for target in variance_analysis.keys():
-        classification[target] = {}
-        
-        for intensity, pop_analysis in variance_analysis[target].items():
-            classification[target][intensity] = {}
-            
-            for pop, variance_data in pop_analysis.items():
-                excited_data = variance_data['excited_fraction']
-                excited_icc = excited_data['icc']
-                excited_p = excited_data['p_value']
-                test_method = excited_data.get('test_method', 'unknown')
-                
-                # Classify based on test results
-                if np.isnan(excited_p) or np.isnan(excited_icc):
-                    regime = 'insufficient_data'
-                    
-                elif test_method == 'deterministic_separation':
-                    # Perfect separation by connectivity - clearly connectivity-driven
-                    regime = 'connectivity_driven'
-                    
-                elif test_method == 'no_variation':
-                    # No variation at all
-                    regime = 'no_significant_variance'
-                    
-                elif excited_p > P_VALUE_THRESHOLD:
-                    # Not statistically significant
-                    regime = 'no_significant_variance'
-                    
-                elif excited_icc > ICC_CONNECTIVITY_THRESHOLD:
-                    regime = 'connectivity_driven'
-                    
-                elif excited_icc < ICC_INPUT_THRESHOLD:
-                    regime = 'input_driven'
-                    
-                else:
-                    regime = 'mixed'
-                
-                classification[target][intensity][pop] = {
-                    'regime': regime,
-                    'excited_icc': excited_icc,
-                    'excited_p_value': excited_p,
-                    'test_method': test_method, 
-                    'interpretation': _get_regime_interpretation(regime, excited_icc, test_method)
-                }
-    
-    return classification
-
-
-def _get_regime_interpretation(regime: str, icc: float, test_method: str = '') -> str:
-    """Generate interpretation text with test method context"""
-    
-    method_note = ""
-    if test_method == 'deterministic_separation':
-        method_note = " (deterministic: zero within-group variance)"
-    elif test_method == 'permutation':
-        method_note = " (permutation test)"
-    elif test_method == 'anova_fallback':
-        method_note = " (ANOVA F-test)"
-    
-    interpretations = {
-        'connectivity_driven': (
-            f"High ICC ({icc:.3f}) indicates paradoxical excitation is primarily "
-            "determined by specific synaptic weight patterns. Different circuit "
-            f"instantiations show distinct response profiles{method_note}."
-        ),
-        'input_driven': (
-            f"Low ICC ({icc:.3f}) indicates paradoxical excitation is primarily "
-            "determined by population-level dynamics. The same connectivity can "
-            f"produce different responses depending on input patterns{method_note}."
-        ),
-        'mixed': (
-            f"Moderate ICC ({icc:.3f}) indicates both connectivity patterns and "
-            f"population dynamics contribute to paradoxical excitation{method_note}."
-        ),
-        'no_significant_variance': (
-            "No significant variance between connectivity instances. "
-            f"Effect may be too small or sample size insufficient{method_note}."
-        ),
-        'insufficient_data': (
-            "Insufficient data for regime classification."
-        )
-    }
-    return interpretations.get(regime, "Unknown regime")
-
-# ============================================================================
-# Saving and Loading
-# ============================================================================
-
 def save_nested_experiment_results(results: Dict, filepath: str):
     """Save nested experiment results with compression"""
     import pickle
     from datetime import datetime
     
-    # Add timestamp
     results['timestamp'] = datetime.now().isoformat()
     results['version'] = '1.0_nested'
     
@@ -1598,7 +2057,7 @@ def plot_connectivity_instance_variance(
     - X-axis: Connectivity instance number
     - Y-axis: Fraction of excited (or suppressed) cells
     - Error bars: Standard deviation across MEC input patterns
-    - Separate panels for each target × post-synaptic population combination
+    - Separate panels for each target x post-synaptic population combination
     
     The plot reveals:
     - Between-connectivity variance: Differences in means across instances
@@ -1952,3 +2411,4 @@ def plot_connectivity_instance_variance_detailed(
         logger.info(f"Saved detailed connectivity variance plot to: {save_path}")
     
     return fig
+

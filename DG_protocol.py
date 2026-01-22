@@ -14,7 +14,6 @@ from scipy.spatial.distance import cdist
 from pathlib import Path
 import tqdm
 import logging
-from hdf5_storage import load_nested_experiment_from_hdf5, load_metadata_from_hdf5
 import h5py
 
 
@@ -6239,11 +6238,13 @@ For detailed analysis options, see: python DG_analysis.py --help
     
     # Data saving options
     parser.add_argument('--no-auto-save', action='store_true',
-                       help='Disable automatic saving of results')
+                        help='Disable automatic saving of results')
     parser.add_argument('--save-full-activity', action='store_true',
-                       help='Save complete activity traces (larger files)')
+                        help='Save complete activity traces (larger files)')
     parser.add_argument('--record-currents', action='store_true',
-                       help='Record synaptic currents')
+                        help='Record synaptic currents')
+    parser.add_argument('--save-results-file', type=str, default=None,
+                        help='Path to results file')
     
     # Adaptive stepping
     parser.add_argument('--adaptive-step', action='store_true',
@@ -6335,7 +6336,7 @@ For detailed analysis options, see: python DG_analysis.py --help
     # Nested experiment
     if args.nested or args.all:
         logger.info("\n" + "="*80)
-        logger.info("Running Nested Experiment (Connectivity × MEC Patterns)")
+        logger.info("Running Nested Experiment (Connectivity x MEC Patterns)")
         logger.info("="*80)
         
         nested_config = NestedExperimentConfig(
