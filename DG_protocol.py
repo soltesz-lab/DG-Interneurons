@@ -6198,15 +6198,15 @@ For detailed analysis options, see: python DG_analysis.py --help
     
     # Experiment selection
     parser.add_argument('--comparative', action='store_true',
-                       help='Run comparative PV vs SST experiment')
+                        help='Run comparative PV vs SST experiment')
     parser.add_argument('--nested', action='store_true',
-                       help='Run nested (connectivity x MEC) experiment')
+                        help='Run nested (connectivity x MEC) experiment (implies --save-full-activity)')
     parser.add_argument('--ablations', action='store_true',
-                       help='Run ablation tests')
+                        help='Run ablation tests')
     parser.add_argument('--expression', action='store_true',
-                       help='Run expression level tests')
+                        help='Run expression level tests')
     parser.add_argument('--all', action='store_true',
-                       help='Run all experiments')
+                        help='Run all experiments')
     
     # Output options
     parser.add_argument('--output-dir', type=str, default='protocol',
@@ -6338,13 +6338,13 @@ For detailed analysis options, see: python DG_analysis.py --help
         logger.info("\n" + "="*80)
         logger.info("Running Nested Experiment (Connectivity x MEC Patterns)")
         logger.info("="*80)
-        
+
         nested_config = NestedExperimentConfig(
             n_connectivity_instances=args.n_connectivity,
             n_mec_patterns_per_connectivity=args.n_mec_patterns,
             base_seed=args.base_seed,
             save_nested_trials=True,
-            save_full_activity=args.save_full_activity
+            save_full_activity=True
         )
 
         # Determine save file path

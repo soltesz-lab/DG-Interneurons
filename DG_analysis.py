@@ -100,10 +100,10 @@ logger = logging.getLogger(__name__)
 
 def load_results_with_validation(filepath: str, result_type: str) -> Dict:
     """
-    Load and validate results file
+    Load and validate results file (supports both pickle and HDF5)
     
     Args:
-        filepath: Path to pickle file
+        filepath: Path to results file (*.pkl or *.h5)
         result_type: Expected type ('comparative', 'ablation', 'expression', 'nested')
         
     Returns:
@@ -119,11 +119,69 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
     if not filepath.exists():
         raise FileNotFoundError(f"Results file not found: {filepath}")
     
-    # Check file extension
+    # Check if HDF5 or pickle
+    is_hdf5 = filepath.suffix == '.h5'
+    
+    if result_type == 'nested':
+        # Nested results can be either HDF5 or pickle
+        if is_hdf5:
+            logger.info(f"Loading nested results from HDF5: {filepath}")
+            
+            # Load metadata to validate
+            from hdf5_storage import load_metadata_from_hdf5
+            metadata = load_metadata_from_hdf5(str(filepath))
+            
+            required_keys = ['n_connectivity_instances', 'n_mec_patterns_per_connectivity']
+            missing_keys = [k for k in required_keys if k not in metadata]
+            if missing_keys:
+                raise ValueError(f"HDF5 file missing required metadata: {missing_keys}")
+            
+            logger.info(f"  Format: HDF5")
+            logger.info(f"  Connectivity instances: {metadata['n_connectivity_instances']}")
+            logger.info(f"  MEC patterns: {metadata['n_mec_patterns_per_connectivity']}")
+            
+            # Return metadata with HDF5 file path
+            return {
+                'metadata': metadata,
+                'hdf5_file': str(filepath),
+                'nested_results': None,  # Not loaded into memory
+                'file_format': 'hdf5'
+            }
+        else:
+            # Pickle format
+            logger.info(f"Loading nested results from pickle: {filepath}")
+            
+            try:
+                with open(filepath, 'rb') as f:
+                    data = pickle.load(f)
+            except Exception as e:
+                raise ValueError(f"Failed to load pickle file: {e}")
+            
+            # Validate pickle format
+            if not isinstance(data, dict):
+                raise ValueError("Invalid nested results format. Expected dictionary")
+            
+            required_keys = ['nested_results', 'metadata']
+            missing_keys = [k for k in required_keys if k not in data]
+            if missing_keys:
+                raise ValueError(f"Nested results missing required keys: {missing_keys}")
+            
+            logger.info(f"  Format: Pickle")
+            if 'metadata' in data:
+                metadata = data['metadata']
+                if 'n_connectivity' in metadata:
+                    logger.info(f"  Connectivity instances: {metadata['n_connectivity']}")
+                if 'n_mec_patterns' in metadata:
+                    logger.info(f"  MEC patterns: {metadata['n_mec_patterns']}")
+            
+            data['file_format'] = 'pickle'
+            return data
+    
+    # For non-nested types, use original pickle loading
     if filepath.suffix != '.pkl':
         logger.warning(f"Unexpected file extension: {filepath.suffix} (expected .pkl)")
     
-    # Load file
+    # Load pickle file
     try:
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
@@ -132,7 +190,6 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
     
     # Validate based on expected type
     if result_type == 'comparative':
-        # Comparative results should have specific structure
         if not isinstance(data, tuple) or len(data) != 4:
             raise ValueError(
                 "Invalid comparative results format. Expected tuple of "
@@ -140,7 +197,6 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
             )
         results, conn_analysis, cond_analysis, metadata = data
         
-        # Check for required keys
         if 'pv' not in results and 'sst' not in results:
             raise ValueError("Comparative results missing 'pv' and 'sst' populations")
         
@@ -152,7 +208,6 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
         return data
         
     elif result_type == 'ablation':
-        # Ablation results should be a dict with test names
         if not isinstance(data, dict):
             raise ValueError("Invalid ablation results format. Expected dictionary")
         
@@ -169,38 +224,14 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
         return data
         
     elif result_type == 'expression':
-        # Expression results should be a dict
         if not isinstance(data, dict):
             raise ValueError("Invalid expression results format. Expected dictionary")
         
-        # Check for expected structure
         if 'full_network' not in data:
             raise ValueError("Expression results missing 'full_network' key")
         
         logger.info(f"Loaded expression results from {filepath}")
         logger.info(f"  Conditions: {list(data.keys())}")
-        
-        return data
-        
-    elif result_type == 'nested':
-        # Nested results should have specific keys
-        if not isinstance(data, dict):
-            raise ValueError("Invalid nested results format. Expected dictionary")
-        
-        required_keys = ['nested_results', 'metadata']
-        missing_keys = [k for k in required_keys if k not in data]
-        if missing_keys:
-            raise ValueError(
-                f"Nested results missing required keys: {missing_keys}"
-            )
-        
-        logger.info(f"Loaded nested results from {filepath}")
-        if 'metadata' in data:
-            metadata = data['metadata']
-            if 'n_connectivity' in metadata:
-                logger.info(f"  Connectivity instances: {metadata['n_connectivity']}")
-            if 'n_mec_patterns' in metadata:
-                logger.info(f"  MEC patterns: {metadata['n_mec_patterns']}")
         
         return data
         
@@ -796,10 +827,7 @@ def cmd_bootstrap_analysis(args):
 
 def cmd_nested_weights_analysis(args):
     """
-    Handle nested weights analysis command
-    
-    Analyzes synaptic weight distributions by post-synaptic response
-    across connectivity instances in nested experiments.
+    Handle nested weights analysis command (supports HDF5 and pickle formats)
     """
     logger.info("="*80)
     logger.info("Nested Weights Analysis")
@@ -821,8 +849,7 @@ def cmd_nested_weights_analysis(args):
     
     # Extract metadata
     metadata = nested_data.get('metadata', {})
-    nested_results = nested_data['nested_results']
-    seed_structure = nested_data['seed_structure']
+    file_format = nested_data.get('file_format', 'pickle')
     
     # Extract experiment parameters
     stim_start = metadata['stim_start']
@@ -839,7 +866,8 @@ def cmd_nested_weights_analysis(args):
     else:
         intensities = args.intensities
     
-    logger.info(f"\nAnalysis parameters:")
+    logger.info(f"\nFile format: {file_format.upper()}")
+    logger.info(f"Analysis parameters:")
     logger.info(f"  Target populations: {target_populations}")
     logger.info(f"  Post populations: {post_populations}")
     logger.info(f"  Source populations: {source_populations}")
@@ -858,144 +886,287 @@ def cmd_nested_weights_analysis(args):
     # Storage for all analyses
     all_analyses = {}
     
-    # Analyze each target population
-    for target in target_populations:
-        if target not in nested_results:
-            logger.warning(f"Skipping {target.upper()} - no results found")
-            continue
+    # Handle HDF5 vs pickle differently
+    if file_format == 'hdf5':
+        import h5py
+        from hdf5_storage import load_nested_trials_from_hdf5
         
-        all_analyses[target] = {}
+        hdf5_file = nested_data['hdf5_file']
+        n_connectivity = metadata['n_connectivity_instances']
+        n_mec_patterns = metadata['n_mec_patterns_per_connectivity']
         
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Analyzing {target.upper()} stimulation")
-        logger.info('='*60)
+        logger.info(f"\nLoading trials from HDF5: {hdf5_file}")
         
-        for intensity in intensities:
-            if intensity not in nested_results[target]:
-                logger.warning(f"  Skipping intensity {intensity} - no results")
+        with h5py.File(hdf5_file, 'r') as f:
+            for target in target_populations:
+                if target not in f:
+                    logger.warning(f"Skipping {target.upper()} - no data in HDF5 file")
+                    continue
+                
+                all_analyses[target] = {}
+                
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Analyzing {target.upper()} stimulation")
+                logger.info('='*60)
+                
+                for intensity in intensities:
+                    logger.info(f"\n  Intensity: {intensity}")
+                    
+                    # Load trials for this condition from HDF5
+                    trials = load_nested_trials_from_hdf5(
+                        f, target, intensity, n_connectivity, n_mec_patterns,
+                        require_full_activity=True
+                    )
+                    
+                    if len(trials) == 0:
+                        logger.warning(f"  Skipping intensity {intensity} - no trials")
+                        continue
+                    
+                    logger.info(f"    Loaded {len(trials)} trials from HDF5")
+                    logger.info(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
+                    
+                    # Recreate circuit (use seed from first connectivity instance)
+                    seed_structure = metadata.get('seed_structure', {})
+                    connectivity_seeds = seed_structure.get('connectivity_seeds', [42])
+                    first_conn_seed = connectivity_seeds[0]
+                    
+                    logger.info(f"    Recreating circuit with seed: {first_conn_seed}")
+                    
+                    circuit_params = CircuitParams()
+                    synaptic_params = PerConnectionSynapticParams()
+                    opsin_params = OpsinParams()
+                    
+                    optimization_file = metadata.get('optimization_file')
+                    if optimization_file:
+                        logger.info(f"    Applying optimization from: {optimization_file}")
+                    
+                    # Create circuit
+                    set_random_seed(first_conn_seed, device)
+                    experiment = OptogeneticExperiment(
+                        circuit_params,
+                        synaptic_params,
+                        opsin_params,
+                        optimization_json_file=optimization_file,
+                        device=device,
+                        base_seed=first_conn_seed
+                    )
+                    
+                    # Analyze each post-synaptic population
+                    for post_pop in post_populations:
+                        logger.info(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
+                        
+                        try:
+                            analysis_results = analyze_weights_by_average_response_nested(
+                                nested_results=trials,
+                                circuit=experiment.circuit,
+                                target_population=target,
+                                post_population=post_pop,
+                                source_populations=source_populations,
+                                stim_start=stim_start,
+                                stim_duration=stim_duration,
+                                warmup=warmup,
+                                threshold_std=args.threshold_std,
+                                expression_threshold=args.expression_threshold,
+                                n_bootstrap=args.n_bootstrap,
+                                random_seed=args.seed
+                            )
+                            
+                            # Store results
+                            if target not in all_analyses:
+                                all_analyses[target] = {}
+                            if intensity not in all_analyses[target]:
+                                all_analyses[target][intensity] = {}
+                            all_analyses[target][intensity][post_pop] = analysis_results
+                            
+                            # Generate visualization
+                            if args.plot:
+                                vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                                vis_dir.mkdir(parents=True, exist_ok=True)
+                                
+                                logger.info(f"      Generating plot...")
+                                fig = plot_weights_by_average_response_nested(
+                                    analysis_results,
+                                    save_path=str(vis_dir / f'nested_weights_{post_pop}.pdf')
+                                )
+                                plt.close(fig)
+                                
+                                # Generate detailed connectivity comparison if requested
+                                if args.detailed:
+                                    logger.info(f"      Generating detailed connectivity comparison...")
+                                    n_conn = analysis_results['metadata']['n_connectivity_instances']
+                                    conn_indices = list(range(min(3, n_conn)))
+                                    fig = plot_connectivity_weight_comparison(
+                                        analysis_results,
+                                        connectivity_indices=conn_indices,
+                                        save_path=str(vis_dir / f'nested_weights_{post_pop}_detailed.pdf')
+                                    )
+                                    plt.close(fig)
+                        
+                        except Exception as e:
+                            logger.error(f"      Failed to analyze {post_pop.upper()}: {e}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+                            continue
+                    
+                    # Generate summary forest plot across all post-populations
+                    if args.plot and intensity in all_analyses.get(target, {}):
+                        analysis_results_by_post = all_analyses[target][intensity]
+                        if len(analysis_results_by_post) > 0:
+                            logger.info(f"\n    Generating summary forest plot across all targets...")
+                            try:
+                                vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                                vis_dir.mkdir(parents=True, exist_ok=True)
+                                
+                                summary_fig = plot_summary_forest_plot_all_targets(
+                                    analysis_results_by_target=analysis_results_by_post,
+                                    stimulated_population=target,
+                                    save_path=str(vis_dir / f'{target}_all_targets_summary_forest.pdf')
+                                )
+                                if summary_fig is not None:
+                                    plt.close(summary_fig)
+                                    logger.info(f"      Saved summary forest plot")
+                            except Exception as e:
+                                logger.error(f"      Failed to generate summary forest plot: {e}")
+                                import traceback
+                                logger.error(traceback.format_exc())
+                    
+                    # Clean up circuit
+                    del experiment
+                    if device.type == 'cuda':
+                        import torch
+                        torch.cuda.empty_cache()
+    
+    else:  # Pickle format
+        nested_results = nested_data['nested_results']
+        seed_structure = nested_data['seed_structure']
+        
+        # Original pickle-based analysis
+        for target in target_populations:
+            if target not in nested_results:
+                logger.warning(f"Skipping {target.upper()} - no results found")
                 continue
             
-            logger.info(f"\n  Intensity: {intensity}")
+            all_analyses[target] = {}
             
-            # Get trials for this condition
-            trials = nested_results[target][intensity]
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Analyzing {target.upper()} stimulation")
+            logger.info('='*60)
             
-            logger.info(f"    Total trials: {len(trials)}")
-            logger.info(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
-            
-            # Recreate circuit (use seed from first connectivity instance)
-            first_conn_seed = seed_structure['connectivity_seeds'][0]
-            logger.info(f"    Recreating circuit with seed: {first_conn_seed}")
-            
-            circuit_params = CircuitParams()
-            synaptic_params = PerConnectionSynapticParams()
-            opsin_params = OpsinParams()
-            
-            optimization_file = metadata.get('optimization_file')
-            if optimization_file:
-                logger.info(f"    Applying optimization from: {optimization_file}")
-            
-            # Create circuit
-            set_random_seed(first_conn_seed, device)
-            experiment = OptogeneticExperiment(
-                circuit_params,
-                synaptic_params,
-                opsin_params,
-                optimization_json_file=optimization_file,
-                device=device,
-                base_seed=first_conn_seed
-            )
-
-            analysis_results_by_post = {}
-            
-            # Analyze each post-synaptic population
-            for post_pop in post_populations:
-                logger.info(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
+            for intensity in intensities:
+                if intensity not in nested_results[target]:
+                    logger.warning(f"  Skipping intensity {intensity} - no results")
+                    continue
                 
-                # Run nested weights analysis
-                try:
-                    analysis_results = analyze_weights_by_average_response_nested(
-                        nested_results=trials,
-                        circuit=experiment.circuit,
-                        target_population=target,
-                        post_population=post_pop,
-                        source_populations=source_populations,
-                        stim_start=stim_start,
-                        stim_duration=stim_duration,
-                        warmup=warmup,
-                        threshold_std=args.threshold_std,
-                        expression_threshold=args.expression_threshold,
-                        n_bootstrap=args.n_bootstrap,
-                        random_seed=args.seed
-                    )
+                logger.info(f"\n  Intensity: {intensity}")
+                
+                trials = nested_results[target][intensity]
+                
+                logger.info(f"    Total trials: {len(trials)}")
+                logger.info(f"    Connectivity instances: {len(set(t.connectivity_idx for t in trials))}")
+                
+                # Recreate circuit
+                first_conn_seed = seed_structure['connectivity_seeds'][0]
+                logger.info(f"    Recreating circuit with seed: {first_conn_seed}")
+                
+                circuit_params = CircuitParams()
+                synaptic_params = PerConnectionSynapticParams()
+                opsin_params = OpsinParams()
+                
+                optimization_file = metadata.get('optimization_file')
+                if optimization_file:
+                    logger.info(f"    Applying optimization from: {optimization_file}")
+                
+                set_random_seed(first_conn_seed, device)
+                experiment = OptogeneticExperiment(
+                    circuit_params,
+                    synaptic_params,
+                    opsin_params,
+                    optimization_json_file=optimization_file,
+                    device=device,
+                    base_seed=first_conn_seed
+                )
+                
+                # Analyze each post-synaptic population
+                for post_pop in post_populations:
+                    logger.info(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
                     
-                    # Store results
-                    if target not in all_analyses:
-                        all_analyses[target] = {}
-                    if intensity not in all_analyses[target]:
-                        all_analyses[target][intensity] = {}
-                    all_analyses[target][intensity][post_pop] = analysis_results
-
-                    # Store results for this post-population
-                    analysis_results_by_post[post_pop] = analysis_results
-                    
-                    # Generate visualization
-                    if args.plot:
-                        vis_dir = output_dir / f"{target}_intensity_{intensity}"
-                        vis_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        logger.info(f"      Generating plot...")
-                        fig = plot_weights_by_average_response_nested(
-                            analysis_results,
-                            save_path=str(vis_dir / f'nested_weights_{post_pop}.pdf')
+                    try:
+                        analysis_results = analyze_weights_by_average_response_nested(
+                            nested_results=trials,
+                            circuit=experiment.circuit,
+                            target_population=target,
+                            post_population=post_pop,
+                            source_populations=source_populations,
+                            stim_start=stim_start,
+                            stim_duration=stim_duration,
+                            warmup=warmup,
+                            threshold_std=args.threshold_std,
+                            expression_threshold=args.expression_threshold,
+                            n_bootstrap=args.n_bootstrap,
+                            random_seed=args.seed
                         )
-                        plt.close(fig)
                         
-                        # Generate detailed connectivity comparison if requested
-                        if args.detailed:
-                            logger.info(f"      Generating detailed connectivity comparison...")
-                            n_conn = analysis_results['metadata']['n_connectivity_instances']
-                            # Plot first few connectivities for detail
-                            conn_indices = list(range(min(3, n_conn)))
-                            fig = plot_connectivity_weight_comparison(
+                        if target not in all_analyses:
+                            all_analyses[target] = {}
+                        if intensity not in all_analyses[target]:
+                            all_analyses[target][intensity] = {}
+                        all_analyses[target][intensity][post_pop] = analysis_results
+                        
+                        if args.plot:
+                            vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                            vis_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            logger.info(f"      Generating plot...")
+                            fig = plot_weights_by_average_response_nested(
                                 analysis_results,
-                                connectivity_indices=conn_indices,
-                                save_path=str(vis_dir / f'nested_weights_{post_pop}_detailed.pdf')
+                                save_path=str(vis_dir / f'nested_weights_{post_pop}.pdf')
                             )
                             plt.close(fig)
+                            
+                            if args.detailed:
+                                logger.info(f"      Generating detailed connectivity comparison...")
+                                n_conn = analysis_results['metadata']['n_connectivity_instances']
+                                conn_indices = list(range(min(3, n_conn)))
+                                fig = plot_connectivity_weight_comparison(
+                                    analysis_results,
+                                    connectivity_indices=conn_indices,
+                                    save_path=str(vis_dir / f'nested_weights_{post_pop}_detailed.pdf')
+                                )
+                                plt.close(fig)
                     
-                except Exception as e:
-                    logger.error(f"      Failed to analyze {post_pop.upper()}: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    continue
-
-            # Generate summary forest plot across all post-populations
-            if args.plot and len(analysis_results_by_post) > 0:
-                logger.info(f"\n    Generating summary forest plot across all targets...")
-                try:
-                    vis_dir = output_dir / f"{target}_intensity_{intensity}"
-                    vis_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    summary_fig = plot_summary_forest_plot_all_targets(
-                        analysis_results_by_target=analysis_results_by_post,
-                        stimulated_population=target,
-                        save_path=str(vis_dir / f'{target}_all_targets_summary_forest.pdf')
-                    )
-                    if summary_fig is not None:
-                        plt.close(summary_fig)
-                        logger.info(f"      Saved summary forest plot")
-                except Exception as e:
-                    logger.error(f"      Failed to generate summary forest plot: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                       
+                    except Exception as e:
+                        logger.error(f"      Failed to analyze {post_pop.upper()}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        continue
                 
-            # Clean up circuit
-            del experiment
-            if device.type == 'cuda':
-                import torch
-                torch.cuda.empty_cache()
+                # Generate summary forest plot
+                if args.plot and intensity in all_analyses.get(target, {}):
+                    analysis_results_by_post = all_analyses[target][intensity]
+                    if len(analysis_results_by_post) > 0:
+                        logger.info(f"\n    Generating summary forest plot across all targets...")
+                        try:
+                            vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                            vis_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            summary_fig = plot_summary_forest_plot_all_targets(
+                                analysis_results_by_target=analysis_results_by_post,
+                                stimulated_population=target,
+                                save_path=str(vis_dir / f'{target}_all_targets_summary_forest.pdf')
+                            )
+                            if summary_fig is not None:
+                                plt.close(summary_fig)
+                                logger.info(f"      Saved summary forest plot")
+                        except Exception as e:
+                            logger.error(f"      Failed to generate summary forest plot: {e}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+                
+                # Clean up circuit
+                del experiment
+                if device.type == 'cuda':
+                    import torch
+                    torch.cuda.empty_cache()
     
     # Save complete analysis results
     if args.save_results:
@@ -1014,9 +1185,10 @@ def cmd_nested_weights_analysis(args):
             }, f)
         logger.info(f"\nAnalysis results saved to: {analysis_file}")
     
-    logger.info(f"Nested weights analysis output saved to: {output_dir}")
+    logger.info(f"\nNested weights analysis output saved to: {output_dir}")
     
     return 0
+
 
 def cmd_decision_analysis(args):
     """

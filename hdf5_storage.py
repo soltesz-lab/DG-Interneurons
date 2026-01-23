@@ -138,8 +138,9 @@ def save_trial_to_hdf5(f: h5py.File,
             if save_full_activity:
                 # Save full traces
                 trial_grp.create_dataset(dataset_name, 
-                                        data=pop_activity,
-                                        compression='gzip', compression_opts=4)
+                                         data=pop_activity,
+                                         compression='gzip',
+                                         compression_opts=9)
             else:
                 # Save summary statistics only
                 trial_grp.attrs[f'{dataset_name}_mean'] = np.mean(pop_activity)
@@ -237,6 +238,115 @@ def load_trial_from_hdf5(f: h5py.File,
     
     return result
 
+
+def load_nested_trials_from_hdf5(
+    f: h5py.File,
+    target: str,
+    intensity: float,
+    n_connectivity: int,
+    n_mec_patterns: int,
+    require_full_activity: bool = True
+) -> List:
+    """
+    Load all trials for a given condition as NestedTrialResult objects
+    
+    Args:
+        f: Open h5py.File object
+        target: Target population ('pv' or 'sst')
+        intensity: Light intensity
+        n_connectivity: Number of connectivity instances
+        n_mec_patterns: Number of MEC patterns per connectivity
+        require_full_activity: If True, raise error if full activity traces not available
+        
+    Returns:
+        List of NestedTrialResult-like objects (dicts with required fields)
+        
+    Raises:
+        ValueError: If require_full_activity=True and traces not available
+    """
+    from collections import namedtuple
+    
+    # Define minimal NestedTrialResult structure
+    NestedTrialResult = namedtuple('NestedTrialResult', 
+                                   ['connectivity_idx', 'mec_pattern_idx', 'seed',
+                                    'results', 'target_population', 'opsin_expression'])
+    
+    intensity_key = f"intensity_{intensity}"
+    
+    if intensity_key not in f[target]:
+        return []
+    
+    trials = []
+    has_full_activity = None  # Will be determined from first trial
+    
+    for conn_idx in range(n_connectivity):
+        conn_key = f"connectivity_{conn_idx}"
+        
+        if conn_key not in f[target][intensity_key]:
+            continue
+        
+        for pattern_idx in range(n_mec_patterns):
+            pattern_key = f"pattern_{pattern_idx}"
+            
+            if pattern_key not in f[target][intensity_key][conn_key]:
+                continue
+            
+            trial_grp = f[target][intensity_key][conn_key][pattern_key]
+            
+            # Check if this trial has full activity (check first population)
+            if has_full_activity is None:
+                has_full_activity = 'activity_gc' in trial_grp
+                
+                if require_full_activity and not has_full_activity:
+                    raise ValueError(
+                        f"HDF5 file does not contain full activity traces for {target} "
+                        f"at intensity {intensity}. Nested weights analysis requires "
+                        f"full activity traces. Please re-run the experiment with "
+                        f"save_full_activity=True in the nested configuration."
+                    )
+            
+            # Load activity traces
+            activity_trace = {}
+            for pop in ['gc', 'mc', 'pv', 'sst', 'mec']:
+                dataset_name = f'activity_{pop}'
+                if dataset_name in trial_grp:
+                    activity_trace[pop] = torch.from_numpy(trial_grp[dataset_name][:])
+                elif require_full_activity:
+                    raise ValueError(
+                        f"Missing activity trace for {pop} in trial "
+                        f"(conn={conn_idx}, pattern={pattern_idx})"
+                    )
+                else:
+                    activity_trace[pop] = None
+            
+            # Load time array
+            time = torch.from_numpy(trial_grp['time'][:])
+            
+            # Load opsin expression
+            if 'opsin_expression' in trial_grp:
+                opsin_expression = trial_grp['opsin_expression'][:]
+            else:
+                opsin_expression = np.array([])
+            
+            # Create result dict
+            results = {
+                'time': time,
+                'activity_trace': activity_trace,
+            }
+            
+            # Create NestedTrialResult
+            trial = NestedTrialResult(
+                connectivity_idx=conn_idx,
+                mec_pattern_idx=pattern_idx,
+                seed=0,  # Not stored in HDF5
+                results=results,
+                target_population=trial_grp.attrs['target_population'],
+                opsin_expression=opsin_expression
+            )
+            
+            trials.append(trial)
+    
+    return trials
 
 def get_trial_indices(f: h5py.File, 
                       target: str,
@@ -345,7 +455,20 @@ def extract_trial_statistics_from_hdf5(f: h5py.File,
 def load_metadata_from_hdf5(filepath: str) -> Dict:
     """Load metadata from HDF5 file"""
     with h5py.File(filepath, 'r') as f:
-        metadata = dict(f['metadata'].attrs)
+        metadata = {}
+        
+        # Load attributes
+        for key, value in f['metadata'].attrs.items():
+            # Convert numpy arrays to lists
+            if isinstance(value, np.ndarray):
+                metadata[key] = value.tolist()
+            # Handle scalar 'None' strings
+            elif isinstance(value, (str, bytes)):
+                if isinstance(value, bytes):
+                    value = value.decode('utf-8')
+                metadata[key] = None if value == 'None' else value
+            else:
+                metadata[key] = value
         
         # Load seed structure
         if 'seed_structure' in f['metadata']:
@@ -354,10 +477,5 @@ def load_metadata_from_hdf5(filepath: str) -> Dict:
                 'connectivity_seeds': seed_grp['connectivity_seeds'][:].tolist(),
                 'mec_pattern_seeds': seed_grp['mec_pattern_seeds'][:].tolist()
             }
-        
-        # Convert 'None' strings back to None
-        for key, value in metadata.items():
-            if value == 'None':
-                metadata[key] = None
-        
+    
     return metadata
