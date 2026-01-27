@@ -2,7 +2,7 @@
 Nested Weights Analysis Framework
 
 Extends the single-connectivity weight analysis to properly handle hierarchical
-structure of nested experiments (connectivity instances × MEC patterns).
+structure of nested experiments (connectivity instances x MEC patterns).
 
 Key principles:
 - Classify cells within each connectivity instance (averaged across MEC patterns)
@@ -18,13 +18,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from scipy import stats
-
-# Import from existing modules
 from nested_experiment import NestedTrialResult
 from nested_effect_size import (organize_nested_trials,
                                 average_activity_across_trials,
                                 classify_cells_by_connectivity,
                                 extract_weights_by_connectivity)
+from pca_input_weight_patterns import analyze_input_weight_patterns_pca, plot_pca_summary_all_targets
+
 
 
 # ============================================================================
@@ -510,7 +510,9 @@ def analyze_weights_by_average_response_nested(
     threshold_std: float = 1.0,
     expression_threshold: float = 0.2,
     n_bootstrap: int = 10000,
-    random_seed: Optional[int] = None
+    run_pca: bool = False,  
+    n_pca_permutations: int = 1000,
+    random_seed: Optional[int] = None,
 ) -> Dict:
     """
     Perform comprehensive weight analysis on nested experiment results
@@ -535,8 +537,10 @@ def analyze_weights_by_average_response_nested(
         threshold_std: Classification threshold (std deviations)
         expression_threshold: Opsin expression threshold
         n_bootstrap: Number of bootstrap samples
+        run_pca: Whether to include PCA analysis
+        n_pca_permutations: Number of permutations for PCA null distribution
         random_seed: Random seed for reproducibility
-        
+    
     Returns:
         dict: {
             'classifications': {...},
@@ -688,7 +692,44 @@ def analyze_weights_by_average_response_nested(
         if not np.isnan(es['cohens_d']):
             print(f"  {source_pop.upper()}: d={es['cohens_d']:.3f} "
                   f"(mean_diff={es['mean_diff']:.3f}, std={es['std_diff']:.3f})")
+
+    # PCA Analysis (optional)
+    pca_results = None
+    if run_pca:
+        print(f"\n{'='*80}")
+        print("MULTIVARIATE PCA ANALYSIS")
+        print('='*80)
+        
+        try:
+            pca_results = analyze_input_weight_patterns_pca(
+                nested_results=nested_results,
+                circuit=circuit,
+                target_population=target_population,
+                post_population=post_population,
+                source_populations=source_populations,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                warmup=warmup,
+                n_bootstrap=n_bootstrap,
+                n_permutations=n_pca_permutations,
+                n_components=None,  # Auto-select
+                threshold_std=threshold_std,
+                expression_threshold=expression_threshold,
+                save_dir=None,  # Will be set externally
+                random_seed=random_seed
+            )
+            
+            print("\nPCA Summary:")
+            print(f"  Hotelling's T^2: {pca_results['bootstrap_result'].observed_t2:.2f}")
+            print(f"  Bootstrap p-value: {pca_results['bootstrap_result'].p_value_bootstrap:.4f}")
+            print(f"  Permutation p-value: {pca_results['permutation_result']['p_value_permutation']:.4f}")
+            
+        except Exception as e:
+            print(f"\nWarning: PCA analysis failed with error: {e}")
+            print("Continuing without PCA results...")
+            pca_results = None
     
+            
     # Compute summary statistics across all connectivities
     summary_statistics = _compute_summary_statistics(
         stats_by_connectivity,
@@ -703,13 +744,15 @@ def analyze_weights_by_average_response_nested(
         'stats_by_connectivity': stats_by_connectivity,
         'bootstrap_results': bootstrap_results,
         'effect_sizes': effect_sizes,
+        'pca_results': pca_results,
         'summary_statistics': summary_statistics,
         'metadata': {
             'target_population': target_population,
             'post_population': post_population,
             'n_connectivity_instances': n_conn,
             'threshold_std': threshold_std,
-            'expression_threshold': expression_threshold
+            'expression_threshold': expression_threshold,
+            'pca_analysis_performed': run_pca
         }
     }
 
@@ -772,7 +815,7 @@ def _compute_summary_statistics(
 def plot_weights_by_average_response_nested(
     analysis_results: Dict,
     save_path: Optional[str] = None,
-    figsize: Tuple[int, int] = (20, 14)
+    figsize: Tuple[int, int] = (20, 14),
 ) -> plt.Figure:
     """
     Create visualizations of nested weight analysis.
@@ -787,6 +830,7 @@ def plot_weights_by_average_response_nested(
     
     Args:
         analysis_results: Output from analyze_weights_by_average_response_nested()
+        include_pca_panel: Whether to add PCA scatter subplot
         save_path: Optional path to save figure
         figsize: Figure size (width, height)
         
@@ -1653,6 +1697,8 @@ def create_summary_forest_plots_batch(
     threshold_std: float = 1.0,
     expression_threshold: float = 0.2,
     n_bootstrap: int = 10000,
+    run_pca: bool = False,
+    n_pca_permutations: int = 1000,
     random_seed: Optional[int] = None
 ):
     """
@@ -1671,6 +1717,8 @@ def create_summary_forest_plots_batch(
         threshold_std: Classification threshold
         expression_threshold: Opsin expression threshold
         n_bootstrap: Number of bootstrap samples
+        run_pca: 
+        n_pca_permutations: 
         random_seed: Random seed
         
     Returns:
@@ -1702,6 +1750,8 @@ def create_summary_forest_plots_batch(
             threshold_std=threshold_std,
             expression_threshold=expression_threshold,
             n_bootstrap=n_bootstrap,
+            run_pca=run_pca,
+            n_pca_permutations=n_pca_permutations,
             random_seed=random_seed
         )
         
@@ -1713,7 +1763,51 @@ def create_summary_forest_plots_batch(
             analysis_results,
             save_path=individual_plot_path
         )
-    
+
+        #  Save PCA plots if analysis was performed
+        if run_pca and analysis_results['pca_results'] is not None:
+            pca_output_dir = output_path / f'{stimulated_population}_to_{target_pop}_pca'
+            pca_output_dir.mkdir(exist_ok=True, parents=True)
+            
+            from pca_input_patterns import (
+                plot_pca_scatter_by_connectivity,
+                plot_pca_loadings_by_connectivity,
+                plot_pca_separation_forest,
+                plot_variance_explained
+            )
+            
+            pca_res = analysis_results['pca_results']
+            
+            # Generate all PCA plots
+            plot_pca_scatter_by_connectivity(
+                pca_res['pca_results'],
+                pca_res['weight_matrices'],
+                pca_res['separation_stats'],
+                stimulated_population,
+                target_pop,
+                save_path=str(pca_output_dir / f'pca_scatter.pdf')
+            )
+            
+            plot_pca_loadings_by_connectivity(
+                pca_res['pca_results'],
+                pca_res['weight_matrices'],
+                save_path=str(pca_output_dir / f'pca_loadings.pdf')
+            )
+            
+            plot_pca_separation_forest(
+                pca_res['bootstrap_result'],
+                stimulated_population,
+                target_pop,
+                save_path=str(pca_output_dir / f'pca_forest.pdf')
+            )
+            
+            plot_variance_explained(
+                pca_res['pca_results'],
+                save_path=str(pca_output_dir / f'pca_variance.pdf')
+            )
+            
+            print(f"   Saved PCA plots to: {pca_output_dir}")
+        
     # Create summary forest plot
     print(f"\n{'='*80}")
     print(f"Creating summary forest plot across all targets")
@@ -1725,7 +1819,33 @@ def create_summary_forest_plots_batch(
         stimulated_population=stimulated_population,
         save_path=summary_plot_path
     )
-    
+
+    if run_pca:
+        print(f"\n{'='*80}")
+        print(f"Creating PCA summary plot across all targets")
+        print('='*80)
+        
+        # Extract only PCA results
+        pca_results_by_target = {
+            target_pop: results['pca_results']
+            for target_pop, results in analysis_results_by_target.items()
+            if results.get('pca_results') is not None
+        }
+        
+        if pca_results_by_target:
+            pca_summary_path = output_path / f'{stimulated_population}_all_targets_pca_summary.pdf'
+            pca_summary_fig = plot_pca_summary_all_targets(
+                pca_results_by_target=pca_results_by_target,
+                stimulated_population=stimulated_population,
+                save_path=pca_summary_path
+            )
+            print(f"   Saved PCA summary plot to: {pca_summary_path}")
+        else:
+            print("   Warning: No PCA results available for summary plot")
+            pca_summary_fig = None
+    else:
+        pca_summary_fig = None
+        
     print(f"\nBatch analysis complete. Outputs saved to: {output_path}")
     
     return analysis_results_by_target, summary_fig

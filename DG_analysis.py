@@ -85,6 +85,7 @@ from nested_weights_analysis import (
     plot_weights_by_average_response_nested,
     plot_connectivity_weight_comparison,
     plot_summary_forest_plot_all_targets,
+    plot_pca_summary_all_targets
 )
 # Configure logging
 logging.basicConfig(
@@ -968,6 +969,8 @@ def cmd_nested_weights_analysis(args):
                                 threshold_std=args.threshold_std,
                                 expression_threshold=args.expression_threshold,
                                 n_bootstrap=args.n_bootstrap,
+                                run_pca=args.run_pca,
+                                n_pca_permutations=args.n_pca_permutations,
                                 random_seed=args.seed
                             )
                             
@@ -1012,10 +1015,10 @@ def cmd_nested_weights_analysis(args):
                     if args.plot and intensity in all_analyses.get(target, {}):
                         analysis_results_by_post = all_analyses[target][intensity]
                         if len(analysis_results_by_post) > 0:
+                            vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                            vis_dir.mkdir(parents=True, exist_ok=True)
                             logger.info(f"\n    Generating summary forest plot across all targets...")
                             try:
-                                vis_dir = output_dir / f"{target}_intensity_{intensity}"
-                                vis_dir.mkdir(parents=True, exist_ok=True)
                                 
                                 summary_fig = plot_summary_forest_plot_all_targets(
                                     analysis_results_by_target=analysis_results_by_post,
@@ -1029,6 +1032,26 @@ def cmd_nested_weights_analysis(args):
                                 logger.error(f"      Failed to generate summary forest plot: {e}")
                                 import traceback
                                 logger.error(traceback.format_exc())
+                            if args.run_pca:
+                                try:
+                                    pca_results_by_target = {
+                                        target_pop: results['pca_results']
+                                        for target_pop, results in analysis_results_by_post.items()
+                                        if results.get('pca_results') is not None
+                                    }
+
+                                    pca_fig = plot_pca_summary_all_targets(
+                                        pca_results_by_target=pca_results_by_target,
+                                        stimulated_population=target,
+                                        save_path=str(vis_dir / f'{target}_all_targets_summary_pca.pdf')
+                                    )
+                                    if pca_fig is not None:
+                                        plt.close(pca_fig)
+                                        logger.info(f"      Saved PCA plot")
+                                except Exception as e:
+                                    logger.error(f"      Failed to generate summary PCA plot: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
                     
                     # Clean up circuit
                     del experiment
@@ -1103,6 +1126,8 @@ def cmd_nested_weights_analysis(args):
                             threshold_std=args.threshold_std,
                             expression_threshold=args.expression_threshold,
                             n_bootstrap=args.n_bootstrap,
+                            run_pca=args.run_pca,
+                            n_pca_permutations=args.n_pca_permutations,
                             random_seed=args.seed
                         )
                         
@@ -1144,11 +1169,10 @@ def cmd_nested_weights_analysis(args):
                 if args.plot and intensity in all_analyses.get(target, {}):
                     analysis_results_by_post = all_analyses[target][intensity]
                     if len(analysis_results_by_post) > 0:
+                        vis_dir = output_dir / f"{target}_intensity_{intensity}"
+                        vis_dir.mkdir(parents=True, exist_ok=True)
                         logger.info(f"\n    Generating summary forest plot across all targets...")
                         try:
-                            vis_dir = output_dir / f"{target}_intensity_{intensity}"
-                            vis_dir.mkdir(parents=True, exist_ok=True)
-                            
                             summary_fig = plot_summary_forest_plot_all_targets(
                                 analysis_results_by_target=analysis_results_by_post,
                                 stimulated_population=target,
@@ -1161,6 +1185,26 @@ def cmd_nested_weights_analysis(args):
                             logger.error(f"      Failed to generate summary forest plot: {e}")
                             import traceback
                             logger.error(traceback.format_exc())
+                        if args.run_pca:
+                            try:
+                                pca_results_by_target = {
+                                        target_pop: results['pca_results']
+                                        for target_pop, results in analysis_results_by_post.items()
+                                        if results.get('pca_results') is not None
+                                    }
+
+                                pca_fig = plot_pca_summary_all_targets(
+                                    pca_results_by_target=pca_results_by_target,
+                                    stimulated_population=target,
+                                    save_path=str(vis_dir / f'{target}_all_targets_summary_pca.pdf')
+                                )
+                                if pca_fig is not None:
+                                    plt.close(pca_fig)
+                                    logger.info(f"      Saved PCA plot")
+                            except Exception as e:
+                                logger.error(f"      Failed to generate summary PCA plot: {e}")
+                                import traceback
+                                logger.error(traceback.format_exc())
                 
                 # Clean up circuit
                 del experiment
@@ -1612,6 +1656,16 @@ Examples:
                                 default=0.2,
                                 metavar='VALUE',
                                 help='Opsin expression threshold (default: 0.2)')
+    parser_weights.add_argument('--run-pca',
+                                action='store_true',
+                                default=False,
+                                help='Include PCA analysis of multivariate input weight patterns'
+                                )
+    parser_weights.add_argument('--n-pca-permutations',
+                                type=int,
+                                default=1000,
+                                help='Number of permutations for PCA null distribution (default: 1000)'
+                                )
     parser_weights.add_argument('--seed',
                                 type=int,
                                 default=None,
