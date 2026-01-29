@@ -5,7 +5,7 @@ This script provides analysis and visualization capabilities for
 results from DG optogenetic experiments.
 
 Available Commands:
-    plot-comparative          Plot PV vs SST comparative results
+    plot-comparative         Plot PV vs SST comparative results
     plot-ablations           Plot ablation test results
     plot-weights             Plot synaptic weight distributions
     plot-expression          Plot expression level dependence
@@ -191,22 +191,52 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
     
     # Validate based on expected type
     if result_type == 'comparative':
-        if not isinstance(data, tuple) or len(data) != 4:
+
+        # Check if it's the new dict format or legacy tuple format
+        if isinstance(data, dict):
+            # New format: extract from dict
+            if 'results' not in data:
+                raise ValueError("Comparative results missing 'results' key")
+
+            results = data['results']
+            conn_analysis = data.get('connectivity_analysis', {})
+            cond_analysis = data.get('conductance_analysis', {})
+            metadata = data.get('metadata', {})
+
+            # Validate results structure
+            if 'pv' not in results and 'sst' not in results:
+                raise ValueError("Comparative results missing 'pv' and 'sst' populations")
+
+            logger.info(f"Loaded comparative results from {filepath}")
+            logger.info(f"  Populations: {list(results.keys())}")
+            if metadata and 'n_trials' in metadata:
+                logger.info(f"  Trials: {metadata['n_trials']}")
+
+            # Return as tuple for consistency
+            return (results, conn_analysis, cond_analysis, metadata)
+
+        elif isinstance(data, tuple) and len(data) == 4:
+            # Legacy format: already a tuple
+            results, conn_analysis, cond_analysis, metadata = data
+
+            if 'pv' not in results and 'sst' not in results:
+                raise ValueError("Comparative results missing 'pv' and 'sst' populations")
+
+            logger.info(f"Loaded comparative results from {filepath}")
+            logger.info(f"  Populations: {list(results.keys())}")
+            if metadata and 'n_trials' in metadata:
+                logger.info(f"  Trials: {metadata['n_trials']}")
+
+            return data
+
+        else:
             raise ValueError(
-                "Invalid comparative results format. Expected tuple of "
-                "(results, connectivity_analysis, conductance_analysis, metadata)"
+                "Invalid comparative results format. Expected either:\n"
+                "  - Dictionary with 'results', 'connectivity_analysis', "
+                "'conductance_analysis', 'metadata' keys\n"
+                "  - Tuple of (results, connectivity_analysis, conductance_analysis, metadata)"
             )
-        results, conn_analysis, cond_analysis, metadata = data
         
-        if 'pv' not in results and 'sst' not in results:
-            raise ValueError("Comparative results missing 'pv' and 'sst' populations")
-        
-        logger.info(f"Loaded comparative results from {filepath}")
-        logger.info(f"  Populations: {list(results.keys())}")
-        if metadata and 'n_trials' in metadata:
-            logger.info(f"  Trials: {metadata['n_trials']}")
-        
-        return data
         
     elif result_type == 'ablation':
         if not isinstance(data, dict):
