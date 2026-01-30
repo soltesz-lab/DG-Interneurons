@@ -43,9 +43,20 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
 import matplotlib.pyplot as plt
 import logging
+import h5py
+from hdf5_storage import load_nested_trials_from_hdf5
+import torch
+import matplotlib.pyplot as plt
+
+
+from DG_circuit_dendritic_somatic_transfer import (
+    CircuitParams, PerConnectionSynapticParams, OpsinParams
+)
 
 # Import functions from DG_protocol module
 from DG_protocol import (
+    OptogeneticExperiment, set_random_seed, get_default_device,
+    
     # Loading
     load_experiment_results,
     reconstruct_circuit_from_metadata,
@@ -87,6 +98,16 @@ from nested_weights_analysis import (
     plot_summary_forest_plot_all_targets,
     plot_pca_summary_all_targets
 )
+from nested_weights_dist_analysis import (
+    analyze_weights_distributional_nested,
+    plot_distributional_analysis_nested,
+    plot_distributional_analysis_nested_opsin_aware,
+    plot_distributional_violin_grid_across_populations,
+    plot_quantile_summary_across_populations
+)
+
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +115,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+plt.rcParams['axes.grid'] = False
 
 # ============================================================================
 # Helper Functions
@@ -859,6 +881,11 @@ def cmd_bootstrap_analysis(args):
 def cmd_nested_weights_analysis(args):
     """
     Handle nested weights analysis command (supports HDF5 and pickle formats)
+    
+    Includes optional distributional analysis using:
+    - Geometric mean ratios
+    - Mann-Whitney U / CLES
+    - Quantile profiles
     """
     logger.info("="*80)
     logger.info("Nested Weights Analysis")
@@ -905,22 +932,19 @@ def cmd_nested_weights_analysis(args):
     logger.info(f"  Intensities: {intensities}")
     logger.info(f"  Bootstrap samples: {args.n_bootstrap}")
     logger.info(f"  Classification threshold: {args.threshold_std} std")
+    if args.run_distributional:
+        logger.info(f"  Distributional analysis: ENABLED")
+        logger.info(f"    Quantiles: {args.distribution_quantiles}")
     
-    # Import necessary classes
-    from DG_circuit_dendritic_somatic_transfer import (
-        CircuitParams, PerConnectionSynapticParams, OpsinParams
-    )
-    from DG_protocol import OptogeneticExperiment, set_random_seed, get_default_device
     
     device = get_default_device()
     
     # Storage for all analyses
     all_analyses = {}
+    all_distributional_analyses = {} if args.run_distributional else None
     
     # Handle HDF5 vs pickle differently
     if file_format == 'hdf5':
-        import h5py
-        from hdf5_storage import load_nested_trials_from_hdf5
         
         hdf5_file = nested_data['hdf5_file']
         n_connectivity = metadata['n_connectivity_instances']
@@ -935,6 +959,8 @@ def cmd_nested_weights_analysis(args):
                     continue
                 
                 all_analyses[target] = {}
+                if args.run_distributional:
+                    all_distributional_analyses[target] = {}
                 
                 logger.info(f"\n{'='*60}")
                 logger.info(f"Analyzing {target.upper()} stimulation")
@@ -987,6 +1013,7 @@ def cmd_nested_weights_analysis(args):
                         logger.info(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
                         
                         try:
+                            # Mean-based analysis
                             analysis_results = analyze_weights_by_average_response_nested(
                                 nested_results=trials,
                                 circuit=experiment.circuit,
@@ -1004,25 +1031,63 @@ def cmd_nested_weights_analysis(args):
                                 random_seed=args.seed
                             )
                             
-                            # Store results
+                            # Store mean-based results
                             if target not in all_analyses:
                                 all_analyses[target] = {}
                             if intensity not in all_analyses[target]:
                                 all_analyses[target][intensity] = {}
                             all_analyses[target][intensity][post_pop] = analysis_results
                             
-                            # Generate visualization
+                            # Distributional analysis (if enabled)
+                            if args.run_distributional:
+                                logger.info(f"      Running distributional analysis...")
+                                
+                                dist_results = analyze_weights_distributional_nested(
+                                    nested_results=trials,
+                                    circuit=experiment.circuit,
+                                    target_population=target,
+                                    post_population=post_pop,
+                                    source_populations=source_populations,
+                                    stim_start=stim_start,
+                                    stim_duration=stim_duration,
+                                    warmup=warmup,
+                                    threshold_std=args.threshold_std,
+                                    expression_threshold=args.expression_threshold,
+                                    n_bootstrap=args.n_bootstrap,
+                                    quantiles=args.distribution_quantiles,
+                                    random_seed=args.seed
+                                )
+                                
+                                # Store distributional results
+                                if target not in all_distributional_analyses:
+                                    all_distributional_analyses[target] = {}
+                                if intensity not in all_distributional_analyses[target]:
+                                    all_distributional_analyses[target][intensity] = {}
+                                all_distributional_analyses[target][intensity][post_pop] = dist_results
+                            
+                            # Generate visualizations
                             if args.plot:
                                 vis_dir = output_dir / f"{target}_intensity_{intensity}"
                                 vis_dir.mkdir(parents=True, exist_ok=True)
                                 
-                                logger.info(f"      Generating plot...")
+                                # Mean-based plot
+                                logger.info(f"      Generating mean-based plot...")
                                 fig = plot_weights_by_average_response_nested(
                                     analysis_results,
                                     save_path=str(vis_dir / f'nested_weights_{post_pop}.pdf')
                                 )
                                 plt.close(fig)
                                 
+                                # Distributional plot (if enabled)
+                                if args.run_distributional:
+                                    logger.info(f"      Generating distributional plot...")
+                                    fig_dist = plot_distributional_analysis_nested_opsin_aware(
+                                        dist_results,
+                                        save_path=str(vis_dir / f'nested_weights_{post_pop}_distributional.pdf')
+                                    )
+                                    plt.close(fig_dist)
+
+
                                 # Generate detailed connectivity comparison if requested
                                 if args.detailed:
                                     logger.info(f"      Generating detailed connectivity comparison...")
@@ -1049,7 +1114,6 @@ def cmd_nested_weights_analysis(args):
                             vis_dir.mkdir(parents=True, exist_ok=True)
                             logger.info(f"\n    Generating summary forest plot across all targets...")
                             try:
-                                
                                 summary_fig = plot_summary_forest_plot_all_targets(
                                     analysis_results_by_target=analysis_results_by_post,
                                     stimulated_population=target,
@@ -1062,6 +1126,24 @@ def cmd_nested_weights_analysis(args):
                                 logger.error(f"      Failed to generate summary forest plot: {e}")
                                 import traceback
                                 logger.error(traceback.format_exc())
+
+                            if args.run_distributional:
+                                # Summary of geometric ratio and CLES across all post-populations
+                                fig_summary = plot_distributional_violin_grid_across_populations(
+                                    all_distributional_analyses[target][intensity],
+                                    save_path=str(vis_dir / f'{target}_distributional_summary_metrics.pdf'),
+                                    figsize=(16, 12)
+                                )
+                                plt.close(fig_summary)
+
+                                # Summary of quantile profiles across all post-populations
+                                fig_quantiles = plot_quantile_summary_across_populations(
+                                    all_distributional_analyses[target][intensity],
+                                    save_path=str(vis_dir / f'{target}_distributional_summary_quantiles.pdf'),
+                                    figsize=(18, 12)
+                                )
+                                plt.close(fig_quantiles)
+
                             if args.run_pca:
                                 try:
                                     pca_results_by_target = {
@@ -1086,20 +1168,21 @@ def cmd_nested_weights_analysis(args):
                     # Clean up circuit
                     del experiment
                     if device.type == 'cuda':
-                        import torch
                         torch.cuda.empty_cache()
     
     else:  # Pickle format
         nested_results = nested_data['nested_results']
         seed_structure = nested_data['seed_structure']
         
-        # Original pickle-based analysis
+        # Original pickle-based analysis (same changes as HDF5 version)
         for target in target_populations:
             if target not in nested_results:
                 logger.warning(f"Skipping {target.upper()} - no results found")
                 continue
             
             all_analyses[target] = {}
+            if args.run_distributional:
+                all_distributional_analyses[target] = {}
             
             logger.info(f"\n{'='*60}")
             logger.info(f"Analyzing {target.upper()} stimulation")
@@ -1144,6 +1227,7 @@ def cmd_nested_weights_analysis(args):
                     logger.info(f"\n    Analyzing {target.upper()} -> {post_pop.upper()}")
                     
                     try:
+                        # Mean-based analysis
                         analysis_results = analyze_weights_by_average_response_nested(
                             nested_results=trials,
                             circuit=experiment.circuit,
@@ -1167,16 +1251,52 @@ def cmd_nested_weights_analysis(args):
                             all_analyses[target][intensity] = {}
                         all_analyses[target][intensity][post_pop] = analysis_results
                         
+                        # Distributional analysis (if enabled)
+                        if args.run_distributional:
+                            logger.info(f"      Running distributional analysis...")
+                            
+                            dist_results = analyze_weights_distributional_nested(
+                                nested_results=trials,
+                                circuit=experiment.circuit,
+                                target_population=target,
+                                post_population=post_pop,
+                                source_populations=source_populations,
+                                stim_start=stim_start,
+                                stim_duration=stim_duration,
+                                warmup=warmup,
+                                threshold_std=args.threshold_std,
+                                expression_threshold=args.expression_threshold,
+                                n_bootstrap=args.n_bootstrap,
+                                quantiles=args.distribution_quantiles,
+                                random_seed=args.seed
+                            )
+                            
+                            if target not in all_distributional_analyses:
+                                all_distributional_analyses[target] = {}
+                            if intensity not in all_distributional_analyses[target]:
+                                all_distributional_analyses[target][intensity] = {}
+                            all_distributional_analyses[target][intensity][post_pop] = dist_results
+                        
                         if args.plot:
                             vis_dir = output_dir / f"{target}_intensity_{intensity}"
                             vis_dir.mkdir(parents=True, exist_ok=True)
                             
-                            logger.info(f"      Generating plot...")
+                            # Mean-based plot
+                            logger.info(f"      Generating mean-based plot...")
                             fig = plot_weights_by_average_response_nested(
                                 analysis_results,
                                 save_path=str(vis_dir / f'nested_weights_{post_pop}.pdf')
                             )
                             plt.close(fig)
+                            
+                            # Distributional plot (if enabled)
+                            if args.run_distributional:
+                                logger.info(f"      Generating distributional plot...")
+                                fig_dist = plot_distributional_analysis_nested_opsin_aware(
+                                    dist_results,
+                                    save_path=str(vis_dir / f'nested_weights_{post_pop}_distributional.pdf')
+                                )
+                                plt.close(fig_dist)
                             
                             if args.detailed:
                                 logger.info(f"      Generating detailed connectivity comparison...")
@@ -1215,14 +1335,32 @@ def cmd_nested_weights_analysis(args):
                             logger.error(f"      Failed to generate summary forest plot: {e}")
                             import traceback
                             logger.error(traceback.format_exc())
+                        
+                        if args.run_distributional:
+                            # Summary of geometric ratio and CLES across all post-populations
+                            fig_summary = plot_distributional_violin_grid_across_populations(
+                                all_distributional_analyses[target][intensity],
+                                save_path=str(vis_dir / f'{target}_distributional_summary_metrics.pdf'),
+                                figsize=(16, 12)
+                            )
+                            plt.close(fig_summary)
+
+                            # Summary of quantile profiles across all post-populations
+                            fig_quantiles = plot_quantile_summary_across_populations(
+                                all_distributional_analyses[target][intensity],
+                                save_path=str(vis_dir / f'{target}_distributional_summary_quantiles.pdf'),
+                                figsize=(18, 12)
+                            )
+                            plt.close(fig_quantiles)
+                                
                         if args.run_pca:
                             try:
                                 pca_results_by_target = {
-                                        target_pop: results['pca_results']
-                                        for target_pop, results in analysis_results_by_post.items()
-                                        if results.get('pca_results') is not None
-                                    }
-
+                                    target_pop: results['pca_results']
+                                    for target_pop, results in analysis_results_by_post.items()
+                                    if results.get('pca_results') is not None
+                                }
+                                
                                 pca_fig = plot_pca_summary_all_targets(
                                     pca_results_by_target=pca_results_by_target,
                                     stimulated_population=target,
@@ -1239,25 +1377,32 @@ def cmd_nested_weights_analysis(args):
                 # Clean up circuit
                 del experiment
                 if device.type == 'cuda':
-                    import torch
                     torch.cuda.empty_cache()
     
     # Save complete analysis results
     if args.save_results:
         analysis_file = output_dir / 'nested_weights_analysis_results.pkl'
-        import pickle
+        save_dict = {
+            'all_analyses': all_analyses,
+            'metadata': metadata,
+            'parameters': {
+                'threshold_std': args.threshold_std,
+                'expression_threshold': args.expression_threshold,
+                'n_bootstrap': args.n_bootstrap,
+                'random_seed': args.seed
+            }
+        }
+        
+        if args.run_distributional:
+            save_dict['all_distributional_analyses'] = all_distributional_analyses
+            save_dict['parameters']['quantiles'] = args.distribution_quantiles
+        
         with open(analysis_file, 'wb') as f:
-            pickle.dump({
-                'all_analyses': all_analyses,
-                'metadata': metadata,
-                'parameters': {
-                    'threshold_std': args.threshold_std,
-                    'expression_threshold': args.expression_threshold,
-                    'n_bootstrap': args.n_bootstrap,
-                    'random_seed': args.seed
-                }
-            }, f)
+            pickle.dump(save_dict, f)
+        
         logger.info(f"\nAnalysis results saved to: {analysis_file}")
+        if args.run_distributional:
+            logger.info(f"  - Includes distributional analysis results")
     
     logger.info(f"\nNested weights analysis output saved to: {output_dir}")
     
@@ -1634,6 +1779,9 @@ Examples:
   # With detailed connectivity comparison plots
   %(prog)s nested_results.pkl --detailed
   
+  # With distributional analysis
+  %(prog)s nested_results.pkl --run-distributional
+        
   # Analyze specific populations
   %(prog)s nested_results.pkl --target-populations pv \\
                               --post-populations gc mc \\
@@ -1686,6 +1834,19 @@ Examples:
                                 default=0.2,
                                 metavar='VALUE',
                                 help='Opsin expression threshold (default: 0.2)')
+
+    parser_weights.add_argument('--run-distributional',
+                                action='store_true',
+                                default=False,
+                                help='Include distributional analysis (geometric mean, CLES, quantiles)')
+    parser_weights.add_argument('--distribution-quantiles',
+                                type=float,
+                                nargs='+',
+                                default=[0.25, 0.50, 0.75, 0.90],
+                                metavar='Q',
+                                help='Quantiles for distributional analysis (default: 0.25 0.50 0.75 0.90)')
+
+
     parser_weights.add_argument('--run-pca',
                                 action='store_true',
                                 default=False,
