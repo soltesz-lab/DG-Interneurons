@@ -2003,12 +2003,47 @@ def plot_distributional_violin_grid_across_populations(
                 # Create violin plot
                 parts = ax.violinplot(data_to_plot, positions=positions,
                                      showmeans=False, showmedians=False, widths=0.6)
-                
+
                 for pc, color in zip(parts['bodies'], [colors['excited'], colors['suppressed']]):
                     pc.set_facecolor(color)
                     pc.set_alpha(0.6)
                     pc.set_edgecolor('black')
                     pc.set_linewidth(1.2)
+
+
+                # Plot individual connectivity-level geometric means
+                geo_means_exc_per_conn = []
+                geo_means_sup_per_conn = []
+
+                for c in sorted(geometric_stats.keys()):
+                    if base_source in geometric_stats[c]:
+                        if panel_type == 'all':
+                            gm_exc = geometric_stats[c][base_source].get('geometric_mean_excited', np.nan)
+                            gm_sup = geometric_stats[c][base_source].get('geometric_mean_suppressed', np.nan)
+                        elif panel_type == 'opsin_plus':
+                            gm_exc = geometric_stats[c][base_source].get('geometric_mean_excited_opsin_plus', np.nan)
+                            gm_sup = geometric_stats[c][base_source].get('geometric_mean_suppressed_opsin_plus', np.nan)
+                        else:  # opsin_minus
+                            gm_exc = geometric_stats[c][base_source].get('geometric_mean_excited_opsin_minus', np.nan)
+                            gm_sup = geometric_stats[c][base_source].get('geometric_mean_suppressed_opsin_minus', np.nan)
+
+                        if not np.isnan(gm_exc):
+                            geo_means_exc_per_conn.append(gm_exc)
+                        if not np.isnan(gm_sup):
+                            geo_means_sup_per_conn.append(gm_sup)
+
+                # Plot individual points with jitter for visibility
+                if len(geo_means_exc_per_conn) > 0:
+                    jitter_exc = np.random.normal(0, 0.04, len(geo_means_exc_per_conn))
+                    ax.scatter(1 + jitter_exc, geo_means_exc_per_conn, 
+                               color=colors['excited'], s=20, alpha=0.4, 
+                               edgecolor='black', linewidth=0.5, zorder=4)
+
+                if len(geo_means_sup_per_conn) > 0:
+                    jitter_sup = np.random.normal(0, 0.04, len(geo_means_sup_per_conn))
+                    ax.scatter(2 + jitter_sup, geo_means_sup_per_conn,
+                               color=colors['suppressed'], s=20, alpha=0.4,
+                               edgecolor='black', linewidth=0.5, zorder=4)
                 
                 if show_stats:
                     # Add geometric means
@@ -2037,12 +2072,12 @@ def plot_distributional_violin_grid_across_populations(
                         if len(geo_means_exc) > 0:
                             geo_mean_exc = np.mean(geo_means_exc)
                             ax.scatter([1], [geo_mean_exc], color=colors['excited'],
-                                      marker='D', s=60, edgecolor='black', linewidth=1.5, zorder=5)
+                                       marker='D', s=60, edgecolor='black', linewidth=1.5, zorder=5)
                         
                         if len(geo_means_sup) > 0:
                             geo_mean_sup = np.mean(geo_means_sup)
                             ax.scatter([2], [geo_mean_sup], color=colors['suppressed'],
-                                      marker='D', s=60, edgecolor='black', linewidth=1.5, zorder=5)
+                                       marker='D', s=60, edgecolor='black', linewidth=1.5, zorder=5)
                     
                     # Add medians
                     median_exc = np.median(all_excited)
