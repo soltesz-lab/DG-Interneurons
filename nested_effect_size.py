@@ -109,8 +109,10 @@ def classify_cells_by_connectivity(
             connectivity_idx: {
                 'excited_cells': array of cell indices,
                 'suppressed_cells': array of cell indices,
+                'unchanged_cells': array of cell indices,
                 'n_excited': int,
                 'n_suppressed': int,
+                'n_unchanged': int,
                 'rate_change': tensor of rate changes for all cells
             },
             ...
@@ -162,21 +164,27 @@ def classify_cells_by_connectivity(
         if isinstance(rate_change_filtered, torch.Tensor):
             excited_mask = rate_change_filtered > (threshold_std * baseline_std)
             suppressed_mask = rate_change_filtered < (-threshold_std * baseline_std)
-            
+            unchanged_mask = ~(excited_mask | suppressed_mask)  # NEW
+
             excited_cells = cell_indices[excited_mask.cpu().numpy()]
             suppressed_cells = cell_indices[suppressed_mask.cpu().numpy()]
+            unchanged_cells = cell_indices[unchanged_mask.cpu().numpy()]  # NEW
         else:
             excited_mask = rate_change_filtered > (threshold_std * baseline_std)
             suppressed_mask = rate_change_filtered < (-threshold_std * baseline_std)
-            
+            unchanged_mask = ~(excited_mask | suppressed_mask)  # NEW
+                        
             excited_cells = cell_indices[excited_mask]
             suppressed_cells = cell_indices[suppressed_mask]
-        
+            unchanged_cells = cell_indices[unchanged_mask]  # NEW
+            
         classifications[conn_idx] = {
             'excited_cells': excited_cells,
             'suppressed_cells': suppressed_cells,
+            'unchanged_cells': unchanged_cells,
             'n_excited': len(excited_cells),
             'n_suppressed': len(suppressed_cells),
+            'n_unchanged': len(unchanged_cells),
             'rate_change': rate_change_filtered
         }
     
@@ -210,8 +218,11 @@ def extract_weights_by_connectivity(
             connectivity_idx: {
                 'weights_excited': array of weights to excited cells,
                 'weights_suppressed': array of weights to suppressed cells,
+                'weights_unchanged': array of weights to unchanged cells,
                 'n_weights_excited': number of non-zero weights,
                 'n_weights_suppressed': number of non-zero weights
+                'n_weights_unchanged': number of non-zero weights
+
             },
             ...
         }
@@ -229,6 +240,7 @@ def extract_weights_by_connectivity(
     for conn_idx, classification in classifications.items():
         excited_cells = classification['excited_cells']
         suppressed_cells = classification['suppressed_cells']
+        unchanged_cells = classification['unchanged_cells']
         
         # Extract weights for each group
         # weights[:, excited_cells] gives all inputs to excited cells
@@ -256,8 +268,10 @@ def extract_weights_by_connectivity(
         weights_by_connectivity[conn_idx] = {
             'weights_excited': weights_excited,
             'weights_suppressed': weights_suppressed,
+            'weights_unchanged': weights_unchanged,
             'n_weights_excited': len(weights_excited),
-            'n_weights_suppressed': len(weights_suppressed)
+            'n_weights_suppressed': len(weights_suppressed),
+            'n_weights_unchanged': len(weights_unchanged)
         }
     
     return weights_by_connectivity
@@ -270,37 +284,58 @@ def extract_weights_by_connectivity(
 def compute_connectivity_weight_differences(
     weights_by_connectivity: Dict,
     metric: str = 'mean'
-) -> np.ndarray:
+) -> Dict[str, np.ndarray]:
     """
-    Compute weight difference for each connectivity instance
+    Compute weight differences for all three pairwise comparisons
     
     Args:
         weights_by_connectivity: Output from extract_weights_by_connectivity()
         metric: 'mean' or 'median'
         
     Returns:
-        array: [Δw_1, Δw_2, ..., Δw_n] for n connectivity instances
+        dict: {
+            'excited_vs_suppressed': array of Δw per connectivity,
+            'excited_vs_unchanged': array of Δw per connectivity,
+            'suppressed_vs_unchanged': array of Δw per connectivity
+        }
     """
-    weight_differences = []
+    diff_exc_sup = []
+    diff_exc_unch = []
+    diff_sup_unch = []
     
     for conn_idx in sorted(weights_by_connectivity.keys()):
         weights_excited = weights_by_connectivity[conn_idx]['weights_excited']
         weights_suppressed = weights_by_connectivity[conn_idx]['weights_suppressed']
+        weights_unchanged = weights_by_connectivity[conn_idx]['weights_unchanged']
         
-        # Skip if either group has no weights
-        if len(weights_excited) == 0 or len(weights_suppressed) == 0:
-            continue
-        
+        # Compute statistics based on metric
         if metric == 'mean':
-            delta_w = np.mean(weights_excited) - np.mean(weights_suppressed)
+            stat_func = np.mean
         elif metric == 'median':
-            delta_w = np.median(weights_excited) - np.median(weights_suppressed)
+            stat_func = np.median
         else:
             raise ValueError(f"Unknown metric: {metric}")
         
-        weight_differences.append(delta_w)
+        # Excited vs Suppressed (original comparison)
+        if len(weights_excited) > 0 and len(weights_suppressed) > 0:
+            delta_exc_sup = stat_func(weights_excited) - stat_func(weights_suppressed)
+            diff_exc_sup.append(delta_exc_sup)
+        
+        # Excited vs Unchanged
+        if len(weights_excited) > 0 and len(weights_unchanged) > 0:
+            delta_exc_unch = stat_func(weights_excited) - stat_func(weights_unchanged)
+            diff_exc_unch.append(delta_exc_unch)
+        
+        # Suppressed vs Unchanged
+        if len(weights_suppressed) > 0 and len(weights_unchanged) > 0:
+            delta_sup_unch = stat_func(weights_suppressed) - stat_func(weights_unchanged)
+            diff_sup_unch.append(delta_sup_unch)
     
-    return np.array(weight_differences)
+    return {
+        'excited_vs_suppressed': np.array(diff_exc_sup),
+        'excited_vs_unchanged': np.array(diff_exc_unch),
+        'suppressed_vs_unchanged': np.array(diff_sup_unch)
+    }
 
 
 # ============================================================================
@@ -492,10 +527,11 @@ def analyze_effect_size_all_sources_nested(
             continue
         
         # Compute connectivity-level differences
-        weight_diffs = compute_connectivity_weight_differences(
+        weight_diffs_all = compute_connectivity_weight_differences(
             weights_by_conn,
             metric='mean'
         )
+        weight_diffs = weights_diffs_all['excited_vs_suppressed']
         
         if len(weight_diffs) == 0:
             continue

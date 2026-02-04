@@ -591,7 +591,9 @@ class DGCircuitVisualization:
                              sort_by_activity=False, split_populations=None, direct_activation=None,
                              activation_cmap='plasma', activation_bar_width=None,
                              baseline_window=None, normalize_to_baseline=False,
-                             activity_std=None, show_std_shading=True):
+                             activity_std=None, show_std_shading=True,
+                             sorting_window=None,
+                             use_global_colormap=True):
         """
         Plot circuit activity as raster plots with neurons sorted by mean firing rate
 
@@ -619,6 +621,8 @@ class DGCircuitVisualization:
             activity_std: Dictionary with population keys containing std across trials (n_cells, timesteps).
                          If provided, will show shaded regions for trial-to-trial variability
             show_std_shading: Whether to show standard deviation shading (only if activity_std provided)
+            use_global_colormap: If True and normalize_to_baseline=True, use same colormap 
+                            range for all populations for fair comparison
         """
         # Determine number of timesteps
         timesteps = None
@@ -629,6 +633,26 @@ class DGCircuitVisualization:
         # Create time axis
         time_axis = np.arange(timesteps) * self.circuit.circuit_params.dt
 
+        # Calculate global colormap limits if requested
+        global_vmin, global_vmax = None, None
+        if normalize_to_baseline and use_global_colormap:
+            all_data = []
+            for pop, activity in activity_trace.items():
+                if hasattr(activity, 'cpu'):
+                    activity_data = activity.cpu().numpy()
+                else:
+                    activity_data = np.array(activity)
+                all_data.append(activity_data.flatten())
+
+            all_data = np.concatenate(all_data)
+            all_data = all_data[np.isfinite(all_data)]
+
+            if len(all_data) > 0:
+                global_vmax = np.percentile(np.abs(all_data), 99)
+                if global_vmax < 0.1:
+                    global_vmax = 1.0
+                global_vmin = -global_vmax
+        
         # Calculate baseline statistics if requested
         baseline_stats = {}
         if baseline_window is not None and normalize_to_baseline:
@@ -723,7 +747,9 @@ class DGCircuitVisualization:
                     activation_part1 = activation_data[unit_ids_part1] if activation_data is not None else None
 
                     im = self._plot_single_raster(ax, activity_part1, time_axis, pop, 
-                                                  vmin, vmax, cmap, mean_linewidth,
+                                                  global_vmin if use_global_colormap else vmin,
+                                                  global_vmax if use_global_colormap else vmax,
+                                                  cmap, mean_linewidth,
                                                   title_suffix=f' - {part1_label}',
                                                   direct_activation=activation_part1,
                                                   activation_cmap=activation_cmap,
@@ -731,7 +757,9 @@ class DGCircuitVisualization:
                                                   normalize_to_baseline=normalize_to_baseline,
                                                   baseline_window=baseline_window,
                                                   activity_std=std_part1,
-                                                  show_std_shading=show_std_shading)
+                                                  show_std_shading=show_std_shading,
+                                                  sort_by_activity=sort_by_activity,
+                                                  sorting_window=sorting_window)
                     if im is not None:
                         image_objects.append(im)
                     panel_idx += 1
@@ -744,7 +772,9 @@ class DGCircuitVisualization:
                     activation_part2 = activation_data[unit_ids_part2] if activation_data is not None else None
 
                     im = self._plot_single_raster(ax, activity_part2, time_axis, pop, 
-                                                  vmin, vmax, cmap, mean_linewidth,
+                                                  global_vmin if use_global_colormap else vmin,
+                                                  global_vmax if use_global_colormap else vmax,
+                                                  cmap, mean_linewidth,
                                                   title_suffix=f' - {part2_label}',
                                                   direct_activation=activation_part2,
                                                   activation_cmap=activation_cmap,
@@ -752,7 +782,9 @@ class DGCircuitVisualization:
                                                   normalize_to_baseline=normalize_to_baseline,
                                                   baseline_window=baseline_window,
                                                   activity_std=std_part2,
-                                                  show_std_shading=show_std_shading)
+                                                  show_std_shading=show_std_shading,
+                                                  sort_by_activity=sort_by_activity,
+                                                  sorting_window=sorting_window)
                     if im is not None:
                         image_objects.append(im)
                     panel_idx += 1
@@ -762,7 +794,9 @@ class DGCircuitVisualization:
                 # Plot normally (no split)
                 ax = axes[panel_idx]
                 im = self._plot_single_raster(ax, activity_data, time_axis, pop, 
-                                              vmin, vmax, cmap, mean_linewidth,
+                                              global_vmin if use_global_colormap else vmin,
+                                              global_vmax if use_global_colormap else vmax,
+                                              cmap, mean_linewidth,
                                               direct_activation=activation_data,
                                               activation_cmap=activation_cmap,
                                               activation_bar_width=activation_bar_width,
@@ -770,7 +804,8 @@ class DGCircuitVisualization:
                                               normalize_to_baseline=normalize_to_baseline,
                                               baseline_window=baseline_window,
                                               activity_std=std_data,
-                                              show_std_shading=show_std_shading)
+                                              show_std_shading=show_std_shading,
+                                              sorting_window=sorting_window)
                 activity_history[pop] = np.mean(activity_data, axis=0).tolist()
                 panel_idx += 1
                 if im is not None:
@@ -804,18 +839,46 @@ class DGCircuitVisualization:
                             direct_activation=None, activation_cmap='plasma',
                             activation_bar_width=None, sort_by_activity=False,
                             normalize_to_baseline=False, baseline_window=None,
-                            activity_std=None, show_std_shading=True):
+                            activity_std=None, show_std_shading=True,
+                            sorting_window=None):
         """
         Helper method to plot a single raster panel with Rectangle patches for activation
-
+        sorting_window: Optional tuple (start_time, end_time) in ms. If provided,
+                       neurons are sorted by mean activity during this window only.
+                       If None, sorts by mean activity across entire trace.
         Returns:
             im: The image object from imshow (to prevent garbage collection)
         """
         n_cells = activity_data.shape[0]
 
         # Calculate mean activity per neuron across time
-        mean_activity_per_neuron = np.mean(activity_data, axis=1)
+        #mean_activity_per_neuron = np.mean(activity_data, axis=1)
 
+        
+        
+        # Calculate mean activity per neuron for sorting
+        if sorting_window is not None and sort_by_activity:
+            # Sort based on activity during specified window
+            sort_start, sort_end = sorting_window
+
+            # Convert to numpy if tensors
+            if hasattr(sort_start, 'cpu'):
+                sort_start = sort_start.cpu().numpy() if sort_start.dim() == 0 else sort_start.cpu().item()
+            if hasattr(sort_end, 'cpu'):
+                sort_end = sort_end.cpu().numpy() if sort_end.dim() == 0 else sort_end.cpu().item()
+
+            # Ensure scalar values
+            if isinstance(sort_start, np.ndarray):
+                sort_start = float(sort_start)
+            if isinstance(sort_end, np.ndarray):
+                sort_end = float(sort_end)
+
+            sort_mask = (time_axis >= sort_start) & (time_axis < sort_end)
+            mean_activity_per_neuron = np.mean(activity_data[:, sort_mask], axis=1)
+        else:
+            # Sort based on activity across entire trace
+            mean_activity_per_neuron = np.mean(activity_data, axis=1)
+        
         # Sort neurons by mean firing rate (descending)
         sorted_indices = np.argsort(mean_activity_per_neuron)[::-1]
         if sort_by_activity:
@@ -827,7 +890,7 @@ class DGCircuitVisualization:
         else:
             sorted_activity = activity_data
             sorted_std = activity_std
-
+            
         # Sort direct activation data if provided
         sorted_activation = None
         if direct_activation is not None and np.sum(direct_activation) > 0.0:
@@ -838,24 +901,18 @@ class DGCircuitVisualization:
 
         # Determine colormap range with robust handling
         if normalize_to_baseline:
-            activity_abs_max = np.abs(sorted_activity)
-            vmax_pop = np.percentile(activity_abs_max[np.isfinite(activity_abs_max)], 99)
-            if vmax_pop < 0.1:
-                vmax_pop = 1.0
-            vmin_pop = -vmax_pop
-        else:
-            vmin_pop = vmin if vmin is not None else 0
-            if vmax is not None:
+            if vmin is not None and vmax is not None:
+                # Use provided global limits
+                vmin_pop = vmin
                 vmax_pop = vmax
             else:
-                valid_activity = sorted_activity[np.isfinite(sorted_activity)]
-                if len(valid_activity) > 0:
-                    vmax_pop = np.percentile(valid_activity, 99)
-                    if vmax_pop <= vmin_pop:
-                        vmax_pop = vmin_pop + 1.0
-                else:
-                    vmax_pop = 10.0
-
+                # Calculate per-population limits
+                activity_abs_max = np.abs(sorted_activity)
+                vmax_pop = np.percentile(activity_abs_max[np.isfinite(activity_abs_max)], 99)
+                if vmax_pop < 0.1:
+                    vmax_pop = 1.0
+                vmin_pop = -vmax_pop
+        
         # Calculate activation bar parameters
         time_range = time_axis[-1] - time_axis[0]
         if activation_bar_width is None:
@@ -1029,6 +1086,7 @@ class DGCircuitVisualization:
                                  stim_start: float = 500.0,
                                  baseline_normalize: bool = False,
                                  sort_by_activity: bool = True,
+                                 sort_by_stim_period: bool = True,
                                  save_path: Optional[str] = None):
         """
         Plot trial-averaged activity with standard deviation shading
@@ -1095,12 +1153,16 @@ class DGCircuitVisualization:
                 suffix += "_normalized"
             save_path = f"protocol/DG_{target_population}_stimulation_raster_{light_intensity}{suffix}.png"
 
+        # Calculate sorting window based on stim_start
+        sorting_window = (stim_start, time_cpu[-1]) if sort_by_stim_period else None
+
         # Plot with trial-averaged data
         fig, activity_history = self.plot_activity_raster(
             activity_mean,
             split_populations=split_populations,
             direct_activation=plot_direct_activation if plot_direct_activation else None,
             sort_by_activity=sort_by_activity,
+            sorting_window=sorting_window,
             baseline_window=baseline_window,
             normalize_to_baseline=baseline_normalize,
             activity_std=activity_std,

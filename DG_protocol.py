@@ -1735,6 +1735,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                                stim_duration: float = 1000.0,
                                warmup: float = 500.0,
                                plot_activity: bool = True,
+                               plot_baseline_normalize: bool = False,
                                device: Optional[torch.device] = None,
                                n_trials: int = 1,
                                regenerate_connectivity_per_trial: bool = False,
@@ -1894,6 +1895,7 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
                 stim_duration=stim_duration,
                 plot_activity=plot_activity,
                 plot_aggregated=True,
+                plot_baseline_normalize=plot_baseline_normalize,
                 mec_current=mec_current,
                 opsin_current=opsin_current,
                 n_trials=n_trials,
@@ -1931,7 +1933,9 @@ def run_comparative_experiment(optimization_json_file: Optional[str] = None,
             analysis = {}
             analysis['opsin_expression_mean'] = opsin_expression_mean
             analysis['n_trials'] = n_trials
-            
+
+            if save_full_activity and 'trial_results' in result:
+                analysis['trial_results'] = result['trial_results']
 
             if recorded_currents is not None:
                 analysis['recorded_currents'] = recorded_currents
@@ -2217,7 +2221,35 @@ def load_experiment_results(filepath: str) -> Tuple[Dict, Dict, Dict, Dict]:
             # Only convert specific keys that are expected to be tensors
             tensor_keys = ['recorded_currents',
                            'activity_trace_mean', 'activity_trace_std', 
-                          'opsin_expression_mean', 'opsin_expression_std', 'time']
+                           'opsin_expression_mean', 'opsin_expression_std', 'time',
+                           'trial_results']
+
+            # Special handling for trial_results (list of trial dicts)
+            if 'trial_results' in obj:
+                converted_trials = []
+                for trial in obj['trial_results']:
+                    converted_trial = {}
+                    for key, value in trial.items():
+                        # Convert tensors in trial dict
+                        if key in ['time', 'opsin_expression', 'target_positions']:
+                            converted_trial[key] = torch.from_numpy(value) if isinstance(value, np.ndarray) else value
+                        elif key == 'activity_trace':
+                            # Convert activity traces for each population
+                            converted_trial[key] = {
+                                pop: torch.from_numpy(act) if isinstance(act, np.ndarray) else act
+                                for pop, act in value.items()
+                            }
+                        else:
+                            # Keep other fields as-is (layout, connectivity, indices)
+                            converted_trial[key] = value
+                    converted_trials.append(converted_trial)
+
+                # Return dict with converted trial_results
+                result = {k: convert_numpy_to_tensors(v) if k != 'trial_results' else converted_trials 
+                         for k, v in obj.items()}
+                return result
+
+            # Original logic for other keys
             if any(k in obj for k in tensor_keys):
                 return {k: convert_numpy_to_tensors(v) for k, v in obj.items()}
             else:
@@ -2227,6 +2259,7 @@ def load_experiment_results(filepath: str) -> Tuple[Dict, Dict, Dict, Dict]:
             return [convert_numpy_to_tensors(item) for item in obj]
         else:
             return obj
+    
     
     results = convert_numpy_to_tensors(results)
     
@@ -2393,17 +2426,33 @@ def plot_adaptive_stepping_analysis(adaptive_stats: Dict,
 
 def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                                         stimulation_level: float = 1.0,
+                                        metadata: Optional[Dict] = None,
                                         save_path: Optional[str] = None) -> None:
     """
     Create visualizations from comparative experiment results
     
     Now handles multi-trial statistics with error bars
     """
+
+    # Helper function to handle both numpy arrays and torch tensors
+    def to_numpy(arr):
+        """Convert torch tensor to numpy if needed"""
+        if isinstance(arr, torch.Tensor):
+            return arr.cpu().numpy()
+        return np.array(arr)
     
+    stim_start = None
+    stim_duration = None
+    warmup = None
+    if metadata is not None:
+        stim_start = metadata.get('stim_start', 1500.0)
+        stim_duration = metadata.get('stim_duration', 1000.0)
+        warmup = metadata.get('warmup', 500.0)
+
     # Check if we have multi-trial data
     n_trials = results['pv'][stimulation_level].get('n_trials', 1)
     has_multitrial = n_trials > 1
-    
+        
     # Define colors matching the paper
     colors = {
         'pv': '#FF6B9D', # Pink 
@@ -2417,50 +2466,138 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
     
     # Panel A: Firing ratio bar plots
     ax1 = plt.subplot(3, 4, (1, 2))
-    
+
     targets = ['pv', 'sst']
     populations = ['gc', 'mc', 'pv', 'sst']
-    
+
     bar_data = []
-    bar_errors = []  # Error bars for multi-trial
+    bar_errors = []
     bar_labels = []
     bar_colors = []
-    
+    individual_points = []  # Store individual trial data points
+    point_colors = []  # Store colors for each point based on cell responses
+
+    # Get time array and create masks (needed for individual trial analysis)
+    # Extract from first available trial_results if present
+    time = None
+    for target in ['pv', 'sst']:
+        if target in results and stimulation_level in results[target]:
+            if 'trial_results' in results[target][stimulation_level]:
+                trial_results = results[target][stimulation_level]['trial_results']
+                if len(trial_results) > 0:
+                    time = trial_results[0]['time']
+                    break
+                
     for target in targets:
+
+        # Create time masks for baseline and stimulation periods
+        if (metadata is not None) and (time is not None):
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+        else:
+            # Fallback: create empty masks (won't be used if no trial_results)
+            baseline_mask = None
+            stim_mask = None
+        
         for pop in populations:
             if pop != target and f'{pop}_mean_change' in results[target][stimulation_level]:
                 baseline_rate = results[target][stimulation_level][f'{pop}_mean_baseline_rate']
                 stim_rate = results[target][stimulation_level][f'{pop}_mean_stim_rate']
-                
+
                 if baseline_rate > 0:
                     ratio = np.log2(stim_rate / baseline_rate)
                     bar_data.append(ratio)
                     bar_labels.append(f'{target.upper()}->{pop.upper()}')
                     bar_colors.append(colors[pop])
-                    
+
+                    # Extract individual trial data points and classify responses
+                    trial_points = []
+                    trial_colors = []
+                    if has_multitrial and 'trial_results' in results[target][stimulation_level]:
+                        for trial_result in results[target][stimulation_level]['trial_results']:
+                            trial_activity = to_numpy(trial_result['activity_trace'][pop])
+
+                            # Convert masks to numpy boolean arrays
+                            baseline_mask_np = to_numpy(baseline_mask)
+                            stim_mask_np = to_numpy(stim_mask)
+                            
+                            # Calculate per-cell baseline and stim rates
+                            trial_baseline = np.mean(trial_activity[:, baseline_mask_np], axis=1)
+                            trial_stim = np.mean(trial_activity[:, stim_mask_np], axis=1)
+                            trial_change = trial_stim - trial_baseline
+                            trial_baseline_std = np.std(trial_baseline)
+
+                            # Classify cells as excited/suppressed/unchanged
+                            excited_cells = (trial_change > trial_baseline_std)
+                            suppressed_cells = (trial_change < -trial_baseline_std)
+                            unchanged_cells = 1.0 - excited_cells - suppressed_cells
+
+                            frac_excited = np.mean(excited_cells)
+                            frac_suppressed = np.mean(suppressed_cells)
+                            frac_unchanged = np.mean(unchanged_cells)
+
+                            # Determine point color based on dominant response
+                            if frac_excited > max(frac_suppressed, frac_unchanged):
+                                point_color = 'red'  # Majority excited
+                            elif frac_suppressed > max(frac_excited, frac_unchanged):
+                                point_color = 'blue'  # Majority suppressed
+                            else:
+                                point_color = 'gray'  # Balanced or unchanged
+
+                            # Calculate trial mean ratio
+                            trial_baseline_mean = np.mean(trial_baseline)
+                            trial_stim_mean = np.mean(trial_stim)
+
+                            if trial_baseline_mean > 0:
+                                trial_ratio = np.log2(trial_stim_mean / trial_baseline_mean)
+                                trial_points.append(trial_ratio)
+                                trial_colors.append(point_color)
+
+                    individual_points.append(trial_points)
+                    point_colors.append(trial_colors)
+
                     # Add error bars if multi-trial
                     if has_multitrial and f'{pop}_mean_change_std' in results[target][stimulation_level]:
-                        # Approximate error in log2 ratio using error propagation
                         std = results[target][stimulation_level][f'{pop}_mean_change_std']
-                        error = std / (baseline_rate * np.log(2))  # Approximate
+                        error = std / (baseline_rate * np.log(2))
                         bar_errors.append(error)
                     else:
                         bar_errors.append(0)
-    
+
     if bar_data:
         x_pos = np.arange(len(bar_labels))
         bars = ax1.bar(x_pos, bar_data, color=bar_colors, alpha=0.7, 
-                      edgecolor='black', linewidth=1.5,
-                      yerr=bar_errors if has_multitrial else None,
-                      capsize=5)
-        
+                       edgecolor='black', linewidth=1.5,
+                       yerr=bar_errors if has_multitrial else None,
+                       capsize=5)
+
+        # Overlay individual data points with color coding
+        if has_multitrial:
+            for i, (points, colors_for_points) in enumerate(zip(individual_points, point_colors)):
+                if len(points) > 0:
+                    # Add jitter to x-position for visibility
+                    x_jittered = np.random.normal(x_pos[i], 0.05, len(points))
+                    ax1.scatter(x_jittered, points, c=colors_for_points, s=40, 
+                                alpha=0.7, zorder=10, edgecolors='white', linewidth=0.8)
+
+        # Value labels on bars
         for i, (bar, value) in enumerate(zip(bars, bar_data)):
             height = bar.get_height()
             ax1.text(bar.get_x() + bar.get_width()/2., height,
                     f'{value:.2f}', ha='center', 
                     va='bottom' if height > 0 else 'top',
                     fontsize=12, fontweight='bold')
-    
+
+        # Add legend for point colors
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='red', alpha=0.7, label='Excited'),
+            Patch(facecolor='blue', alpha=0.7, label='Suppressed'),
+            Patch(facecolor='gray', alpha=0.7, label='Balanced/Unchanged')
+        ]
+        ax1.legend(handles=legend_elements, loc='lower left', fontsize=9, 
+                  framealpha=0.9, title='Trial Response')
+
     ax1.set_xticks(x_pos)
     ax1.set_xticklabels(bar_labels, rotation=45, ha='right', fontsize=10)
     ax1.set_ylabel(r'Modulation Ratio ($\log_2$)', fontsize=12)
@@ -6392,6 +6529,7 @@ For detailed analysis options, see: python DG_analysis.py --help
             device=device,
             n_trials=args.n_trials,
             regenerate_connectivity_per_trial=args.regenerate_connectivity,
+            plot_baseline_normalize=True,
             base_seed=args.base_seed,
             stim_start=args.stim_start,
             stim_duration=args.stim_duration,

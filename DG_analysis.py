@@ -102,7 +102,7 @@ from nested_weights_dist_analysis import (
     analyze_weights_distributional_nested,
     plot_distributional_analysis_nested,
     plot_distributional_analysis_nested_opsin_aware,
-    plot_distributional_violin_grid_across_populations,
+    plot_distributional_violin_grid_across_populations_with_boxplot,
     plot_quantile_summary_across_populations
 )
 
@@ -397,6 +397,7 @@ def cmd_plot_comparative(args):
                 results, 
                 conn_analysis,
                 stimulation_level=intensity,
+                metadata=metadata,
                 save_path=str(output_dir)
             )
             logger.info(f"    Saved to {output_dir}")
@@ -1055,7 +1056,8 @@ def cmd_nested_weights_analysis(args):
                                     expression_threshold=args.expression_threshold,
                                     n_bootstrap=args.n_bootstrap,
                                     quantiles=args.distribution_quantiles,
-                                    random_seed=args.seed
+                                    random_seed=args.seed,
+                                    export_csv_path=args.weight_distribution_csv
                                 )
                                 
                                 # Store distributional results
@@ -1129,7 +1131,7 @@ def cmd_nested_weights_analysis(args):
 
                             if args.run_distributional:
                                 # Summary of geometric ratio and CLES across all post-populations
-                                fig_summary = plot_distributional_violin_grid_across_populations(
+                                fig_summary = plot_distributional_violin_grid_across_populations_with_boxplot(
                                     all_distributional_analyses[target][intensity],
                                     save_path=str(vis_dir / f'{target}_distributional_summary_metrics.pdf'),
                                     figsize=(16, 12)
@@ -1268,7 +1270,8 @@ def cmd_nested_weights_analysis(args):
                                 expression_threshold=args.expression_threshold,
                                 n_bootstrap=args.n_bootstrap,
                                 quantiles=args.distribution_quantiles,
-                                random_seed=args.seed
+                                random_seed=args.seed,
+                                export_csv_path=args.weight_distribution_csv
                             )
                             
                             if target not in all_distributional_analyses:
@@ -1338,7 +1341,7 @@ def cmd_nested_weights_analysis(args):
                         
                         if args.run_distributional:
                             # Summary of geometric ratio and CLES across all post-populations
-                            fig_summary = plot_distributional_violin_grid_across_populations(
+                            fig_summary = plot_distributional_violin_grid_across_populations_with_boxplot(
                                 all_distributional_analyses[target][intensity],
                                 save_path=str(vis_dir / f'{target}_distributional_summary_metrics.pdf'),
                                 figsize=(16, 12)
@@ -1845,7 +1848,10 @@ Examples:
                                 default=[0.25, 0.50, 0.75, 0.90],
                                 metavar='Q',
                                 help='Quantiles for distributional analysis (default: 0.25 0.50 0.75 0.90)')
-
+    parser_weights.add_argument('--weight-distribution-csv',
+                                type=str,
+                                default=None,
+                                help='Export weight distribution data to CSV')
 
     parser_weights.add_argument('--run-pca',
                                 action='store_true',

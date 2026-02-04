@@ -303,7 +303,17 @@ def bootstrap_geometric_mean_nested(
     
     # Two-sided p-value: test if ratio differs from 1.0
     # For ratios, null hypothesis is ratio = 1.0 (no difference)
-    p_value = np.sum(np.abs(bootstrap_means - 1.0) < np.abs(mean_val - 1.0)) / len(bootstrap_means)
+    # For CLES, null hypothesis is CLES = 0.5
+
+    if statistic == 'cles':
+        null_value = 0.5
+    elif 'ratio' in statistic:
+        null_value = 1.0
+    else:
+        null_value = 0.0
+
+    # Count proportion of bootstrap samples as or more extreme than observed
+    p_value = np.sum(np.abs(bootstrap_means - null_value) >= np.abs(mean_val - null_value)) / len(bootstrap_means)
     
     interpretation = _interpret_geometric_mean_ratio(mean_val)
     
@@ -627,8 +637,8 @@ def bootstrap_mann_whitney_nested(
     # Two-sided p-value: test if CLES differs from 0.5 (no difference)
     # For CLES, null hypothesis is CLES = 0.5
     null_value = 0.5 if statistic == 'cles' else 0.0
-    p_value = np.sum(np.abs(bootstrap_means - null_value) < np.abs(mean_val - null_value)) / len(bootstrap_means)
-    
+    p_value = np.sum(np.abs(bootstrap_means - null_value) >= np.abs(mean_val - null_value)) / len(bootstrap_means)
+
     interpretation = _interpret_cles(mean_val) if statistic == 'cles' else f'{statistic} = {mean_val:.3f}'
     
     return {
@@ -918,7 +928,7 @@ def bootstrap_quantile_differences_nested(
         alpha = 1 - confidence_level
         ci_lower_q = np.percentile(bootstrap_means_q, (alpha / 2) * 100)
         ci_upper_q = np.percentile(bootstrap_means_q, (1 - alpha / 2) * 100)
-        p_value_q = np.sum(np.sign(bootstrap_means_q) != np.sign(mean_diff)) / len(bootstrap_means_q)
+        p_value_q = np.sum(np.abs(bootstrap_means_q) >= np.abs(mean_diff)) / len(bootstrap_means_q)
         
         results_by_quantile[q] = {
             'mean': mean_diff,
@@ -953,7 +963,8 @@ def analyze_weights_distributional_nested(
     expression_threshold: float = 0.2,
     n_bootstrap: int = 10000,
     quantiles: List[float] = [0.25, 0.50, 0.75, 0.90],
-    random_seed: Optional[int] = None
+    random_seed: Optional[int] = None,
+    export_csv_path: Optional[str] = None
 ) -> Dict:
     """
     Perform comprehensive distributional analysis on nested experiment results.
@@ -1198,7 +1209,20 @@ def analyze_weights_distributional_nested(
         mann_whitney_bootstrap,
         quantile_bootstrap
     )
-    
+
+    # Export per-cell data to CSV if requested
+    if export_csv_path is not None:
+        export_per_cell_weights_to_csv(
+            classifications=classifications,
+            circuit=circuit,
+            source_populations=source_populations,
+            post_population=post_population,
+            target_population=target_population,
+            trials_by_connectivity=trials_by_connectivity,
+            expression_threshold=expression_threshold,
+            csv_path=f"{target_population}_{post_population}_{export_csv_path}"
+        )
+        
     print(f"\n{'='*80}\n")
     
     return {
@@ -2162,6 +2186,262 @@ def plot_distributional_violin_grid_across_populations(
     
     return fig
 
+def plot_distributional_violin_grid_across_populations_with_boxplot(
+    all_distributional_results: Dict[str, Dict],
+    save_path: Optional[str] = None,
+    figsize: Optional[Tuple[int, int]] = None,
+    show_stats: bool = True,
+    show_pvalues: bool = True
+) -> plt.Figure:
+    """
+    Create violin plot grid with box plots showing connectivity-level variance.
+    
+    Visualization strategy:
+    - Violin plots (semi-transparent): within-connectivity variance (all synaptic weights)
+    - Box plots (overlaid): between-connectivity variance (geometric means per connectivity)
+    - Individual dots (jittered): individual connectivity geometric means
+    
+    Args:
+        all_distributional_results: Dict mapping post_pop -> distributional_results
+        save_path: Optional path to save figure
+        figsize: Figure size (width, height). If None, auto-calculated from grid size
+        show_stats: Whether to show statistics in text boxes
+        show_pvalues: Whether to show p-values in text boxes
+        
+    Returns:
+        matplotlib Figure object
+    """
+    post_populations = sorted(all_distributional_results.keys())
+    n_post = len(post_populations)
+    
+    # Get source organization from first result
+    first_result = all_distributional_results[post_populations[0]]
+    geometric_bootstrap = first_result['geometric_bootstrap_results']
+    source_entries = _organize_sources_with_opsin_separation(geometric_bootstrap)
+    n_sources = len(source_entries)
+    
+    target = first_result['metadata']['target_population']
+    
+    # Auto-calculate figure size if not provided
+    if figsize is None:
+        fig_width = max(20, n_sources * 2.5 + 2)
+        fig_height = max(12, n_post * 2.5 + 2)
+        figsize = (fig_width, fig_height)
+    
+    # Create figure
+    fig, axes = plt.subplots(n_post, n_sources, figsize=figsize, squeeze=False)
+    fig.subplots_adjust(hspace=0.4, wspace=0.3, top=0.9, bottom=0.08, left=0.05, right=0.98)
+    
+    colors = {
+        'excited': '#e74c3c',
+        'suppressed': '#3498db'
+    }
+    
+    # Iterate over post-populations (rows)
+    for row_idx, post_pop in enumerate(post_populations):
+        results = all_distributional_results[post_pop]
+        weights_by_conn = results['weights_by_connectivity']
+        geometric_stats = results['geometric_stats_by_connectivity']
+        geometric_bootstrap = results['geometric_bootstrap_results']
+        mann_whitney_bootstrap = results['mann_whitney_bootstrap_results']
+        
+        # Iterate over source populations (columns)
+        for col_idx, entry in enumerate(source_entries):
+            ax = axes[row_idx, col_idx]
+            
+            source_key = entry['key']
+            source_label = entry['label']
+            base_source = entry['base_source']
+            
+            # Determine panel type for weight extraction
+            if source_key == base_source:
+                panel_type = 'all'
+            elif 'opsin_plus' in source_key:
+                panel_type = 'opsin_plus'
+            else:  # opsin_minus
+                panel_type = 'opsin_minus'
+            
+            # Collect weights across connectivities
+            all_excited = []
+            all_suppressed = []
+            
+            # Collect connectivity-level geometric means
+            geo_means_exc_per_conn = []
+            geo_means_sup_per_conn = []
+            
+            for conn_idx in sorted(weights_by_conn.keys()):
+                if base_source in weights_by_conn[conn_idx]:
+                    # Get weights for violin plot
+                    if panel_type == 'all':
+                        weights_exc = weights_by_conn[conn_idx][base_source]['weights_excited']
+                        weights_sup = weights_by_conn[conn_idx][base_source]['weights_suppressed']
+                    elif panel_type == 'opsin_plus':
+                        weights_exc = weights_by_conn[conn_idx][base_source].get('weights_excited_opsin_plus', [])
+                        weights_sup = weights_by_conn[conn_idx][base_source].get('weights_suppressed_opsin_plus', [])
+                    else:  # opsin_minus
+                        weights_exc = weights_by_conn[conn_idx][base_source].get('weights_excited_opsin_minus', [])
+                        weights_sup = weights_by_conn[conn_idx][base_source].get('weights_suppressed_opsin_minus', [])
+                    
+                    if len(weights_exc) > 0:
+                        all_excited.extend(weights_exc)
+                    if len(weights_sup) > 0:
+                        all_suppressed.extend(weights_sup)
+                    
+                    # Get geometric means for box plot
+                    if base_source in geometric_stats[conn_idx]:
+                        if panel_type == 'all':
+                            gm_exc = geometric_stats[conn_idx][base_source].get('geometric_mean_excited', np.nan)
+                            gm_sup = geometric_stats[conn_idx][base_source].get('geometric_mean_suppressed', np.nan)
+                        elif panel_type == 'opsin_plus':
+                            gm_exc = geometric_stats[conn_idx][base_source].get('geometric_mean_excited_opsin_plus', np.nan)
+                            gm_sup = geometric_stats[conn_idx][base_source].get('geometric_mean_suppressed_opsin_plus', np.nan)
+                        else:  # opsin_minus
+                            gm_exc = geometric_stats[conn_idx][base_source].get('geometric_mean_excited_opsin_minus', np.nan)
+                            gm_sup = geometric_stats[conn_idx][base_source].get('geometric_mean_suppressed_opsin_minus', np.nan)
+                        
+                        if not np.isnan(gm_exc):
+                            geo_means_exc_per_conn.append(gm_exc)
+                        if not np.isnan(gm_sup):
+                            geo_means_sup_per_conn.append(gm_sup)
+            
+            # Plot if we have data
+            if len(all_excited) > 0 and len(all_suppressed) > 0:
+                # 1. Violin plot (within-connectivity variance)
+                data_to_plot = [all_excited, all_suppressed]
+                positions = [1, 2]
+                
+                parts = ax.violinplot(data_to_plot, positions=positions,
+                                     showmeans=False, showmedians=False, widths=0.6)
+                
+                for pc, color in zip(parts['bodies'], [colors['excited'], colors['suppressed']]):
+                    pc.set_facecolor(color)
+                    pc.set_alpha(0.25)  # More transparent to see box plot
+                    pc.set_edgecolor('black')
+                    pc.set_linewidth(1.0)
+                    pc.set_label('All synapses' if color == colors['excited'] else None)
+                
+                # 2. Box plot (between-connectivity variance) - PROMINENT
+                if len(geo_means_exc_per_conn) > 0 and len(geo_means_sup_per_conn) > 0:
+                    box_data = [geo_means_exc_per_conn, geo_means_sup_per_conn]
+                    box_positions = [1, 2]
+                    
+                    bp = ax.boxplot(box_data, positions=box_positions, widths=0.3,
+                                   patch_artist=True, showfliers=False,
+                                   boxprops=dict(linewidth=2, zorder=5),
+                                   whiskerprops=dict(linewidth=2, zorder=5),
+                                   capprops=dict(linewidth=2, zorder=5),
+                                   medianprops=dict(linewidth=2.5, color='black', zorder=6))
+                    
+                    # Color the boxes
+                    for patch, color in zip(bp['boxes'], [colors['excited'], colors['suppressed']]):
+                        patch.set_facecolor(color)
+                        patch.set_alpha(0.5)
+                        patch.set_edgecolor('black')
+                    
+                    # 3. Individual connectivity points with jitter
+                    jitter_exc = np.random.normal(0, 0.04, len(geo_means_exc_per_conn))
+                    jitter_sup = np.random.normal(0, 0.04, len(geo_means_sup_per_conn))
+                    
+                    ax.scatter(1 + jitter_exc, geo_means_exc_per_conn, 
+                               color=colors['excited'], s=20, alpha=0.6, 
+                               edgecolor='black', linewidth=0.5, zorder=7)
+                    ax.scatter(2 + jitter_sup, geo_means_sup_per_conn,
+                               color=colors['suppressed'], s=20, alpha=0.6,
+                               edgecolor='black', linewidth=0.5, zorder=7)
+                
+                if show_stats:
+                    # Grand geometric mean marker
+                    geo_res = geometric_bootstrap.get(source_key, {})
+                    if 'mean' in geo_res and not np.isnan(geo_res['mean']):
+                        if len(geo_means_exc_per_conn) > 0:
+                            grand_mean_exc = np.mean(geo_means_exc_per_conn)
+                            ax.scatter([1], [grand_mean_exc], color=colors['excited'],
+                                       marker='D', s=80, edgecolor='black', linewidth=2, zorder=8)
+                        
+                        if len(geo_means_sup_per_conn) > 0:
+                            grand_mean_sup = np.mean(geo_means_sup_per_conn)
+                            ax.scatter([2], [grand_mean_sup], color=colors['suppressed'],
+                                       marker='D', s=80, edgecolor='black', linewidth=2, zorder=8)
+                
+                # Add p-values annotation if requested
+                if show_pvalues:
+                    geo_res = geometric_bootstrap.get(source_key, {})
+                    mw_res = mann_whitney_bootstrap.get(source_key, {})
+                    
+                    if 'mean' in geo_res and 'mean' in mw_res:
+                        p_geo = geo_res.get('p_value', np.nan)
+                        p_mw = mw_res.get('p_value', np.nan)
+                        
+                        sig_geo = _format_significance(p_geo)
+                        sig_mw = _format_significance(p_mw)
+                        
+                        stats_text = (f"W: {geo_res['mean']:.2f} {sig_geo}\n"
+                                      f"M: {mw_res['mean']:.2f} {sig_mw}")
+                        
+                        ax.text(0.65, 0.98, stats_text,
+                               transform=ax.transAxes, fontsize=7,
+                               verticalalignment='top', horizontalalignment='right',
+                               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+                
+                # Formatting
+                ax.set_yscale('log')
+                ax.set_xticks([1, 2])
+                ax.set_xticklabels(['Exc', 'Sup'], fontsize=8)
+                ax.grid(True, alpha=0.2, axis='y')
+                
+                # Y-axis label only on first column
+                if col_idx == 0:
+                    ax.set_ylabel(f'{post_pop.upper()}\nWeight (nS)', fontsize=9, fontweight='bold')
+                else:
+                    ax.set_ylabel('')
+                
+                # Column titles on first row
+                if row_idx == 0:
+                    ax.set_title(source_label, fontsize=9, fontweight='bold')
+                
+            else:
+                # No data - show empty panel
+                ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
+                       ha='center', va='center', fontsize=8, color='gray')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                
+                if col_idx == 0:
+                    ax.set_ylabel(f'{post_pop.upper()}', fontsize=9, fontweight='bold')
+                
+                if row_idx == 0:
+                    ax.set_title(source_label, fontsize=9, fontweight='bold')
+    
+    # Overall title
+    fig.suptitle(f'Weight Distribution Grid: {target.upper()} Stimulation Across All Post-Synaptic Populations\n'
+                f'(Excited vs Suppressed, Log Scale)',
+                fontsize=13, fontweight='bold')
+    
+    # Enhanced legend explaining the two variance levels
+    legend_elements = [
+        mpatches.Patch(facecolor='gray', alpha=0.25, edgecolor='black', linewidth=1,
+                      label='Violin: All synapses (within-connectivity variance)'),
+        mpatches.Patch(facecolor='gray', alpha=0.8, edgecolor='black', linewidth=2,
+                      label='Box: Connectivity means (between-connectivity variance)'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray',
+                  markeredgecolor='black', markersize=5, alpha=0.6,
+                  label='Individual connectivity geometric means'),
+        plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='gray',
+                  markeredgecolor='black', markersize=8,
+                  label='Grand mean (across connectivities)'),
+    ]
+    fig.legend(handles=legend_elements, loc='lower center', ncol=2,
+               bbox_to_anchor=(0.5, 0.01), fontsize=9, frameon=True)
+    
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved distributional violin grid plot with box overlays to: {save_path}")
+    
+    return fig
+
+
 def plot_quantile_summary_across_populations(
     all_distributional_results: Dict[str, Dict],
     save_path: Optional[str] = None,
@@ -2636,3 +2916,209 @@ def _plot_metric_comparison_opsin_separated(
         mpatches.Patch(edgecolor='black', facecolor='white', linewidth=1.5, label='n.s.')
     ]
     ax.legend(handles=legend_elements, fontsize=8, loc='upper right')
+
+def export_per_cell_weights_to_csv(
+    classifications: Dict,
+    circuit,
+    source_populations: List[str],
+    post_population: str,
+    target_population: str,
+    trials_by_connectivity: Dict,
+    expression_threshold: float,
+    csv_path: str
+) -> None:
+    """
+    Export per-cell weight statistics to CSV.
+    
+    Each row represents one post-synaptic cell with:
+    - Connectivity instance ID
+    - Post-synaptic cell information (population, unit ID, opsin expression, classification)
+    - For each presynaptic source: sum, mean, median of incoming weights
+    - If presynaptic source is stimulated (opsin-expressing), separate stats for opsin+/- sources
+    
+    Args:
+        classifications: Output from classify_cells_by_connectivity()
+        circuit: DentateCircuit instance
+        source_populations: List of source populations to analyze
+        post_population: Post-synaptic population name
+        target_population: Stimulated population name
+        trials_by_connectivity: Organized trials by connectivity
+        expression_threshold: Opsin expression threshold
+        csv_path: Path to save CSV file
+    """
+    import csv
+    
+    # Collect all cell data
+    cell_records = []
+    
+    for conn_idx in sorted(classifications.keys()):
+        conn_data = classifications[conn_idx]
+
+        # Get all cell indices for this connectivity
+        all_cell_indices = set()
+        all_cell_indices.update(conn_data['excited_cells'])
+        all_cell_indices.update(conn_data['suppressed_cells'])
+        all_cell_indices.update(conn_data['unchanged_cells'])
+        
+        # Get opsin expression from trials for this connectivity
+        trials = trials_by_connectivity[conn_idx]
+        if len(trials) == 0:
+            continue
+        
+        # Get opsin expression from first trial (same for all trials in connectivity)
+        opsin_expression = trials[0].opsin_expression
+        if hasattr(opsin_expression, 'cpu'):
+            opsin_expression = opsin_expression.cpu().numpy()
+        
+        for cell_idx in sorted(all_cell_indices):
+            # Determine classification
+            if cell_idx in conn_data['excited_cells']:
+                classification = 'excited'
+            elif cell_idx in conn_data['suppressed_cells']:
+                classification = 'suppressed'
+            else:
+                classification = 'unchanged'
+            
+            # Determine opsin expression for post-synaptic cell
+            post_opsin_expr = None
+            post_has_opsin = None
+            if post_population == target_population:
+                post_opsin_expr = float(opsin_expression[cell_idx])
+                post_has_opsin = post_opsin_expr >= expression_threshold
+            
+            # Build record
+            record = {
+                'connectivity_idx': conn_idx,
+                'post_population': post_population,
+                'post_cell_idx': cell_idx,
+                'classification': classification
+            }
+            
+            # Add opsin expression if applicable
+            if post_population == target_population:
+                record['post_opsin_expression'] = post_opsin_expr
+                record['post_has_opsin'] = post_has_opsin
+            
+            # For each source population, get weight statistics
+            for source_pop in source_populations:
+                # Get weights from source to this target cell
+                conn_name = f'{source_pop}_{post_population}'
+                
+                if conn_name not in circuit.connectivity.conductance_matrices:
+                    # No connection from this source to post population
+                    record[f'{source_pop}_weight_sum'] = 0.0
+                    record[f'{source_pop}_weight_mean'] = 0.0
+                    record[f'{source_pop}_weight_median'] = 0.0
+                    record[f'{source_pop}_n_synapses'] = 0
+                    
+                    if source_pop == target_population:
+                        record[f'{source_pop}_opsin_plus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_plus_n_synapses'] = 0
+                        record[f'{source_pop}_opsin_minus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_minus_n_synapses'] = 0
+                    continue
+                
+                cond_matrix = circuit.connectivity.conductance_matrices[conn_name]
+                weight_matrix = cond_matrix.conductances  # [n_pre, n_post]
+                
+                # Convert to numpy for easier indexing
+                if hasattr(weight_matrix, 'cpu'):
+                    weight_matrix_np = weight_matrix.cpu().numpy()
+                else:
+                    weight_matrix_np = np.array(weight_matrix)
+                
+                weights_to_cell = weight_matrix_np[:, cell_idx]
+                
+                # Filter non-zero weights
+                weights_to_cell = weights_to_cell[weights_to_cell > 0]
+                
+                # Basic statistics
+                if len(weights_to_cell) > 0:
+                    record[f'{source_pop}_weight_sum'] = float(np.sum(weights_to_cell))
+                    record[f'{source_pop}_weight_mean'] = float(np.mean(weights_to_cell))
+                    record[f'{source_pop}_weight_median'] = float(np.median(weights_to_cell))
+                    record[f'{source_pop}_n_synapses'] = int(len(weights_to_cell))
+                else:
+                    record[f'{source_pop}_weight_sum'] = 0.0
+                    record[f'{source_pop}_weight_mean'] = 0.0
+                    record[f'{source_pop}_weight_median'] = 0.0
+                    record[f'{source_pop}_n_synapses'] = 0
+                
+                # If source is stimulated population, separate by opsin expression
+                if source_pop == target_population:
+                    # Create opsin masks
+                    opsin_plus_mask = opsin_expression >= expression_threshold
+                    opsin_minus_mask = opsin_expression < expression_threshold
+                    
+                    # Get weights from opsin+ sources
+                    weights_from_opsin_plus = weight_matrix_np[opsin_plus_mask, cell_idx]
+                    weights_from_opsin_plus = weights_from_opsin_plus[weights_from_opsin_plus > 0]
+                    
+                    if len(weights_from_opsin_plus) > 0:
+                        record[f'{source_pop}_opsin_plus_weight_sum'] = float(np.sum(weights_from_opsin_plus))
+                        record[f'{source_pop}_opsin_plus_weight_mean'] = float(np.mean(weights_from_opsin_plus))
+                        record[f'{source_pop}_opsin_plus_weight_median'] = float(np.median(weights_from_opsin_plus))
+                        record[f'{source_pop}_opsin_plus_n_synapses'] = int(len(weights_from_opsin_plus))
+                    else:
+                        record[f'{source_pop}_opsin_plus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_plus_n_synapses'] = 0
+                    
+                    # Get weights from opsin- sources
+                    weights_from_opsin_minus = weight_matrix_np[opsin_minus_mask, cell_idx]
+                    weights_from_opsin_minus = weights_from_opsin_minus[weights_from_opsin_minus > 0]
+                    
+                    if len(weights_from_opsin_minus) > 0:
+                        record[f'{source_pop}_opsin_minus_weight_sum'] = float(np.sum(weights_from_opsin_minus))
+                        record[f'{source_pop}_opsin_minus_weight_mean'] = float(np.mean(weights_from_opsin_minus))
+                        record[f'{source_pop}_opsin_minus_weight_median'] = float(np.median(weights_from_opsin_minus))
+                        record[f'{source_pop}_opsin_minus_n_synapses'] = int(len(weights_from_opsin_minus))
+                    else:
+                        record[f'{source_pop}_opsin_minus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_minus_n_synapses'] = 0
+            
+            cell_records.append(record)
+    
+    # Write to CSV
+    if len(cell_records) > 0:
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Get all field names (some records may have opsin fields, others may not)
+        all_fieldnames = set()
+        for record in cell_records:
+            all_fieldnames.update(record.keys())
+        
+        # Order fieldnames logically
+        fieldnames = ['connectivity_idx', 'post_population', 'post_cell_idx', 'classification']
+        
+        # Add opsin fields if present
+        if 'post_opsin_expression' in all_fieldnames:
+            fieldnames.extend(['post_opsin_expression', 'post_has_opsin'])
+        
+        # Add source population fields in order
+        for source_pop in source_populations:
+            source_fields = [f for f in all_fieldnames if f.startswith(f'{source_pop}_')]
+            # Sort to get: weight_sum, weight_mean, weight_median, n_synapses, then opsin variants
+            source_fields_sorted = sorted(source_fields, key=lambda x: (
+                'opsin' in x,  # Regular fields first, then opsin fields
+                'minus' in x,  # opsin_plus before opsin_minus
+                x.split('_')[-1]  # Then by statistic type
+            ))
+            fieldnames.extend(source_fields_sorted)
+        
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(cell_records)
+        
+        print(f"Exported per-cell weight data to: {csv_path}")
+        print(f"  Total cells: {len(cell_records)}")
+        print(f"  Connectivity instances: {len(set(r['connectivity_idx'] for r in cell_records))}")
