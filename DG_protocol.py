@@ -1009,10 +1009,10 @@ class OptogeneticExperiment:
                     torch.cuda.empty_cache()
 
         # Aggregate results across trials
-        aggregated_results = self._aggregate_trial_results(all_trial_results, n_trials)
+        aggregated_results = aggregate_trial_results(all_trial_results, n_trials)
         # Add aggregated currents to results if available
         if self.record_currents:
-            aggregated_results['recorded_currents'] = self._aggregate_trial_currents(all_trial_results)
+            aggregated_results['recorded_currents'] = aggregate_trial_currents(all_trial_results)
         
         # Plot aggregated results if requested
         if plot_activity and plot_aggregated and n_trials >= 1:
@@ -1418,146 +1418,6 @@ class OptogeneticExperiment:
             'non_stimulated_indices': non_stimulated_indices
         }
     
-    def _aggregate_trial_results(self, trial_results: List[Dict], n_trials: int) -> Dict:
-        """Aggregate results across multiple trials"""
-        
-        # Time is the same across trials
-        time = trial_results[0]['time']
-        
-        # Stack activity traces: [n_trials, n_neurons, n_steps]
-        activity_traces_all = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst', 'mec']}
-        opsin_expressions_all = []
-        
-        for trial_result in trial_results:
-            for pop in activity_traces_all:
-                activity_traces_all[pop].append(trial_result['activity_trace'][pop])
-            opsin_expressions_all.append(trial_result['opsin_expression'])
-        
-        # Calculate mean and std across trials
-        activity_trace_mean = {}
-        activity_trace_std = {}
-        
-        for pop in activity_traces_all:
-            # Stack: [n_trials, n_neurons, n_steps]
-            stacked = torch.stack(activity_traces_all[pop], dim=0)
-            activity_trace_mean[pop] = torch.mean(stacked, dim=0)  # [n_neurons, n_steps]
-            if n_trials == 1:
-                # For single trial, std is 0 (no variance across trials)
-                activity_trace_std[pop] = torch.zeros_like(activity_trace_mean[pop])
-            else:
-                # For multiple trials, use unbiased=False for numerical stability
-                # (unbiased=True would divide by n-1, causing issues with small n)
-                activity_trace_std[pop] = torch.std(stacked, dim=0, unbiased=False)
-
-            
-        # Opsin expression (may vary slightly per trial due to stochastic generation)
-        opsin_expression_stacked = torch.stack(opsin_expressions_all, dim=0)
-        opsin_expression_mean = torch.mean(opsin_expression_stacked, dim=0)
-        if n_trials == 1:
-            opsin_expression_std = torch.zeros_like(opsin_expression_mean)
-        else:
-            opsin_expression_std = torch.std(opsin_expression_stacked, dim=0, unbiased=False)
-
-        # Aggregate adaptive stats if present
-        adaptive_stats_aggregated = None
-        if 'adaptive_stats' in trial_results[0]:
-            adaptive_stats_aggregated = self._aggregate_adaptive_stats(trial_results)
-
-        aggregated = {
-            'time': time,
-            'activity_trace_mean': activity_trace_mean,
-            'activity_trace_std': activity_trace_std,
-            'opsin_expression_mean': opsin_expression_mean,
-            'opsin_expression_std': opsin_expression_std,
-            'n_trials': n_trials,
-            'trial_results': trial_results,  # Keep individual results for detailed analysis
-            # Include layout and connectivity from last trial for visualization
-            'layout': trial_results[-1]['layout'],
-            'connectivity': trial_results[-1]['connectivity']
-        }
-
-        # Add adaptive stats if they were computed
-        if adaptive_stats_aggregated is not None:
-            aggregated['adaptive_stats'] = adaptive_stats_aggregated
-        
-        return aggregated
-
-    def _aggregate_adaptive_stats(self, trial_results: List[Dict]) -> Dict:
-        """
-        Aggregate adaptive stepping statistics across trials
-
-        Args:
-            trial_results: List of trial result dicts, each containing 'adaptive_stats'
-
-        Returns:
-            Aggregated statistics with mean, std, min, max across trials
-        """
-        # Extract adaptive stats from each trial
-        all_stats = [result['adaptive_stats'] for result in trial_results]
-
-        # Aggregate scalar statistics
-        n_steps_all = [stats['n_steps'] for stats in all_stats]
-        avg_dt_all = [stats['avg_dt'] for stats in all_stats]
-        min_dt_all = [stats['min_dt'] for stats in all_stats]
-        max_dt_all = [stats['max_dt'] for stats in all_stats]
-
-        aggregated = {
-            # Summary statistics across trials
-            'n_steps_mean': np.mean(n_steps_all),
-            'n_steps_std': np.std(n_steps_all),
-            'n_steps_min': np.min(n_steps_all),
-            'n_steps_max': np.max(n_steps_all),
-
-            'avg_dt_mean': np.mean(avg_dt_all),
-            'avg_dt_std': np.std(avg_dt_all),
-            'avg_dt_min': np.min(avg_dt_all),
-            'avg_dt_max': np.max(avg_dt_all),
-
-            'min_dt_mean': np.mean(min_dt_all),
-            'min_dt_min': np.min(min_dt_all),
-
-            'max_dt_mean': np.mean(max_dt_all),
-            'max_dt_max': np.max(max_dt_all),
-
-            # Keep individual trial statistics for detailed analysis
-            'trial_n_steps': n_steps_all,
-            'trial_avg_dt': avg_dt_all,
-            'trial_min_dt': min_dt_all,
-            'trial_max_dt': max_dt_all,
-
-            # Optional: Store first trial's detailed history for visualization
-            'dt_history_sample': all_stats[0]['dt_history'],
-            'time_history_sample': all_stats[0]['time_history'],
-            'gradient_history_sample': all_stats[0]['gradient_history'],
-        }
-
-        return aggregated
-
-    def _aggregate_trial_currents(self, trial_results: List[Dict]) -> Optional[Dict]:
-        """
-        Aggregate recorded currents across trials
-
-        Args:
-            trial_results: List of trial result dicts with 'recorded_currents'
-
-        Returns:
-            Aggregated current statistics or None if currents not recorded
-        """
-
-        # Check if any trial has recorded currents
-        if not any('recorded_currents' in tr for tr in trial_results):
-            return None
-
-        result = None
-        
-        # For now, just return the currents from the first trial
-        # (full multi-trial aggregation would require more memory)
-        for trial_result in trial_results:
-            if 'recorded_currents' in trial_result:
-                result = trial_result['recorded_currents']
-                break
-
-        return result    
     
     def _generate_dentate_spike_times(self, duration: float, baseline_rate: float = 0.5) -> List[float]:
         """Generate random dentate spike times (Poisson process)"""
@@ -1577,6 +1437,146 @@ class OptogeneticExperiment:
         return ds_times
 
 
+def aggregate_trial_results(trial_results: List[Dict], n_trials: int) -> Dict:
+    """Aggregate results across multiple trials"""
+
+    # Time is the same across trials
+    time = trial_results[0]['time']
+
+    # Stack activity traces: [n_trials, n_neurons, n_steps]
+    activity_traces_all = {pop: [] for pop in ['gc', 'mc', 'pv', 'sst', 'mec']}
+    opsin_expressions_all = []
+
+    for trial_result in trial_results:
+        for pop in activity_traces_all:
+            activity_traces_all[pop].append(trial_result['activity_trace'][pop])
+        opsin_expressions_all.append(trial_result['opsin_expression'])
+
+    # Calculate mean and std across trials
+    activity_trace_mean = {}
+    activity_trace_std = {}
+
+    for pop in activity_traces_all:
+        # Stack: [n_trials, n_neurons, n_steps]
+        stacked = torch.stack(activity_traces_all[pop], dim=0)
+        activity_trace_mean[pop] = torch.mean(stacked, dim=0)  # [n_neurons, n_steps]
+        if n_trials == 1:
+            # For single trial, std is 0 (no variance across trials)
+            activity_trace_std[pop] = torch.zeros_like(activity_trace_mean[pop])
+        else:
+            # For multiple trials, use unbiased=False for numerical stability
+            # (unbiased=True would divide by n-1, causing issues with small n)
+            activity_trace_std[pop] = torch.std(stacked, dim=0, unbiased=False)
+
+
+    # Opsin expression (may vary slightly per trial due to stochastic generation)
+    opsin_expression_stacked = torch.stack(opsin_expressions_all, dim=0)
+    opsin_expression_mean = torch.mean(opsin_expression_stacked, dim=0)
+    if n_trials == 1:
+        opsin_expression_std = torch.zeros_like(opsin_expression_mean)
+    else:
+        opsin_expression_std = torch.std(opsin_expression_stacked, dim=0, unbiased=False)
+
+    # Aggregate adaptive stats if present
+    adaptive_stats_aggregated = None
+    if 'adaptive_stats' in trial_results[0]:
+        adaptive_stats_aggregated = aggregate_adaptive_stats(trial_results)
+
+    aggregated = {
+        'time': time,
+        'activity_trace_mean': activity_trace_mean,
+        'activity_trace_std': activity_trace_std,
+        'opsin_expression_mean': opsin_expression_mean,
+        'opsin_expression_std': opsin_expression_std,
+        'n_trials': n_trials,
+        'trial_results': trial_results,  # Keep individual results for detailed analysis
+        # Include layout and connectivity from last trial for visualization
+        'layout': trial_results[-1]['layout'],
+        'connectivity': trial_results[-1]['connectivity']
+    }
+
+    # Add adaptive stats if they were computed
+    if adaptive_stats_aggregated is not None:
+        aggregated['adaptive_stats'] = adaptive_stats_aggregated
+
+    return aggregated
+
+def aggregate_adaptive_stats(trial_results: List[Dict]) -> Dict:
+    """
+    Aggregate adaptive stepping statistics across trials
+
+    Args:
+        trial_results: List of trial result dicts, each containing 'adaptive_stats'
+
+    Returns:
+        Aggregated statistics with mean, std, min, max across trials
+    """
+    # Extract adaptive stats from each trial
+    all_stats = [result['adaptive_stats'] for result in trial_results]
+
+    # Aggregate scalar statistics
+    n_steps_all = [stats['n_steps'] for stats in all_stats]
+    avg_dt_all = [stats['avg_dt'] for stats in all_stats]
+    min_dt_all = [stats['min_dt'] for stats in all_stats]
+    max_dt_all = [stats['max_dt'] for stats in all_stats]
+
+    aggregated = {
+        # Summary statistics across trials
+        'n_steps_mean': np.mean(n_steps_all),
+        'n_steps_std': np.std(n_steps_all),
+        'n_steps_min': np.min(n_steps_all),
+        'n_steps_max': np.max(n_steps_all),
+
+        'avg_dt_mean': np.mean(avg_dt_all),
+        'avg_dt_std': np.std(avg_dt_all),
+        'avg_dt_min': np.min(avg_dt_all),
+        'avg_dt_max': np.max(avg_dt_all),
+
+        'min_dt_mean': np.mean(min_dt_all),
+        'min_dt_min': np.min(min_dt_all),
+
+        'max_dt_mean': np.mean(max_dt_all),
+        'max_dt_max': np.max(max_dt_all),
+
+        # Keep individual trial statistics for detailed analysis
+        'trial_n_steps': n_steps_all,
+        'trial_avg_dt': avg_dt_all,
+        'trial_min_dt': min_dt_all,
+        'trial_max_dt': max_dt_all,
+
+        # Optional: Store first trial's detailed history for visualization
+        'dt_history_sample': all_stats[0]['dt_history'],
+        'time_history_sample': all_stats[0]['time_history'],
+        'gradient_history_sample': all_stats[0]['gradient_history'],
+    }
+
+    return aggregated
+
+def aggregate_trial_currents(trial_results: List[Dict]) -> Optional[Dict]:
+    """
+    Aggregate recorded currents across trials
+
+    Args:
+        trial_results: List of trial result dicts with 'recorded_currents'
+
+    Returns:
+        Aggregated current statistics or None if currents not recorded
+    """
+
+    # Check if any trial has recorded currents
+    if not any('recorded_currents' in tr for tr in trial_results):
+        return None
+
+    result = None
+
+    # For now, just return the currents from the first trial
+    # (full multi-trial aggregation would require more memory)
+    for trial_result in trial_results:
+        if 'recorded_currents' in trial_result:
+            result = trial_result['recorded_currents']
+            break
+
+    return result    
     
 
 def analyze_connectivity_patterns(experiment: OptogeneticExperiment) -> Dict:

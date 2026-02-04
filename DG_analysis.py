@@ -11,6 +11,7 @@ Available Commands:
     plot-expression          Plot expression level dependence
     plot-combined            Generate combined ablation + expression figure
     plot-currents            Plot synaptic currents
+    plot-connectivity-activity  Plot aggregated activity for specific connectivity instance
     analyze-weights-by-response  Statistical weight analysis by response
     plot-variance            Plot variance decomposition
     bootstrap-analysis       Bootstrap effect size analysis
@@ -22,7 +23,11 @@ Usage Examples:
     python DG_analysis.py plot-comparative results.pkl
     python DG_analysis.py plot-ablations ablation_results.pkl
     python DG_analysis.py plot-weights results.pkl
-    
+
+    # Connectivity-specific plotting
+    python DG_analysis.py plot-connectivity-activity nested_results.h5 \\
+        --connectivity-idx 0 --target-population pv --intensity 1.0
+
     # Advanced analyses
     python DG_analysis.py analyze-weights-by-response results.pkl --n-bootstrap 10000
     python DG_analysis.py bootstrap-analysis nested_results.pkl --n-samples 10000
@@ -60,6 +65,10 @@ from DG_protocol import (
     # Loading
     load_experiment_results,
     reconstruct_circuit_from_metadata,
+
+    # Aggregation utilities
+    aggregate_trial_results,
+    aggregate_adaptive_stats,
     
     # Plotting - Comparative
     plot_comparative_experiment_results,
@@ -341,6 +350,65 @@ def validate_intensities(intensities: Optional[list], available: list) -> list:
     
     return sorted(valid)
 
+
+def filter_trials_for_connectivity(nested_data: Dict,
+                                   target_population: str,
+                                   intensity: float,
+                                   connectivity_idx: int) -> List:
+    """
+    Filter trials for a specific connectivity instance
+    
+    Args:
+        nested_data: Loaded nested experiment data
+        target_population: Target population ('pv', 'sst')
+        intensity: Light intensity
+        connectivity_idx: Connectivity instance index
+        
+    Returns:
+        List of trial results for this connectivity/target/intensity combination
+    """
+    file_format = nested_data.get('file_format', 'pickle')
+    
+    if file_format == 'hdf5':
+        # Load trials from HDF5
+        hdf5_file = nested_data['hdf5_file']
+        metadata = nested_data['metadata']
+        
+        n_connectivity = metadata['n_connectivity_instances']
+        n_mec_patterns = metadata['n_mec_patterns_per_connectivity']
+        
+        with h5py.File(hdf5_file, 'r') as f:
+            all_trials = load_nested_trials_from_hdf5(
+                f, target_population, intensity, 
+                n_connectivity, n_mec_patterns,
+                require_full_activity=True
+            )
+        
+        # Filter for specific connectivity
+        filtered_trials = [
+            trial for trial in all_trials 
+            if trial.connectivity_idx == connectivity_idx
+        ]
+        
+    else:
+        # Pickle format
+        nested_results = nested_data['nested_results']
+        
+        if target_population not in nested_results:
+            return []
+        
+        if intensity not in nested_results[target_population]:
+            return []
+        
+        all_trials = nested_results[target_population][intensity]
+        
+        # Filter for specific connectivity
+        filtered_trials = [
+            trial for trial in all_trials 
+            if trial.connectivity_idx == connectivity_idx
+        ]
+    
+    return filtered_trials
 
 # ============================================================================
 # Subcommand Handlers
@@ -1476,6 +1544,210 @@ def cmd_decision_analysis(args):
     return 0
 
 
+def cmd_plot_connectivity_activity(args):
+    """
+    Handle connectivity-specific aggregated activity plotting
+    
+    Plots the average activity across all trials (different MEC patterns)
+    for a specific connectivity instance
+    """
+    logger.info("="*80)
+    logger.info("Plotting Connectivity-Specific Aggregated Activity")
+    logger.info("="*80)
+    
+    # Load and validate results
+    try:
+        nested_data = load_results_with_validation(args.input, 'nested')
+    except Exception as e:
+        logger.error(f"Failed to load results: {e}")
+        return 1
+    
+    # Extract metadata
+    metadata = nested_data.get('metadata', {})
+    file_format = nested_data.get('file_format', 'pickle')
+    
+    # Validate connectivity index
+    n_connectivity = metadata.get('n_connectivity_instances', 0)
+    if args.connectivity_idx >= n_connectivity:
+        logger.error(f"Connectivity index {args.connectivity_idx} out of range "
+                    f"(max: {n_connectivity - 1})")
+        return 1
+    
+    # Setup output directory
+    try:
+        output_dir = setup_output_directory(args.output)
+    except Exception as e:
+        logger.error(f"Failed to setup output directory: {e}")
+        return 1
+    
+    # Extract stimulation parameters
+    stim_start = metadata['stim_start']
+    stim_duration = metadata['stim_duration']
+    warmup = metadata.get('warmup', 500.0)
+    
+    logger.info(f"\nConfiguration:")
+    logger.info(f"  File format: {file_format.upper()}")
+    logger.info(f"  Target population: {args.target_population.upper()}")
+    logger.info(f"  Intensity: {args.intensity}")
+    logger.info(f"  Connectivity instance: {args.connectivity_idx}")
+    logger.info(f"  Total connectivity instances: {n_connectivity}")
+    
+    # Filter trials for this connectivity
+    logger.info(f"\nFiltering trials...")
+    
+    try:
+        trials = filter_trials_for_connectivity(
+            nested_data,
+            args.target_population,
+            args.intensity,
+            args.connectivity_idx
+        )
+    except Exception as e:
+        logger.error(f"Failed to filter trials: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 1
+    
+    if len(trials) == 0:
+        logger.error(f"No trials found for connectivity {args.connectivity_idx}")
+        return 1
+    
+    logger.info(f"  Found {len(trials)} trials for this connectivity")
+    logger.info(f"  MEC pattern indices: {sorted(set(t.mec_pattern_idx for t in trials))}")
+    
+    # Extract trial results in expected format
+    trial_results = [trial.results for trial in trials]
+    
+    # Aggregate across MEC patterns using the factored-out function
+    logger.info(f"\nAggregating activity across MEC patterns...")
+    
+    aggregated_results = aggregate_trial_results(
+        trial_results,
+        n_trials=len(trial_results)
+    )
+    
+    logger.info(f"  Aggregated {len(trial_results)} trials")
+    
+    # Reconstruct circuit with the specific connectivity seed
+    logger.info(f"\nReconstructing circuit...")
+    
+    seed_structure = nested_data.get('seed_structure', {})
+    connectivity_seeds = seed_structure.get('connectivity_seeds', [42])
+    
+    if args.connectivity_idx >= len(connectivity_seeds):
+        logger.error(f"Connectivity seed not found for index {args.connectivity_idx}")
+        return 1
+    
+    connectivity_seed = connectivity_seeds[args.connectivity_idx]
+    logger.info(f"  Using connectivity seed: {connectivity_seed}")
+    
+    # Import circuit components
+    from DG_circuit_dendritic_somatic_transfer import (
+        CircuitParams, PerConnectionSynapticParams, OpsinParams
+    )
+    from DG_visualization import DGCircuitVisualization
+    
+    circuit_params = CircuitParams()
+    synaptic_params = PerConnectionSynapticParams()
+    opsin_params = OpsinParams()
+    
+    # Apply optimization if available
+    optimization_file = metadata.get('optimization_file')
+    if optimization_file:
+        logger.info(f"  Applying optimization from: {optimization_file}")
+    
+    # Create circuit with this specific connectivity
+    device = get_default_device()
+    set_random_seed(connectivity_seed, device)
+    
+    experiment = OptogeneticExperiment(
+        circuit_params,
+        synaptic_params,
+        opsin_params,
+        optimization_json_file=optimization_file,
+        device=device,
+        base_seed=connectivity_seed
+    )
+    
+    # Get opsin expression (regenerate with same seed)
+    set_random_seed(connectivity_seed, device)
+    opsin_expression_obj = experiment.create_opsin_expression(args.target_population)
+    opsin_expression_array = opsin_expression_obj.expression_levels.cpu().numpy()
+    
+    logger.info(f"  Circuit reconstructed successfully")
+    
+    # Generate plot
+    logger.info(f"\nGenerating aggregated activity plot...")
+    
+    vis = DGCircuitVisualization(experiment.circuit)
+    
+    # Create filename suffix
+    suffix = f"_connectivity_{args.connectivity_idx}"
+    if args.baseline_normalize:
+        suffix += "_normalized"
+    
+    save_path = output_dir / f"DG_{args.target_population}_stimulation_connectivity_{args.connectivity_idx}_intensity_{args.intensity}_raster_aggregated.pdf"
+    
+    try:
+        fig, _ = vis.plot_aggregated_activity(
+            aggregated_results=aggregated_results,
+            target_population=args.target_population,
+            opsin_expression_levels=opsin_expression_array,
+            light_intensity=args.intensity,
+            stim_start=stim_start,
+            baseline_normalize=args.baseline_normalize,
+            sort_by_activity=args.sort_by_activity,
+            save_path=str(save_path)
+        )
+        plt.close(fig)
+        
+        logger.info(f"  Saved to: {save_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate plot: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 1
+    
+    # Print summary statistics
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Summary Statistics (Connectivity {args.connectivity_idx})")
+    logger.info('='*60)
+    
+    time = aggregated_results['time']
+    activity_mean = aggregated_results['activity_trace_mean']
+    activity_std = aggregated_results['activity_trace_std']
+    
+    baseline_mask = (time >= warmup) & (time < stim_start)
+    stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+    
+    for pop in ['gc', 'mc', 'pv', 'sst']:
+        baseline_rate = torch.mean(activity_mean[pop][:, baseline_mask], dim=1)
+        stim_rate = torch.mean(activity_mean[pop][:, stim_mask], dim=1)
+        
+        mean_baseline = torch.mean(baseline_rate).item()
+        mean_stim = torch.mean(stim_rate).item()
+        mean_change = mean_stim - mean_baseline
+        
+        logger.info(f"\n{pop.upper()}:")
+        logger.info(f"  Baseline: {mean_baseline:.2f} Hz")
+        logger.info(f"  Stimulation: {mean_stim:.2f} Hz")
+        logger.info(f"  Change: {mean_change:+.2f} Hz")
+        
+        # Variability across MEC patterns
+        if len(trial_results) > 1:
+            std_baseline = torch.mean(activity_std[pop][:, baseline_mask]).item()
+            std_stim = torch.mean(activity_std[pop][:, stim_mask]).item()
+            logger.info(f"  Variability (std across MEC patterns):")
+            logger.info(f"    Baseline: {std_baseline:.2f} Hz")
+            logger.info(f"    Stimulation: {std_stim:.2f} Hz")
+    
+    logger.info(f"\n{'='*60}")
+    logger.info("Connectivity activity plotting complete")
+    logger.info('='*60)
+    
+    return 0
+
 # ============================================================================
 # Argument Parser Setup
 # ============================================================================
@@ -1956,6 +2228,62 @@ Examples:
                            metavar='INTENSITY',
                            help='Intensities to analyze (default: all)')
     parser_dec.set_defaults(func=cmd_decision_analysis)
+
+    # ========== plot-connectivity-activity ==========
+    parser_conn = subparsers.add_parser(
+        'plot-connectivity-activity',
+        help='Plot aggregated activity for specific connectivity instance',
+        description='Plot trial-averaged activity for a single connectivity instance across MEC patterns',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Plot connectivity 0 for PV stimulation
+  %(prog)s nested_results.h5 --connectivity-idx 0 \\
+                             --target-population pv --intensity 1.0
+  
+  # Plot with baseline normalization
+  %(prog)s nested_results.pkl --connectivity-idx 2 \\
+                              --target-population sst --intensity 1.5 \\
+                              --baseline-normalize
+  
+  # Plot multiple connectivities
+  for i in 0 1 2; do
+    %(prog)s nested_results.h5 --connectivity-idx $i \\
+                               --target-population pv --intensity 1.0
+  done
+        """
+    )
+    parser_conn.add_argument('input',
+                            help='Nested experiment results file (*.pkl or *.h5)')
+    parser_conn.add_argument('--connectivity-idx',
+                            type=int,
+                            required=True,
+                            metavar='INDEX',
+                            help='Connectivity instance index to plot')
+    parser_conn.add_argument('--target-population',
+                            type=str,
+                            required=True,
+                            choices=['pv', 'sst'],
+                            metavar='POP',
+                            help='Target population that was stimulated')
+    parser_conn.add_argument('--intensity',
+                            type=float,
+                            required=True,
+                            metavar='VALUE',
+                            help='Light intensity to plot')
+    parser_conn.add_argument('--baseline-normalize',
+                            action='store_true',
+                            help='Normalize activity relative to baseline')
+    parser_conn.add_argument('--sort-by-activity',
+                            action='store_true',
+                            default=True,
+                            help='Sort cells by activity (default: True)')
+    parser_conn.add_argument('--no-sort',
+                            action='store_false',
+                            dest='sort_by_activity',
+                            help='Do not sort cells by activity')
+    parser_conn.set_defaults(func=cmd_plot_connectivity_activity)
+
     
     return parser
 
