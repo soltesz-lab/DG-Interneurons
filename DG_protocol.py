@@ -5174,9 +5174,12 @@ def print_current_analysis(current_analysis):
 
 def reconstruct_circuit_from_metadata(metadata: Dict,
                                       optimization_json_file: Optional[str] = None,
-                                      device: Optional[torch.device] = None) -> Tuple[DentateCircuit, Dict[str, OpsinExpression]]:
+                                      device: Optional[torch.device] = None) -> DentateCircuit:
     """
-    Reconstruct circuit and opsin expression from saved metadata
+    Reconstruct circuit from saved metadata
+    
+    NOTE: Does NOT recreate opsin expression due to lack of dedicated RNG seed.
+    Opsin expression should always be extracted from saved results.
     
     Args:
         metadata: Metadata dict from saved experiment results
@@ -5184,7 +5187,7 @@ def reconstruct_circuit_from_metadata(metadata: Dict,
         device: Device to create circuit on
         
     Returns:
-        Tuple of (circuit, opsin_expression_dict)
+        Reconstructed circuit (without opsin expression)
     """
     if device is None:
         device = get_default_device()
@@ -5219,27 +5222,16 @@ def reconstruct_circuit_from_metadata(metadata: Dict,
     if optimization_json_file:
         circuit.load_and_apply_optimization_results(optimization_json_file)
     
-    # Create opsin expression for each target population
-    # Use base_seed from metadata to ensure consistency
+    # Use base_seed from metadata for circuit consistency
     base_seed = metadata.get('base_seed', 42)
     set_random_seed(base_seed, device)
-    
-    opsin_expression_dict = {}
-    for target_pop in ['pv', 'sst']:
-        n_cells = getattr(circuit_params, f'n_{target_pop}')
-        opsin_expression_dict[target_pop] = OpsinExpression(
-            opsin_params, 
-            n_cells, 
-            device=device
-        )
     
     logger.info(f"  Circuit reconstructed with {circuit_params.n_gc} GC, "
           f"{circuit_params.n_mc} MC, {circuit_params.n_pv} PV, "
           f"{circuit_params.n_sst} SST cells")
     logger.info(f"  Using seed: {base_seed}")
     
-    return circuit, opsin_expression_dict
-
+    return circuit        
 
 
 def plot_synaptic_weights_from_results(results: Dict,
@@ -5262,7 +5254,7 @@ def plot_synaptic_weights_from_results(results: Dict,
     logger.info("="*80)
     
     # Reconstruct circuit
-    circuit, opsin_expression_dict = reconstruct_circuit_from_metadata(
+    circuit = reconstruct_circuit_from_metadata(
         metadata, 
         optimization_json_file,
         device
@@ -5301,10 +5293,7 @@ def plot_synaptic_weights_from_results(results: Dict,
             else:
                 opsin_expression_array = np.array(opsin_expression_array)
         else:
-            # Fall back to reconstructed expression
-            opsin_expression_array = opsin_expression_dict[target_pop].expression_levels
-            if hasattr(opsin_expression_array, 'cpu'):
-                opsin_expression_array = opsin_expression_array.cpu().numpy()
+            raise RuntimeError("Unable to obtain opsin expression data")
         
         # Create opsin expression dict for visualization
         # This should include the target population's expression
@@ -5570,7 +5559,7 @@ def analyze_synaptic_weights_by_response_from_results(results: Dict,
     """
     
     # Reconstruct circuit
-    circuit, opsin_expression_dict = reconstruct_circuit_from_metadata(
+    circuit = reconstruct_circuit_from_metadata(
         metadata, 
         optimization_json_file,
         device

@@ -64,7 +64,6 @@ from DG_protocol import (
     
     # Loading
     load_experiment_results,
-    reconstruct_circuit_from_metadata,
 
     # Aggregation utilities
     aggregate_trial_results,
