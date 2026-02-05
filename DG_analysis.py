@@ -1695,7 +1695,7 @@ def cmd_plot_connectivity_activity(args):
     
     # Reconstruct circuit with the specific connectivity seed
     logger.info(f"\nReconstructing circuit...")
-    
+
     seed_structure = nested_data.get('seed_structure', {})
     connectivity_seeds = seed_structure.get('connectivity_seeds', [42])
     
