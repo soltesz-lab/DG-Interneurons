@@ -195,7 +195,7 @@ class OpsinExpression:
         
         # No activation for non-expressing cells
         activation = torch.where(self.expression_levels == 0, 
-                                torch.tensor(0.0, device=self.device), activation)
+                                 torch.tensor(0.0, device=self.device), activation)
         
         return activation
 

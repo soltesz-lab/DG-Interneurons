@@ -824,7 +824,7 @@ def plot_pca_summary_all_targets(
     pca_results_by_target: Dict[str, Dict],
     stimulated_population: str,
     save_path: Optional[str] = None,
-    figsize: Tuple[int, int] = (16, 10)
+    figsize: Tuple[int, int] = (10, 6)
 ) -> plt.Figure:
     """
     Create unified summary plot showing PCA separation across all target populations

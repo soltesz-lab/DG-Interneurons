@@ -45,7 +45,8 @@ import argparse
 import sys
 import pickle
 from pathlib import Path
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, List, Optional, Any
+import numpy as np
 import matplotlib.pyplot as plt
 import logging
 import h5py
@@ -408,6 +409,50 @@ def filter_trials_for_connectivity(nested_data: Dict,
         ]
     
     return filtered_trials
+
+def convert_trial_results_to_torch(trial_results: List[Dict],
+                                   device: Optional[torch.device] = None) -> List[Dict]:
+    """
+    Convert trial results from numpy arrays to torch tensors
+    
+    Handles data loaded from HDF5/pickle files where arrays are stored as numpy.
+    
+    Args:
+        trial_results: List of trial result dicts (may contain numpy arrays)
+        device: Device to create tensors on
+        
+    Returns:
+        List of trial result dicts with torch tensors
+    """
+    if device is None:
+        device = get_default_device()
+    
+    converted_results = []
+    
+    for trial_result in trial_results:
+        converted = {}
+        
+        for key, value in trial_result.items():
+            if isinstance(value, np.ndarray):
+                # Convert numpy to torch tensor
+                converted[key] = torch.from_numpy(value).to(device)
+            elif isinstance(value, dict):
+                # Recursively convert nested dicts (e.g., activity_trace)
+                converted[key] = {}
+                for subkey, subvalue in value.items():
+                    if isinstance(subvalue, np.ndarray):
+                        converted[key][subkey] = torch.from_numpy(subvalue).to(device)
+                    else:
+                        converted[key][subkey] = subvalue
+            else:
+                # Keep other types as-is
+                converted[key] = value
+        
+        converted_results.append(converted)
+    
+    return converted_results
+
+
 
 # ============================================================================
 # Subcommand Handlers
@@ -1201,7 +1246,8 @@ def cmd_nested_weights_analysis(args):
                                 fig_summary = plot_distributional_violin_grid_across_populations_with_boxplot(
                                     all_distributional_analyses[target][intensity],
                                     save_path=str(vis_dir / f'{target}_distributional_summary_metrics.pdf'),
-                                    figsize=(16, 12)
+                                    figsize=(16, 12),
+                                    show_stats=False
                                 )
                                 plt.close(fig_summary)
 
@@ -1411,7 +1457,8 @@ def cmd_nested_weights_analysis(args):
                             fig_summary = plot_distributional_violin_grid_across_populations_with_boxplot(
                                 all_distributional_analyses[target][intensity],
                                 save_path=str(vis_dir / f'{target}_distributional_summary_metrics.pdf'),
-                                figsize=(16, 12)
+                                figsize=(16, 12),
+                                show_stats=False
                             )
                             plt.close(fig_summary)
 
@@ -1564,6 +1611,9 @@ def cmd_plot_connectivity_activity(args):
     # Extract metadata
     metadata = nested_data.get('metadata', {})
     file_format = nested_data.get('file_format', 'pickle')
+
+    # Get device for tensor operations
+    device = get_default_device()
     
     # Validate connectivity index
     n_connectivity = metadata.get('n_connectivity_instances', 0)
@@ -1614,18 +1664,17 @@ def cmd_plot_connectivity_activity(args):
     logger.info(f"  Found {len(trials)} trials for this connectivity")
     logger.info(f"  MEC pattern indices: {sorted(set(t.mec_pattern_idx for t in trials))}")
     
-    # Extract trial results in expected format
-    trial_results = [trial.results for trial in trials]
+    # Extract trial results and add opsin_expression from nested trial wrapper
+    # (In nested experiments, opsin_expression is stored at NestedTrialResult level)
+    trial_results = []
+    for trial in trials:
+        result = trial.results.copy()
+        # Add opsin_expression from trial wrapper if not already in results
+        if 'opsin_expression' not in result:
+            result['opsin_expression'] = trial.opsin_expression
+        trial_results.append(result)
     
-    # Aggregate across MEC patterns using the factored-out function
-    logger.info(f"\nAggregating activity across MEC patterns...")
-    
-    aggregated_results = aggregate_trial_results(
-        trial_results,
-        n_trials=len(trial_results)
-    )
-    
-    logger.info(f"  Aggregated {len(trial_results)} trials")
+    trial_results = convert_trial_results_to_torch(trial_results, device=device)
     
     # Reconstruct circuit with the specific connectivity seed
     logger.info(f"\nReconstructing circuit...")
@@ -1656,7 +1705,6 @@ def cmd_plot_connectivity_activity(args):
         logger.info(f"  Applying optimization from: {optimization_file}")
     
     # Create circuit with this specific connectivity
-    device = get_default_device()
     set_random_seed(connectivity_seed, device)
     
     experiment = OptogeneticExperiment(
@@ -1668,13 +1716,43 @@ def cmd_plot_connectivity_activity(args):
         base_seed=connectivity_seed
     )
     
-    # Get opsin expression (regenerate with same seed)
-    set_random_seed(connectivity_seed, device)
-    opsin_expression_obj = experiment.create_opsin_expression(args.target_population)
-    opsin_expression_array = opsin_expression_obj.expression_levels.cpu().numpy()
-    
     logger.info(f"  Circuit reconstructed successfully")
     
+    # Add layout, connectivity, and stimulated indices to trial results
+    # (These are needed for visualization but aren't saved in nested experiment results)
+    activation_threshold = 1e-2  # Same threshold used in simulate_stimulation
+    
+    for trial_result in trial_results:
+        trial_result['layout'] = experiment.circuit.layout
+        trial_result['connectivity'] = experiment.circuit.connectivity
+        
+        # Reconstruct stimulated/non-stimulated indices from opsin expression
+        opsin_expr = trial_result['opsin_expression']
+        if isinstance(opsin_expr, torch.Tensor):
+            opsin_expr_np = opsin_expr.cpu().numpy()
+        else:
+            opsin_expr_np = np.array(opsin_expr)
+        
+        stimulated_mask = opsin_expr_np >= activation_threshold
+        trial_result['stimulated_indices'] = np.where(stimulated_mask)[0]
+        trial_result['non_stimulated_indices'] = np.where(~stimulated_mask)[0]        
+
+    # Aggregate across MEC patterns using the factored-out function
+    logger.info(f"\nAggregating activity across MEC patterns...")
+    aggregated_results = aggregate_trial_results(
+        trial_results,
+        n_trials=len(trial_results)
+    )
+    logger.info(f"  Aggregated {len(trial_results)} trials")
+    
+    # Extract opsin expression from aggregated results
+    # (Already averaged across trials, no need to regenerate)
+    opsin_expression_mean = aggregated_results['opsin_expression_mean']
+    if isinstance(opsin_expression_mean, torch.Tensor):
+        opsin_expression_array = opsin_expression_mean.cpu().numpy()
+    else:
+        opsin_expression_array = np.array(opsin_expression_mean)
+
     # Generate plot
     logger.info(f"\nGenerating aggregated activity plot...")
     

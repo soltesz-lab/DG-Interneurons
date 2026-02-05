@@ -1399,7 +1399,7 @@ def plot_summary_forest_plot_all_targets(
     analysis_results_by_target: Dict[str, Dict],
     stimulated_population: str,
     save_path: Optional[str] = None,
-    figsize: Tuple[int, int] = (14, 8)
+    figsize: Tuple[int, int] = (10, 6)
 ) -> plt.Figure:
     """Create unified forest plot showing weight differences across all postsynaptic targets
     

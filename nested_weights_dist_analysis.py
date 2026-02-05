@@ -2320,7 +2320,7 @@ def plot_distributional_violin_grid_across_populations_with_boxplot(
                     pc.set_linewidth(1.0)
                     pc.set_label('All synapses' if color == colors['excited'] else None)
                 
-                # 2. Box plot (between-connectivity variance) - PROMINENT
+                # 2. Box plot (between-connectivity variance)
                 if len(geo_means_exc_per_conn) > 0 and len(geo_means_sup_per_conn) > 0:
                     box_data = [geo_means_exc_per_conn, geo_means_sup_per_conn]
                     box_positions = [1, 2]
@@ -2426,9 +2426,9 @@ def plot_distributional_violin_grid_across_populations_with_boxplot(
         plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray',
                   markeredgecolor='black', markersize=5, alpha=0.6,
                   label='Individual connectivity geometric means'),
-        plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='gray',
-                  markeredgecolor='black', markersize=8,
-                  label='Grand mean (across connectivities)'),
+        #plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='gray',
+        #          markeredgecolor='black', markersize=8,
+        #          label='Grand mean (across connectivities)'),
     ]
     fig.legend(handles=legend_elements, loc='lower center', ncol=2,
                bbox_to_anchor=(0.5, 0.01), fontsize=9, frameon=True)
