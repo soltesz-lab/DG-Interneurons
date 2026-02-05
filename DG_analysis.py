@@ -50,14 +50,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import logging
 import h5py
-from hdf5_storage import load_nested_trials_from_hdf5
+from hdf5_storage import load_nested_trials_from_hdf5, load_metadata_from_hdf5
 import torch
 import matplotlib.pyplot as plt
+
 
 
 from DG_circuit_dendritic_somatic_transfer import (
     CircuitParams, PerConnectionSynapticParams, OpsinParams
 )
+from DG_visualization import DGCircuitVisualization
 
 # Import functions from DG_protocol module
 from DG_protocol import (
@@ -159,8 +161,10 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
         if is_hdf5:
             logger.info(f"Loading nested results from HDF5: {filepath}")
             
-            # Load metadata to validate
+            # Load metadata and seed structure
             from hdf5_storage import load_metadata_from_hdf5
+            import h5py
+            
             metadata = load_metadata_from_hdf5(str(filepath))
             
             required_keys = ['n_connectivity_instances', 'n_mec_patterns_per_connectivity']
@@ -168,15 +172,28 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
             if missing_keys:
                 raise ValueError(f"HDF5 file missing required metadata: {missing_keys}")
             
+            # Load seed_structure from HDF5
+            seed_structure = {}
+            with h5py.File(str(filepath), 'r') as f:
+                if 'metadata/seed_structure' in f:
+                    seed_group = f['metadata/seed_structure']
+                    if 'connectivity_seeds' in seed_group:
+                        seed_structure['connectivity_seeds'] = seed_group['connectivity_seeds'][()].tolist()
+                    if 'mec_pattern_seeds' in seed_group:
+                        seed_structure['mec_pattern_seeds'] = seed_group['mec_pattern_seeds'][()].tolist()
+            
             logger.info(f"  Format: HDF5")
             logger.info(f"  Connectivity instances: {metadata['n_connectivity_instances']}")
             logger.info(f"  MEC patterns: {metadata['n_mec_patterns_per_connectivity']}")
+            if seed_structure:
+                logger.info(f"  Loaded {len(seed_structure.get('connectivity_seeds', []))} connectivity seeds")
             
-            # Return metadata with HDF5 file path
+            # Return metadata with HDF5 file path and seed_structure
             return {
                 'metadata': metadata,
                 'hdf5_file': str(filepath),
                 'nested_results': None,  # Not loaded into memory
+                'seed_structure': seed_structure,  # Add this!
                 'file_format': 'hdf5'
             }
         else:
@@ -1689,11 +1706,6 @@ def cmd_plot_connectivity_activity(args):
     connectivity_seed = connectivity_seeds[args.connectivity_idx]
     logger.info(f"  Using connectivity seed: {connectivity_seed}")
     
-    # Import circuit components
-    from DG_circuit_dendritic_somatic_transfer import (
-        CircuitParams, PerConnectionSynapticParams, OpsinParams
-    )
-    from DG_visualization import DGCircuitVisualization
     
     circuit_params = CircuitParams()
     synaptic_params = PerConnectionSynapticParams()
