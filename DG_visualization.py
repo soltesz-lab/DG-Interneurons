@@ -587,7 +587,7 @@ class DGCircuitVisualization:
 
 
     def plot_activity_raster(self, activity_trace, vmin=0, vmax=None, 
-                             mean_linewidth=2.5, cmap='coolwarm', save_path=None,
+                             mean_linewidth=2.5, cmap='seismic', save_path=None,
                              sort_by_activity=False, split_populations=None, direct_activation=None,
                              activation_cmap='plasma', activation_bar_width=None,
                              baseline_window=None, normalize_to_baseline=False,
