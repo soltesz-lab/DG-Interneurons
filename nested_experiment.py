@@ -2412,3 +2412,97 @@ def plot_connectivity_instance_variance_detailed(
     
     return fig
 
+
+def load_nested_experiment_seeds_and_opsin(
+    filepath: str,
+    target_populations: List[str] = ['pv', 'sst'],
+    max_n_experiments: Optional[bool] = None
+) -> Dict:
+    """
+    Load connectivity seeds and opsin expressions from a nested experiment HDF5 file.
+
+    For each target population and connectivity instance, extracts the opsin
+    expression array from the first available intensity/pattern combination.
+    Expression is constant across MEC patterns and intensities for a given
+    (target, connectivity) pair due to deterministic seeding.
+
+    Args:
+        filepath: Path to nested experiment HDF5 file
+        target_populations: Populations to load opsin expressions for
+        max_n_experiments: optional argument to specify maximum number of experiments to load
+    
+    Returns:
+        Dict with keys:
+            'connectivity_seeds': List[int] — one seed per connectivity instance
+            'opsin_expressions': Dict[str, Dict[int, np.ndarray]]
+                mapping target_pop -> {conn_idx: expression_array}
+            'metadata': Dict — full experiment metadata
+            'intensities': List[float] — intensities used in nested experiment
+    """
+    metadata = load_metadata_from_hdf5(filepath)
+    seed_structure = metadata['seed_structure']
+    connectivity_seeds = seed_structure['connectivity_seeds']
+    if max_n_experiments is not None:
+        connectivity_seeds = connectivity_seeds[:max_n_experiments]
+    
+    opsin_expressions = {}
+    intensities = metadata.get('intensities', [])
+
+    with h5py.File(filepath, 'r') as f:
+        for target in target_populations:
+            if target not in f:
+                logger.warning(
+                    f"Target population '{target}' not found in {filepath}"
+                )
+                continue
+
+            opsin_expressions[target] = {}
+
+            # Use first available intensity (expression is intensity-independent)
+            intensity_keys = sorted(
+                k for k in f[target].keys() if k.startswith('intensity_')
+            )
+            if not intensity_keys:
+                logger.warning(
+                    f"No intensity groups found for '{target}' in {filepath}"
+                )
+                continue
+
+            intensity_key = intensity_keys[0]
+            
+            for conn_idx in range(len(connectivity_seeds)):
+                conn_key = f'conn_{conn_idx}'
+                if conn_key not in f[target][intensity_key]:
+                    logger.warning(
+                        f"Missing conn_{conn_idx} for {target}/{intensity_key}"
+                    )
+                    continue
+
+                # Load from first MEC pattern (constant across patterns)
+                pattern_key = 'pattern_0'
+                trial_grp = f[target][intensity_key][conn_key].get(pattern_key)
+                if trial_grp is None or 'opsin_expression' not in trial_grp:
+                    logger.warning(
+                        f"Missing opsin_expression for "
+                        f"{target}/{intensity_key}/{conn_key}/{pattern_key}"
+                    )
+                    continue
+
+                opsin_expressions[target][conn_idx] = trial_grp['opsin_expression'][:]
+
+    n_loaded = {
+        t: len(exprs) for t, exprs in opsin_expressions.items()
+    }
+    logger.info(
+        f"Loaded from {filepath}:\n"
+        f"  Connectivity seeds: {len(connectivity_seeds)}\n"
+        f"  Opsin expressions: {n_loaded}\n"
+        f"  Intensities: {intensities}"
+    )
+
+    return {
+        'connectivity_seeds': connectivity_seeds,
+        'opsin_expressions': opsin_expressions,
+        'metadata': metadata,
+        'intensities': intensities,
+    }
