@@ -1299,7 +1299,7 @@ def run_all_ablation_tests(
                     f"{nested_experiment_file}")
 
         nested_data = load_nested_experiment_seeds_and_opsin(
-            nested_experiment_file, target_populations, max_n_experiments=3
+            nested_experiment_file, target_populations, max_n_experiments=None
         )
         connectivity_seeds = nested_data['connectivity_seeds']
         opsin_expressions = nested_data['opsin_expressions']
