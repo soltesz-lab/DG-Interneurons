@@ -60,7 +60,9 @@ from DG_circuit_dendritic_somatic_transfer import (
     CircuitParams, PerConnectionSynapticParams, OpsinParams
 )
 from DG_visualization import DGCircuitVisualization
-
+from optogenetic_experiment import (aggregate_trial_results,
+                                    aggregate_adaptive_stats)
+from ablation_tests import plot_ablation_test_results
 # Import functions from DG_protocol module
 from DG_protocol import (
     OptogeneticExperiment, set_random_seed, get_default_device,
@@ -68,15 +70,8 @@ from DG_protocol import (
     # Loading
     load_experiment_results,
 
-    # Aggregation utilities
-    aggregate_trial_results,
-    aggregate_adaptive_stats,
-    
     # Plotting - Comparative
     plot_comparative_experiment_results,
-    
-    # Plotting - Ablations
-    plot_ablation_test_results,
     
     # Plotting - Expression
     plot_expression_level_results,
@@ -291,7 +286,7 @@ def load_results_with_validation(filepath: str, result_type: str) -> Dict:
             raise ValueError("Invalid ablation results format. Expected dictionary")
         
         expected_keys = ['interneuron_interactions', 'excitation_to_interneurons', 
-                        'recurrent_excitation']
+                         'recurrent_excitation']
         if not any(k in data for k in expected_keys):
             raise ValueError(
                 f"Ablation results missing expected keys. Found: {list(data.keys())}"
