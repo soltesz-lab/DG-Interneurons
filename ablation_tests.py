@@ -1727,7 +1727,9 @@ def _aggregate_paired_ablation_results(
 
 def plot_ablation_test_results(all_results: Dict,
                                intensity: float = 1.0,
-                               save_path: Optional[str] = None) -> None:
+                               save_path: Optional[str] = None,
+                               show_percentage_change: bool = False,
+                               show_error_bars: bool = False) -> None:
     """
     Plot ablation test results including non-target interneurons
     
@@ -1750,7 +1752,7 @@ def plot_ablation_test_results(all_results: Dict,
     results_intrinsic_exc = all_results['intrinsic_excitation']
     
     # Create figure with subplots - 2 rows x 4 columns
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(12, 8))
     
     # Define colors
     colors = {
@@ -1761,7 +1763,7 @@ def plot_ablation_test_results(all_results: Dict,
         'intrinsic': '#e1c16e'  # Brass
     }
     
-    conditions = ['Full\nNetwork', 'Block\nInt-Int', 'Block\nExc->Int', 'Block\nRecurrent',
+    conditions = ['Full\nNetwork', 'Block\nInt-Int', 'Block\nExc-Int', 'Block\nRec.',
                   'Block\nIntrinsic']
     
     # Define populations to plot for each target
@@ -1787,16 +1789,17 @@ def plot_ablation_test_results(all_results: Dict,
                 
                 # Get error bars
                 errors = []
-                for result_dict, condition in [(results_exc_int, 'full_network'),
-                                               (results_int_int, 'blocked_int_int'),
-                                               (results_exc_int, 'blocked_exc_to_int'),
-                                               (results_recurrent, 'blocked_recurrent'),
-                                               (results_intrinsic_exc, 'blocked_intrinsic_exc')]:
-                    std_key = f'{base_pop}_nonexpr_excited_std'
-                    if condition in result_dict and std_key in result_dict[condition][target][intensity]:
-                        errors.append(result_dict[condition][target][intensity][std_key])
-                    else:
-                        errors.append(0)
+                if show_error_bars:
+                    for result_dict, condition in [(results_exc_int, 'full_network'),
+                                                   (results_int_int, 'blocked_int_int'),
+                                                   (results_exc_int, 'blocked_exc_to_int'),
+                                                   (results_recurrent, 'blocked_recurrent'),
+                                                   (results_intrinsic_exc, 'blocked_intrinsic_exc')]:
+                        std_key = f'{base_pop}_nonexpr_excited_std'
+                        if condition in result_dict and std_key in result_dict[condition][target][intensity]:
+                            errors.append(result_dict[condition][target][intensity][std_key])
+                        else:
+                            errors.append(0)
             else:
                 # Normal populations
                 full_excited = results_exc_int['full_network'][target][intensity][f'{pop}_excited']
@@ -1807,49 +1810,52 @@ def plot_ablation_test_results(all_results: Dict,
                 
                 # Get error bars
                 errors = []
-                for result_dict, condition in [(results_exc_int, 'full_network'),
-                                               (results_int_int, 'blocked_int_int'),
-                                               (results_exc_int, 'blocked_exc_to_int'),
-                                               (results_recurrent, 'blocked_recurrent'),
-                                               (results_intrinsic_exc, 'blocked_intrinsic_exc')]:
-                    std_key = f'{pop}_excited_std'
-                    if condition in result_dict and std_key in result_dict[condition][target][intensity]:
-                        errors.append(result_dict[condition][target][intensity][std_key])
-                    else:
-                        errors.append(0)
+                if show_error_bars:
+                    for result_dict, condition in [(results_exc_int, 'full_network'),
+                                                   (results_int_int, 'blocked_int_int'),
+                                                   (results_exc_int, 'blocked_exc_to_int'),
+                                                   (results_recurrent, 'blocked_recurrent'),
+                                                   (results_intrinsic_exc, 'blocked_intrinsic_exc')]:
+                        std_key = f'{pop}_excited_std'
+                        if condition in result_dict and std_key in result_dict[condition][target][intensity]:
+                            errors.append(result_dict[condition][target][intensity][std_key])
+                        else:
+                            errors.append(0)
 
             data = [full_excited, int_int_excited, exc_int_excited, recurrent_excited, intrinsic_excited]
                         
             # Create bar plot
             x_pos = np.arange(len(conditions))
             bars = ax.bar(x_pos, data, yerr=errors if any(errors) else None,
-                         color=[colors['full'], colors['int_int'], 
-                                colors['exc_int'], colors['recurrent'],
-                                colors['intrinsic']],
-                         alpha=0.7, edgecolor='black', linewidth=1.5,
-                         capsize=5)
+                          color=[colors['full'], colors['int_int'], 
+                                 colors['exc_int'], colors['recurrent'],
+                                 colors['intrinsic']],
+                          alpha=0.7, edgecolor='black', width=0.5,
+                          linewidth=1.5, capsize=5)
             
             # Add value labels on bars
             for bar, value in zip(bars, data):
                 height = bar.get_height()
                 ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{value*100:.1f}%',
-                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+                        f'{value*100:.1f}%',
+                        ha='left' if show_error_bars else 'center',
+                        va='bottom', fontsize=10, fontweight='bold')
             
             # Add percentage change labels for ablations
-            for i, (bar, value) in enumerate(zip(bars[1:], data[1:]), 1):
-                if data[0] > 0.0:
-                    change = (value - data[0]) / (data[0] + 1e-6) * 100
-                else:
-                    change = value * 100
-                height = bar.get_height()
-                color = 'red' if change < -10 else 'orange' if change < 0 else 'black'
-                ax.text(bar.get_x() + bar.get_width()/2., height * 0.5,
-                       f'{change:+.0f}%',
-                       ha='center', va='center', fontsize=10, 
-                       fontweight='bold', color=color,
-                       bbox=dict(boxstyle='round,pad=0.3', 
-                                facecolor='white', alpha=0.7))
+            if show_percentage_change:
+                for i, (bar, value) in enumerate(zip(bars[1:], data[1:]), 1):
+                    if data[0] > 0.0:
+                        change = (value - data[0]) / (data[0] + 1e-6) * 100
+                    else:
+                        change = value * 100
+                    height = bar.get_height()
+                    color = 'red' if change < -10 else 'orange' if change < 0 else 'black'
+                    ax.text(bar.get_x() + bar.get_width()/2., height * 0.5,
+                            f'{change:+.0f}%',
+                            ha='center', va='center', fontsize=10, 
+                            fontweight='bold', color=color,
+                            bbox=dict(boxstyle='round,pad=0.3', 
+                                      facecolor='white', alpha=0.7))
             
             # Formatting
             ax.set_xticks(x_pos)
@@ -1862,7 +1868,7 @@ def plot_ablation_test_results(all_results: Dict,
                 base_pop = pop.replace('_nonexpr', '')
                 # Get count of non-expressing cells for subtitle
                 n_nonexpr = results_exc_int['full_network'][target][intensity].get(f'{base_pop}_nonexpr_count', 0)
-                ax.set_title(f'{target.upper()} Stim -> {target.upper()} (non-expr)\n({n_nonexpr} cells)', 
+                ax.set_title(f'{target.upper()} Stim -> {target.upper()} (non-expr)', 
                             fontsize=11, fontweight='bold', color='purple')
             elif pop in ['pv', 'sst']:
                 ax.set_title(f'{target.upper()} Stim -> {pop.upper()} (non-target IN)', 
@@ -1871,7 +1877,7 @@ def plot_ablation_test_results(all_results: Dict,
                 ax.set_title(f'{target.upper()} Stim -> {pop.upper()}', 
                             fontsize=11, fontweight='bold')
             
-            ax.grid(True, alpha=0.3, axis='y')
+            #ax.grid(True, alpha=0.3, axis='y')
             ax.set_axisbelow(True)
     
     # Overall title
