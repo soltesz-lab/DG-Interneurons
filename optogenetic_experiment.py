@@ -227,7 +227,7 @@ def generate_time_varying_mec_pattern(n_mec: int,
                                       drift_timescale: float = 200.0,
                                       drift_amplitude: float = 0.1,
                                       rotation_groups: int = 3,
-                                      spatial_noise_std: float = 0.2,
+                                      spatial_noise_std: float = 0.05,
                                       temporal_noise_std: float = 0.05,
                                       device: Optional[torch.device] = None) -> torch.Tensor:
     """
