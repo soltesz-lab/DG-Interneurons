@@ -912,7 +912,16 @@ class DGCircuitVisualization:
                 if vmax_pop < 0.1:
                     vmax_pop = 1.0
                 vmin_pop = -vmax_pop
-        
+        else:
+            # Non-normalized: use provided vmin/vmax or compute from data
+            vmin_pop = vmin if vmin is not None else 0
+            finite_data = sorted_activity[np.isfinite(sorted_activity)]
+            vmax_pop = vmax if vmax is not None else (
+                np.percentile(finite_data, 99) if len(finite_data) > 0 else 1.0
+            )
+            if vmax_pop < 0.1:
+                vmax_pop = 1.0
+                
         # Calculate activation bar parameters
         time_range = time_axis[-1] - time_axis[0]
         if activation_bar_width is None:
