@@ -1084,6 +1084,7 @@ class DGCircuitVisualization:
                                  opsin_expression_levels: np.ndarray,
                                  light_intensity: float,
                                  stim_start: float = 500.0,
+                                 warmup: float = 100.0,
                                  baseline_normalize: bool = False,
                                  sort_by_activity: bool = True,
                                  sort_by_stim_period: bool = True,
@@ -1144,7 +1145,7 @@ class DGCircuitVisualization:
             plot_direct_activation[target_population] = activation_values
 
         # Calculate baseline window (before stimulation)
-        baseline_window = (0.0, stim_start) if baseline_normalize else None
+        baseline_window = (warmup, stim_start) if baseline_normalize else None
 
         # Generate save path if not provided
         if save_path is None:

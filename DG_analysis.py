@@ -62,7 +62,8 @@ from DG_circuit_dendritic_somatic_transfer import (
 from DG_visualization import DGCircuitVisualization
 from optogenetic_experiment import (aggregate_trial_results,
                                     aggregate_adaptive_stats)
-from ablation_tests import plot_ablation_test_results
+from ablation_tests import (plot_ablation_results_violin,
+                            export_ablation_results_csv)
 # Import functions from DG_protocol module
 from DG_protocol import (
     OptogeneticExperiment, set_random_seed, get_default_device,
@@ -72,10 +73,6 @@ from DG_protocol import (
 
     # Plotting - Comparative
     plot_comparative_experiment_results,
-    
-    # Plotting - Expression
-    plot_expression_level_results,
-    plot_combined_ablation_and_expression,
     
     # Plotting - Weights
     plot_synaptic_weights_from_results,
@@ -465,6 +462,307 @@ def convert_trial_results_to_torch(trial_results: List[Dict],
     return converted_results
 
 
+def plot_expression_level_overlay(
+    results: Dict,
+    save_path: Optional[str] = None,
+    error_type: str = 'sem',
+    figsize: Optional[Tuple[float, float]] = None,
+    show_legend: bool = True,
+    x_as_percent: bool = True,
+) -> plt.Figure:
+    """
+    Plot expression level results with all cell types overlaid on the same axes.
+
+    For each target population (PV, SST), creates one panel per ablation
+    config showing fraction excited (%) vs opsin expression (%) for all
+    cell types as colored lines.  When multiple configs exist, panels are
+    arranged in columns.
+
+    Args:
+        results: Dictionary from test_opsin_expression_levels().
+            Structure: results[config_name][target][expr_level] -> analysis dict
+        save_path: Optional directory path to save figure (PDF + PNG).
+        error_type: 'std' for standard deviation, 'sem' for standard error,
+            or 'none' to suppress error bands.
+        figsize: Override default figure size (width, height) in inches.
+        show_legend: Whether to display a legend on the first panel.
+        x_as_percent: If True, multiply expression levels by 100 for the
+            x-axis (matching "Opsin expression (%)" label).
+
+    Returns:
+        matplotlib Figure object.
+    """
+    # --- extract structure ---
+    config_names = list(results.keys())
+    targets = list(results[config_names[0]].keys())
+    expression_levels = sorted(results[config_names[0]][targets[0]].keys())
+
+    n_configs = len(config_names)
+    n_targets = len(targets)
+
+    # --- colours matching the reference figure ---
+    pop_colors = {
+        'pv': '#CC00CC',   # magenta
+        'sst': '#00AA44',  # green
+        'gc': '#DDBB00',   # gold / yellow
+        'mc': '#AA0000',   # dark red
+    }
+    pop_markers = {'pv': 's', 'sst': '^', 'gc': 'o', 'mc': 'D'}
+    pop_labels = {'pv': 'PV', 'sst': 'SST', 'gc': 'GC', 'mc': 'MC'}
+
+    config_labels = {
+        'full_network': 'Full Network',
+        'blocked_exc_to_int': 'Block Exc$\\to$Int',
+        'blocked_int_int': 'Block Int-Int',
+        'blocked_recurrent': 'Block Recurrent',
+    }
+
+    # --- populations to plot per target ---
+    #   Include both non-target pops and non-expressing target cells.
+    pop_order = {
+        'pv': ['pv_nonexpr', 'sst', 'gc', 'mc'],
+        'sst': ['pv', 'sst_nonexpr', 'gc', 'mc'],
+    }
+
+    # --- layout ---
+    if figsize is None:
+        figsize = (4.0 * n_configs + 0.5, 3.5 * n_targets + 0.5)
+    fig, axes = plt.subplots(
+        n_targets, n_configs, figsize=figsize,
+        squeeze=False, sharex=True, sharey=True,
+    )
+
+    x_vals = np.array(expression_levels)
+    if x_as_percent:
+        x_vals = x_vals * 100.0
+
+    for row_idx, target in enumerate(targets):
+        populations = pop_order.get(target, ['gc', 'mc', 'pv', 'sst'])
+
+        for col_idx, config_name in enumerate(config_names):
+            ax = axes[row_idx, col_idx]
+
+            for pop in populations:
+                # --- resolve data keys ---
+                is_nonexpr = pop.endswith('_nonexpr')
+                if is_nonexpr:
+                    base_pop = pop.replace('_nonexpr', '')
+                    excited_key = f'{base_pop}_nonexpr_excited'
+                    std_key = f'{base_pop}_nonexpr_excited_std'
+                    sem_key = f'{base_pop}_nonexpr_excited_sem'
+                    display_pop = base_pop  # colour / label lookup
+                else:
+                    excited_key = f'{pop}_excited'
+                    std_key = f'{pop}_excited_std'
+                    sem_key = f'{pop}_excited_sem'
+                    display_pop = pop
+
+                # --- collect values across expression levels ---
+                y_vals = []
+                y_errs = []
+                for expr_level in expression_levels:
+                    data = results[config_name][target].get(expr_level, {})
+                    y_vals.append(data.get(excited_key, 0.0) * 100.0)
+
+                    if error_type == 'sem' and sem_key in data:
+                        y_errs.append(data[sem_key] * 100.0)
+                    elif error_type == 'std' and std_key in data:
+                        y_errs.append(data[std_key] * 100.0)
+                    else:
+                        y_errs.append(0.0)
+
+                y_vals = np.array(y_vals)
+                y_errs = np.array(y_errs)
+
+                color = pop_colors.get(display_pop, 'gray')
+                marker = pop_markers.get(display_pop, 'o')
+                label_suffix = ' (non-expr)' if is_nonexpr else ''
+                label = pop_labels.get(display_pop, display_pop.upper()) + label_suffix
+
+                # --- plot line + optional error band ---
+                ax.plot(
+                    x_vals, y_vals,
+                    color=color, marker=marker, markersize=5,
+                    linewidth=1.8, label=label, alpha=0.9,
+                )
+                if error_type != 'none' and np.any(y_errs > 0):
+                    ax.fill_between(
+                        x_vals, y_vals - y_errs, y_vals + y_errs,
+                        color=color, alpha=0.15,
+                    )
+
+            # --- formatting ---
+            ax.set_xlabel(r'Opsin expression (%)', fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(r'Fraction excited (%)', fontsize=10)
+
+            config_title = config_labels.get(config_name, config_name)
+            ax.set_title(
+                f'{target.upper()} stim — {config_title}',
+                fontsize=10, fontweight='bold',
+            )
+            #ax.grid(True, alpha=0.2)
+            ax.set_axisbelow(True)
+
+            if show_legend and row_idx == 0 and col_idx == 0:
+                ax.legend(fontsize=8, loc='best', framealpha=0.8)
+
+    fig.suptitle(
+        'Fraction Excited vs. Opsin Expression Level',
+        fontsize=12, fontweight='bold',
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        fig.savefig(
+            save_dir / 'expression_level_overlay.pdf',
+            dpi=300, bbox_inches='tight',
+        )
+        fig.savefig(
+            save_dir / 'expression_level_overlay.png',
+            dpi=300, bbox_inches='tight',
+        )
+        logger.info(f"Saved expression level overlay plots to {save_dir}")
+
+    plt.show()
+    return fig
+
+def plot_expression_level_results(
+    results: Dict,
+    save_path: Optional[str] = None
+) -> None:
+    """
+    Plot how paradoxical excitation varies with opsin expression level
+    
+    Creates plots showing:
+    - Expression level dependence for full network
+    - Comparison with ablation conditions (if available)
+    - Separate panels for PV and SST stimulation
+    - All populations including non-target interneurons
+    
+    Args:
+        results: Dictionary from test_opsin_expression_levels()
+        save_path: Optional directory to save figure
+    """
+    
+    # Extract configuration names and expression levels
+    config_names = list(results.keys())
+    targets = list(results[config_names[0]].keys())
+    
+    # Get expression levels from first config/target
+    expression_levels = sorted(results[config_names[0]][targets[0]].keys())
+    
+    # Create figure - 2 rows x 4 columns
+    n_configs = len(config_names)
+    fig, axes = plt.subplots(2, 4, figsize=(18, 10))
+    
+    # Define colors and markers
+    colors = {
+        'full_network': '#2ecc71',
+        'blocked_exc_to_int': '#e67e22',
+        'blocked_int_int': '#e74c3c',
+        'blocked_recurrent': '#3498db'
+    }
+    markers = {
+        'full_network': 'o',
+        'blocked_exc_to_int': 's',
+        'blocked_int_int': '^',
+        'blocked_recurrent': 'D'
+    }
+    labels = {
+        'full_network': 'Full Network',
+        'blocked_exc_to_int': 'Block Exc->Int',
+        'blocked_int_int': 'Block Int-Int',
+        'blocked_recurrent': 'Block Recurrent'
+    }
+    
+    # Define populations to plot for each target
+    pop_map = {
+        'pv': ['gc', 'mc', 'pv_nonexpr', 'sst'],
+        'sst': ['gc', 'mc', 'pv', 'sst_nonexpr']
+    }
+    
+    for target_idx, target in enumerate(targets):
+        populations = pop_map[target]
+        
+        for pop_idx, pop in enumerate(populations):
+            ax = axes[target_idx, pop_idx]
+            
+            for config_name in config_names:
+                excited_fractions = []
+                excited_errors = []
+                
+                for expr_level in expression_levels:
+                    data = results[config_name][target][expr_level]
+                    
+                    # Handle non-expressing target cells
+                    if pop.endswith('_nonexpr'):
+                        base_pop = pop.replace('_nonexpr', '')
+                        excited_fractions.append(data.get(f'{base_pop}_nonexpr_excited', 0.0) * 100)
+                        
+                        if f'{base_pop}_nonexpr_excited_std' in data:
+                            excited_errors.append(data[f'{base_pop}_nonexpr_excited_std'] * 100)
+                        else:
+                            excited_errors.append(0)
+                    else:
+                        # Normal populations
+                        excited_fractions.append(data[f'{pop}_excited'] * 100)
+                        
+                        if f'{pop}_excited_std' in data:
+                            excited_errors.append(data[f'{pop}_excited_std'] * 100)
+                        else:
+                            excited_errors.append(0)
+                
+                # Plot with error bars
+                ax.errorbar(expression_levels, excited_fractions,
+                           yerr=excited_errors if any(excited_errors) else None,
+                           marker=markers.get(config_name, 'o'),
+                           color=colors.get(config_name, 'gray'),
+                           label=labels.get(config_name, config_name),
+                           linewidth=2, markersize=8, capsize=5,
+                           alpha=0.8)
+            
+            # Formatting
+            ax.set_xlabel('Mean Opsin Expression Level', fontsize=10)
+            ax.set_ylabel('% Cells Paradoxically Excited', fontsize=10)
+            
+            if pop.endswith('_nonexpr'):
+                base_pop = pop.replace('_nonexpr', '')
+                ax.set_title(f'{target.upper()} Stim -> {target.upper()} (non-expr)',
+                            fontsize=11, fontweight='bold', color='purple')
+            elif pop in ['pv', 'sst']:
+                ax.set_title(f'{target.upper()} Stim -> {pop.upper()} (non-target IN)',
+                            fontsize=11, fontweight='bold', color='darkred')
+            else:
+                ax.set_title(f'{target.upper()} Stim -> {pop.upper()}',
+                            fontsize=11, fontweight='bold')
+            
+            #ax.grid(True, alpha=0.3)
+            ax.set_axisbelow(True)
+            ax.legend(fontsize=10, loc='best')
+            
+            # Set x-axis limits
+            ax.set_xlim(min(expression_levels) - 0.05, max(expression_levels) + 0.05)
+    
+    # Overall title
+    fig.suptitle('Opsin Expression Level Dependence',
+                 fontsize=14, fontweight='bold')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        plt.savefig(save_dir / 'expression_level_results.pdf',
+                   dpi=300, bbox_inches='tight')
+        plt.savefig(save_dir / 'expression_level_results.png',
+                   dpi=300, bbox_inches='tight')
+        logger.info(f"\nSaved expression level plots to {save_dir}")
+    
+    plt.show()
+
 
 # ============================================================================
 # Subcommand Handlers
@@ -587,7 +885,7 @@ def cmd_plot_ablations(args):
     logger.info(f"\nGenerating ablation plot for intensity {intensity}...")
     
     try:
-        plot_ablation_test_results(
+        plot_ablation_results_violin(
             ablation_results,
             intensity=intensity,
             save_path=str(output_dir)
@@ -596,6 +894,18 @@ def cmd_plot_ablations(args):
     except Exception as e:
         logger.error(f"Failed to plot ablation results: {e}")
         return 1
+    logger.info(f"\nGenerating ablation plot for intensity {intensity}...")
+
+    if args.export_csv:
+        try:
+            export_ablation_results_csv(
+                ablation_results,
+                output_dir=str(output_dir),
+                intensities=[intensity]
+            )
+        except Exception as e:
+            logger.error(f"Failed to export ablation results: {e}")
+            return 1
     
     return 0
 
@@ -679,7 +989,7 @@ def cmd_plot_expression(args):
     logger.info("\nGenerating expression level plots...")
     
     try:
-        plot_expression_level_results(
+        plot_expression_level_overlay(
             expression_results,
             save_path=str(output_dir)
         )
@@ -1779,6 +2089,7 @@ def cmd_plot_connectivity_activity(args):
             opsin_expression_levels=opsin_expression_array,
             light_intensity=args.intensity,
             stim_start=stim_start,
+            warmup=warmup,
             baseline_normalize=args.baseline_normalize,
             sort_by_activity=args.sort_by_activity,
             save_path=str(save_path)
@@ -1932,12 +2243,16 @@ Examples:
         """
     )
     parser_abl.add_argument('input',
-                           help='Ablation results file (*.pkl)')
+                            help='Ablation results file (*.pkl)')
     parser_abl.add_argument('--intensity',
-                           type=float,
-                           default=None,
-                           metavar='VALUE',
-                           help='Light intensity to plot (default: highest available)')
+                            type=float,
+                            default=None,
+                            metavar='VALUE',
+                            help='Light intensity to plot (default: highest available)')
+    parser_abl.add_argument('--export-csv',
+                            action='store_true',
+                            help='Export ablation data to CSV')
+    
     parser_abl.set_defaults(func=cmd_plot_ablations)
     
     # ========== plot-weights ==========

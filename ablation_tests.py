@@ -15,6 +15,8 @@ from pathlib import Path
 import tqdm
 import logging
 import h5py
+import csv
+from itertools import product as iter_product
 
 
 logger = logging.getLogger('DG_protocol')
@@ -1729,7 +1731,7 @@ def plot_ablation_test_results(all_results: Dict,
                                intensity: float = 1.0,
                                save_path: Optional[str] = None,
                                show_percentage_change: bool = False,
-                               show_error_bars: bool = False) -> None:
+                               show_error_bars: bool = True) -> None:
     """
     Plot ablation test results including non-target interneurons
     
@@ -1898,3 +1900,474 @@ def plot_ablation_test_results(all_results: Dict,
     
     plt.show()
 
+    
+def plot_ablation_results_violin(
+    all_results: Dict,
+    intensity: float = 1.0,
+    save_path: Optional[str] = None,
+    jitter_width: float = 0.08,
+    point_size: float = 12,
+    point_alpha: float = 0.5,
+    violin_alpha: float = 0.35,
+    violin_width: float = 0.7,
+    figsize: Tuple[float, float] = (14, 8),
+) -> None:
+    """
+    Plot ablation test results as violin plots with overlaid individual
+    connectivity-instance data points.
+
+    Requires paired-mode results containing '_by_conn' arrays.
+    Falls back to scalar means (no violin) when per-connectivity data
+    is unavailable.
+
+    Args:
+        all_results: Dictionary from run_all_ablation_tests()
+        intensity: Light intensity to plot
+        save_path: Optional directory to save figure
+        jitter_width: Horizontal spread of strip points
+        point_size: Marker size for individual data points
+        point_alpha: Transparency of data points
+        violin_alpha: Transparency of violin bodies
+        violin_width: Width scaling for violins
+        figsize: Figure size (width, height)
+    """
+    # ---- unpack test results ----
+    results_int_int = all_results['interneuron_interactions']
+    results_exc_int = all_results['excitation_to_interneurons']
+    results_recurrent = all_results['recurrent_excitation']
+    results_intrinsic_exc = all_results['intrinsic_excitation']
+
+    # ---- condition metadata ----
+    condition_specs = [
+        # (label, result_dict, condition_key)
+        ('Full\nNetwork',    results_exc_int,      'full_network'),
+        ('Block\nInt-Int',   results_int_int,      'blocked_int_int'),
+        ('Block\nExc-Int',   results_exc_int,      'blocked_exc_to_int'),
+        ('Block\nRec.',      results_recurrent,    'blocked_recurrent'),
+        ('Block\nIntrinsic', results_intrinsic_exc, 'blocked_intrinsic_exc'),
+    ]
+
+    colors = {
+        0: '#2ecc71',   # Full   - green
+        1: '#e74c3c',   # Int-Int - red
+        2: '#e67e22',   # Exc-Int - orange
+        3: '#3498db',   # Rec.   - blue
+        4: '#e1c16e',   # Intrinsic - brass
+    }
+
+    # ---- population layout per target ----
+    pop_map = {
+        'pv':  ['gc', 'mc', 'pv_nonexpr', 'sst'],
+        'sst': ['gc', 'mc', 'pv', 'sst_nonexpr'],
+    }
+
+    fig, axes = plt.subplots(2, 4, figsize=figsize)
+
+    for target_idx, target in enumerate(['pv', 'sst']):
+        populations = pop_map[target]
+
+        for pop_idx, pop in enumerate(populations):
+            ax = axes[target_idx, pop_idx]
+
+            # ---- collect per-condition data ----
+            all_data = []       # list of arrays (one per condition)
+            all_means = []      # scalar means
+            has_by_conn = []    # whether _by_conn data exists
+
+            for cond_idx, (_, result_dict, cond_key) in enumerate(condition_specs):
+                cond_results = result_dict[cond_key][target][intensity]
+
+                # Determine the metric key
+                if pop.endswith('_nonexpr'):
+                    base_pop = pop.replace('_nonexpr', '')
+                    metric_key = f'{base_pop}_nonexpr_excited'
+                else:
+                    metric_key = f'{pop}_excited'
+
+                by_conn_key = f'{metric_key}_by_conn'
+
+                if by_conn_key in cond_results:
+                    vals = np.array(cond_results[by_conn_key])
+                    all_data.append(vals)
+                    all_means.append(np.mean(vals))
+                    has_by_conn.append(True)
+                else:
+                    # Fallback: scalar only
+                    scalar = cond_results.get(metric_key, 0.0)
+                    all_data.append(np.array([scalar]))
+                    all_means.append(scalar)
+                    has_by_conn.append(False)
+
+            n_cond = len(condition_specs)
+            x_positions = np.arange(n_cond)
+
+            # ---- draw violins for conditions with distributional data ----
+            for cond_idx in range(n_cond):
+                vals = all_data[cond_idx]
+                x = x_positions[cond_idx]
+                color = colors[cond_idx]
+
+                if has_by_conn[cond_idx] and len(vals) > 1 and np.std(vals) > 1e-10:
+                    # Draw violin
+                    parts = ax.violinplot(
+                        vals,
+                        positions=[x],
+                        showmeans=False,
+                        showmedians=False,
+                        showextrema=False,
+                        widths=violin_width,
+                    )
+                    for pc in parts['bodies']:
+                        pc.set_facecolor(color)
+                        pc.set_alpha(violin_alpha)
+                        pc.set_edgecolor('black')
+                        pc.set_linewidth(0.8)
+
+                # ---- overlay individual data points with jitter ----
+                if has_by_conn[cond_idx] and len(vals) > 1:
+                    rng = np.random.default_rng(seed=42 + cond_idx)
+                    jitter = rng.uniform(-jitter_width, jitter_width, size=len(vals))
+                    ax.scatter(
+                        x + jitter, vals,
+                        s=point_size,
+                        color=color,
+                        alpha=point_alpha,
+                        edgecolors='black',
+                        linewidths=0.3,
+                        zorder=3,
+                    )
+                else:
+                    # Single value: plot as a diamond marker
+                    ax.scatter(
+                        [x], [all_means[cond_idx]],
+                        s=point_size * 4,
+                        color=color,
+                        marker='D',
+                        edgecolors='black',
+                        linewidths=0.8,
+                        zorder=3,
+                    )
+
+                # ---- mean marker (horizontal line) ----
+                ax.hlines(
+                    all_means[cond_idx],
+                    x - 0.2, x + 0.2,
+                    color='black',
+                    linewidth=1.5,
+                    zorder=4,
+                )
+
+                # (Mean annotations are added in a second pass once
+                #  axis limits are finalized.)
+
+            # ---- formatting ----
+            ax.set_xticks(x_positions)
+            ax.set_xticklabels(
+                [spec[0] for spec in condition_specs],
+                fontsize=10,
+            )
+            ax.set_ylabel('Fraction Excited', fontsize=10)
+
+            # y-axis: start at 0, auto upper limit with headroom
+            y_max = max(
+                np.max(v) if len(v) > 0 else 0 for v in all_data
+            )
+            ax.set_ylim(0, max(y_max * 1.25, 0.005))
+
+            # ---- title ----
+            if pop.endswith('_nonexpr'):
+                ax.set_title(
+                    f'{target.upper()} Stim $\\rightarrow$ {target.upper()} (non-expr)',
+                    fontsize=10, fontweight='bold', color='purple',
+                )
+            elif pop in ['pv', 'sst']:
+                ax.set_title(
+                    f'{target.upper()} Stim $\\rightarrow$ {pop.upper()} (non-target IN)',
+                    fontsize=10, fontweight='bold', color='darkred',
+                )
+            else:
+                ax.set_title(
+                    f'{target.upper()} Stim $\\rightarrow$ {pop.upper()}',
+                    fontsize=10, fontweight='bold',
+                )
+
+            ax.set_axisbelow(True)
+            #ax.grid(True, alpha=0.2, axis='y')
+
+    # ---- annotate means after axis limits are finalized ----
+    for target_idx, target in enumerate(['pv', 'sst']):
+        populations = pop_map[target]
+        for pop_idx, pop in enumerate(populations):
+            ax = axes[target_idx, pop_idx]
+
+            for cond_idx, (_, result_dict, cond_key) in enumerate(condition_specs):
+                cond_results = result_dict[cond_key][target][intensity]
+
+                if pop.endswith('_nonexpr'):
+                    base_pop = pop.replace('_nonexpr', '')
+                    metric_key = f'{base_pop}_nonexpr_excited'
+                else:
+                    metric_key = f'{pop}_excited'
+
+                by_conn_key = f'{metric_key}_by_conn'
+                if by_conn_key in cond_results:
+                    mean_val = float(np.mean(cond_results[by_conn_key]))
+                else:
+                    mean_val = float(cond_results.get(metric_key, 0.0))
+
+                y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+                ax.text(
+                    cond_idx, y_range, #mean_val + y_range * 0.25,
+                    f'{mean_val * 100:.1f}%',
+                    ha='center',
+                    va='top',
+                    fontsize=10,
+                    fontweight='bold',
+                    color=colors[cond_idx],
+                )
+
+    fig.suptitle(
+        f'Ablation Test Results: Paradoxical Excitation\n(Intensity = {intensity})',
+        fontsize=14,
+        fontweight='bold',
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        plt.savefig(
+            save_dir / f'ablation_violin_intensity_{intensity}.pdf',
+            dpi=300, bbox_inches='tight',
+        )
+        plt.savefig(
+            save_dir / f'ablation_violin_intensity_{intensity}.png',
+            dpi=300, bbox_inches='tight',
+        )
+        logger.info(f"\nSaved ablation violin plots to {save_dir}")
+
+    plt.show()
+
+
+    
+
+
+_ABLATION_CONDITION_SPECS = [
+    # (short_label, result_top_key, condition_key)
+    ('full_network',        'excitation_to_interneurons', 'full_network'),
+    ('block_int_int',       'interneuron_interactions',   'blocked_int_int'),
+    ('block_exc_int',       'excitation_to_interneurons', 'blocked_exc_to_int'),
+    ('block_recurrent',     'recurrent_excitation',       'blocked_recurrent'),
+    ('block_intrinsic_exc', 'intrinsic_excitation',       'blocked_intrinsic_exc'),
+]
+
+_POP_MAP = {
+    'pv':  ['gc', 'mc', 'pv_nonexpr', 'sst'],
+    'sst': ['gc', 'mc', 'pv', 'sst_nonexpr'],
+}
+
+
+def _metric_key_for_pop(pop: str) -> str:
+    """Return the results-dict key prefix for a given population label."""
+    if pop.endswith('_nonexpr'):
+        base = pop.replace('_nonexpr', '')
+        return f'{base}_nonexpr_excited'
+    return f'{pop}_excited'
+
+
+def _change_metric_key_for_pop(pop: str) -> str:
+    """Return the results-dict key for mean rate change."""
+    if pop.endswith('_nonexpr'):
+        base = pop.replace('_nonexpr', '')
+        return f'{base}_nonexpr_mean_change'
+    return f'{pop}_mean_change'
+
+
+# -------------------------------------------------------------------
+# CSV export for ablation test results
+# -------------------------------------------------------------------
+
+def export_ablation_results_csv(
+    all_results: Dict,
+    output_dir: str,
+    intensities: Optional[List[float]] = None,
+    target_populations: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """
+    Export ablation test results to CSV files.
+
+    Produces two files:
+      1. ``ablation_summary.csv``  -- wide format with one row per
+         (target, intensity, condition, population).  Columns include
+         mean, std, sem of fraction-excited and mean-rate-change.
+         Suitable for quick inspection and summary tables.
+
+      2. ``ablation_by_connectivity.csv``  -- long format with one row
+         per (target, intensity, condition, population, conn_idx).
+         Includes the per-connectivity-instance fraction-excited value.
+         Suitable for paired statistical tests in R or Python.
+
+    Args:
+        all_results: Dictionary returned by ``run_all_ablation_tests``.
+        output_dir: Directory to write CSV files into (created if needed).
+        intensities: Intensities to export.  ``None`` exports all found
+            in the first condition's results.
+        target_populations: Targets to export (default ``['pv', 'sst']``).
+
+    Returns:
+        Dict mapping file label to absolute path of the written file.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True, parents=True)
+
+    if target_populations is None:
+        target_populations = ['pv', 'sst']
+
+    # Auto-detect intensities from the first available condition
+    if intensities is None:
+        intensities = _detect_intensities(all_results, target_populations)
+
+    summary_path = output_path / 'ablation_summary.csv'
+    long_path = output_path / 'ablation_by_connectivity.csv'
+
+    _write_summary_csv(
+        all_results, summary_path, intensities, target_populations,
+    )
+    _write_long_csv(
+        all_results, long_path, intensities, target_populations,
+    )
+
+    logger.info(f"Exported ablation summary CSV:        {summary_path}")
+    logger.info(f"Exported ablation per-connectivity CSV: {long_path}")
+
+    return {
+        'summary': str(summary_path),
+        'by_connectivity': str(long_path),
+    }
+
+
+# -------------------------------------------------------------------
+# Internal helpers for CSV export
+# -------------------------------------------------------------------
+
+def _detect_intensities(
+    all_results: Dict, target_populations: List[str],
+) -> List[float]:
+    """Discover available intensities from the results dict."""
+    for _, top_key, cond_key in _ABLATION_CONDITION_SPECS:
+        if top_key not in all_results:
+            continue
+        cond_dict = all_results[top_key].get(cond_key, {})
+        for target in target_populations:
+            if target in cond_dict:
+                return sorted(cond_dict[target].keys())
+    return [1.0]
+
+
+def _write_summary_csv(
+    all_results: Dict,
+    path: Path,
+    intensities: List[float],
+    target_populations: List[str],
+) -> None:
+    """Write wide-format summary CSV."""
+    fieldnames = [
+        'target', 'intensity', 'condition', 'population',
+        'fraction_excited_mean', 'fraction_excited_std', 'fraction_excited_sem',
+        'mean_rate_change',
+        'n_connectivity',
+    ]
+
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for target, intensity in iter_product(target_populations, intensities):
+            populations = _POP_MAP[target]
+
+            for cond_label, top_key, cond_key in _ABLATION_CONDITION_SPECS:
+                cond_data = (
+                    all_results
+                    .get(top_key, {})
+                    .get(cond_key, {})
+                    .get(target, {})
+                    .get(intensity, {})
+                )
+                if not cond_data:
+                    continue
+
+                for pop in populations:
+                    exc_key = _metric_key_for_pop(pop)
+                    chg_key = _change_metric_key_for_pop(pop)
+
+                    row = {
+                        'target': target,
+                        'intensity': intensity,
+                        'condition': cond_label,
+                        'population': pop,
+                        'fraction_excited_mean': cond_data.get(exc_key, ''),
+                        'fraction_excited_std': cond_data.get(f'{exc_key}_std', ''),
+                        'fraction_excited_sem': cond_data.get(f'{exc_key}_sem', ''),
+                        'mean_rate_change': cond_data.get(chg_key, ''),
+                        'n_connectivity': cond_data.get('n_connectivity', ''),
+                    }
+                    writer.writerow(row)
+
+
+def _write_long_csv(
+    all_results: Dict,
+    path: Path,
+    intensities: List[float],
+    target_populations: List[str],
+) -> None:
+    """Write long-format per-connectivity CSV for paired statistics."""
+    fieldnames = [
+        'target', 'intensity', 'condition', 'population',
+        'conn_idx', 'fraction_excited',
+    ]
+
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for target, intensity in iter_product(target_populations, intensities):
+            populations = _POP_MAP[target]
+
+            for cond_label, top_key, cond_key in _ABLATION_CONDITION_SPECS:
+                cond_data = (
+                    all_results
+                    .get(top_key, {})
+                    .get(cond_key, {})
+                    .get(target, {})
+                    .get(intensity, {})
+                )
+                if not cond_data:
+                    continue
+
+                for pop in populations:
+                    exc_key = _metric_key_for_pop(pop)
+                    by_conn = cond_data.get(f'{exc_key}_by_conn')
+
+                    if by_conn is None:
+                        # Unpaired mode -- emit single row with conn_idx = NA
+                        scalar = cond_data.get(exc_key)
+                        if scalar is not None:
+                            writer.writerow({
+                                'target': target,
+                                'intensity': intensity,
+                                'condition': cond_label,
+                                'population': pop,
+                                'conn_idx': 'NA',
+                                'fraction_excited': scalar,
+                            })
+                        continue
+
+                    for conn_idx, val in enumerate(by_conn):
+                        writer.writerow({
+                            'target': target,
+                            'intensity': intensity,
+                            'condition': cond_label,
+                            'population': pop,
+                            'conn_idx': conn_idx,
+                            'fraction_excited': val,
+                        })
