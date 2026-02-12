@@ -70,9 +70,6 @@ from DG_protocol import (
     
     # Loading
     load_experiment_results,
-
-    # Plotting - Comparative
-    plot_comparative_experiment_results,
     
     # Plotting - Weights
     plot_synaptic_weights_from_results,
@@ -93,6 +90,10 @@ from DG_protocol import (
     # Bootstrap and decision framework
     run_nested_effect_size_analysis,
     run_nested_effect_size_decision_analysis,
+)
+from nested_experiment import (
+    export_nested_experiment_csv,
+    export_nested_experiment_csv_from_hdf5,
 )
 from nested_weights_analysis import (
     analyze_weights_by_average_response_nested,
@@ -462,6 +463,438 @@ def convert_trial_results_to_torch(trial_results: List[Dict],
     return converted_results
 
 
+def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
+                                        stimulation_level: float = 1.0,
+                                        metadata: Optional[Dict] = None,
+                                        save_path: Optional[str] = None) -> None:
+    """
+    Create visualizations from comparative experiment results
+    
+    Now handles multi-trial statistics with error bars
+    """
+
+    # Helper function to handle both numpy arrays and torch tensors
+    def to_numpy(arr):
+        """Convert torch tensor to numpy if needed"""
+        if isinstance(arr, torch.Tensor):
+            return arr.cpu().numpy()
+        return np.array(arr)
+    
+    stim_start = None
+    stim_duration = None
+    warmup = None
+    if metadata is not None:
+        stim_start = metadata.get('stim_start', 1500.0)
+        stim_duration = metadata.get('stim_duration', 1000.0)
+        warmup = metadata.get('warmup', 500.0)
+
+    # Check if we have multi-trial data
+    n_trials = results['pv'][stimulation_level].get('n_trials', 1)
+    has_multitrial = n_trials > 1
+        
+    # Define colors matching the paper
+    colors = {
+        'pv': '#FF6B9D', # Pink 
+        'sst': '#45B7D1', # Blue
+        'gc': '#96CEB4', # Green 
+        'mc': '#FFEAA7', # Yellow
+    }
+    
+    # Create summary figure
+    fig = plt.figure(figsize=(16, 12))
+    
+    # Panel A: Firing ratio bar plots
+    ax1 = plt.subplot(3, 4, (1, 2))
+
+    targets = ['pv', 'sst']
+    populations = ['gc', 'mc', 'pv', 'sst']
+
+    bar_data = []
+    bar_errors = []
+    bar_labels = []
+    bar_colors = []
+    individual_points = []  # Store individual trial data points
+    point_colors = []  # Store colors for each point based on cell responses
+
+    # Get time array and create masks (needed for individual trial analysis)
+    # Extract from first available trial_results if present
+    time = None
+    for target in ['pv', 'sst']:
+        if target in results and stimulation_level in results[target]:
+            if 'trial_results' in results[target][stimulation_level]:
+                trial_results = results[target][stimulation_level]['trial_results']
+                if len(trial_results) > 0:
+                    time = trial_results[0]['time']
+                    break
+                
+    for target in targets:
+
+        # Create time masks for baseline and stimulation periods
+        if (metadata is not None) and (time is not None):
+            baseline_mask = (time >= warmup) & (time < stim_start)
+            stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+        else:
+            # Fallback: create empty masks (won't be used if no trial_results)
+            baseline_mask = None
+            stim_mask = None
+        
+        for pop in populations:
+            if pop != target and f'{pop}_mean_change' in results[target][stimulation_level]:
+                baseline_rate = results[target][stimulation_level][f'{pop}_mean_baseline_rate']
+                stim_rate = results[target][stimulation_level][f'{pop}_mean_stim_rate']
+
+                if baseline_rate > 0:
+                    ratio = np.log2(stim_rate / baseline_rate)
+                    bar_data.append(ratio)
+                    bar_labels.append(f'{target.upper()}->{pop.upper()}')
+                    bar_colors.append(colors[pop])
+
+                    # Extract individual trial data points and classify responses
+                    trial_points = []
+                    trial_colors = []
+                    if has_multitrial and 'trial_results' in results[target][stimulation_level]:
+                        for trial_result in results[target][stimulation_level]['trial_results']:
+                            trial_activity = to_numpy(trial_result['activity_trace'][pop])
+
+                            # Convert masks to numpy boolean arrays
+                            baseline_mask_np = to_numpy(baseline_mask)
+                            stim_mask_np = to_numpy(stim_mask)
+                            
+                            # Calculate per-cell baseline and stim rates
+                            trial_baseline = np.mean(trial_activity[:, baseline_mask_np], axis=1)
+                            trial_stim = np.mean(trial_activity[:, stim_mask_np], axis=1)
+                            trial_change = trial_stim - trial_baseline
+                            trial_baseline_std = np.std(trial_baseline)
+
+                            # Classify cells as excited/suppressed/unchanged
+                            excited_cells = (trial_change > trial_baseline_std)
+                            suppressed_cells = (trial_change < -trial_baseline_std)
+                            unchanged_cells = 1.0 - excited_cells - suppressed_cells
+
+                            frac_excited = np.mean(excited_cells)
+                            frac_suppressed = np.mean(suppressed_cells)
+                            frac_unchanged = np.mean(unchanged_cells)
+
+                            # Determine point color based on dominant response
+                            if frac_excited > max(frac_suppressed, frac_unchanged):
+                                point_color = 'red'  # Majority excited
+                            elif frac_suppressed > max(frac_excited, frac_unchanged):
+                                point_color = 'blue'  # Majority suppressed
+                            else:
+                                point_color = 'gray'  # Balanced or unchanged
+
+                            # Calculate trial mean ratio
+                            trial_baseline_mean = np.mean(trial_baseline)
+                            trial_stim_mean = np.mean(trial_stim)
+
+                            if trial_baseline_mean > 0:
+                                trial_ratio = np.log2(trial_stim_mean / trial_baseline_mean)
+                                trial_points.append(trial_ratio)
+                                trial_colors.append(point_color)
+
+                    individual_points.append(trial_points)
+                    point_colors.append(trial_colors)
+
+                    # Add error bars if multi-trial
+                    if has_multitrial and f'{pop}_mean_change_std' in results[target][stimulation_level]:
+                        std = results[target][stimulation_level][f'{pop}_mean_change_std']
+                        error = std / (baseline_rate * np.log(2))
+                        bar_errors.append(error)
+                    else:
+                        bar_errors.append(0)
+
+    if bar_data:
+        x_pos = np.arange(len(bar_labels))
+        bars = ax1.bar(x_pos, bar_data, color=bar_colors, alpha=0.7, 
+                       edgecolor='black', linewidth=1.5,
+                       yerr=bar_errors if has_multitrial else None,
+                       capsize=5)
+
+        # Overlay individual data points with color coding
+        if has_multitrial:
+            for i, (points, colors_for_points) in enumerate(zip(individual_points, point_colors)):
+                if len(points) > 0:
+                    # Add jitter to x-position for visibility
+                    x_jittered = np.random.normal(x_pos[i], 0.05, len(points))
+                    ax1.scatter(x_jittered, points, c=colors_for_points, s=40, 
+                                alpha=0.7, zorder=10, edgecolors='white', linewidth=0.8)
+
+        # Value labels on bars
+        for i, (bar, value) in enumerate(zip(bars, bar_data)):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{value:.2f}', ha='center', 
+                    va='bottom' if height > 0 else 'top',
+                    fontsize=12, fontweight='bold')
+
+        # Add legend for point colors
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='red', alpha=0.7, label='Excited'),
+            Patch(facecolor='blue', alpha=0.7, label='Suppressed'),
+            Patch(facecolor='gray', alpha=0.7, label='Balanced/Unchanged')
+        ]
+        ax1.legend(handles=legend_elements, loc='lower left', fontsize=9, 
+                  framealpha=0.9, title='Trial Response')
+
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(bar_labels, rotation=45, ha='right', fontsize=10)
+    ax1.set_ylabel(r'Modulation Ratio ($\log_2$)', fontsize=12)
+    title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+    ax1.set_title(f'Firing Rate Modulation{title_suffix}', fontsize=12, fontweight='bold')
+    ax1.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=2)
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.set_axisbelow(True)
+    
+    # Panel B: Network effects summary with error bars
+    ax2 = plt.subplot(3, 4, (3, 4))
+    
+    effect_data = []
+    effect_errors = []
+    effect_labels = []
+    
+    for target in targets:
+        for pop in populations:
+            if pop != target:
+                excited_key = f'{pop}_excited'
+                if excited_key in results[target][stimulation_level]:
+                    excited_frac = results[target][stimulation_level][excited_key]
+                    inhibited_frac = results[target][stimulation_level][f'{pop}_inhibited']
+                    
+                    effect_data.append([excited_frac, inhibited_frac])
+                    effect_labels.append(f'{target.upper()}->{pop.upper()}')
+                    
+                    # Add error bars if available
+                    if has_multitrial and f'{pop}_excited_std' in results[target][stimulation_level]:
+                        excited_std = results[target][stimulation_level][f'{pop}_excited_std']
+                        effect_errors.append([excited_std, excited_std])  # Same for both
+                    else:
+                        effect_errors.append([0, 0])
+    
+    if effect_data:
+        effect_array = np.array(effect_data)
+        effect_errors_array = np.array(effect_errors)
+        x_pos = np.arange(len(effect_labels))
+        width = 0.35
+        
+        bars1 = ax2.bar(x_pos - width/2, effect_array[:, 0], width, 
+               label='Excited', color='red', alpha=0.7, edgecolor='black',
+               yerr=effect_errors_array[:, 0] if has_multitrial else None,
+               capsize=5)
+        bars2 = ax2.bar(x_pos + width/2, effect_array[:, 1], width, 
+               label='Inhibited', color='blue', alpha=0.7, edgecolor='black',
+               yerr=effect_errors_array[:, 1] if has_multitrial else None,
+               capsize=5)
+        
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}', ha='center', va='bottom',
+                        fontsize=10)
+        
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels(effect_labels, rotation=45, ha='right', fontsize=10)
+        ax2.set_ylabel('Fraction of Cells', fontsize=12)
+        title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+        ax2.set_title(f'Network Effects{title_suffix}', fontsize=12, fontweight='bold')
+        ax2.legend(fontsize=12)
+        ax2.grid(True, alpha=0.3, axis='y')
+        ax2.set_axisbelow(True)
+    
+    # Panel C: Firing rate changes bar plot with error bars
+    ax4 = plt.subplot(3, 4, (5, 6))
+    
+    change_data = []
+    change_errors = []
+    change_labels = []
+    change_colors = []
+    
+    for target in targets:
+        for pop in ['gc', 'mc']:
+            if f'{pop}_mean_change' in results[target][stimulation_level]:
+                mean_change = results[target][stimulation_level][f'{pop}_mean_change']
+                
+                change_data.append(mean_change)
+                change_labels.append(f'{target.upper()}->{pop.upper()}')
+                change_colors.append(colors['pv'] if target == 'pv' else colors['sst'])
+                
+                # Add error bars if available
+                if has_multitrial and f'{pop}_mean_change_std' in results[target][stimulation_level]:
+                    std = results[target][stimulation_level][f'{pop}_mean_change_std']
+                    change_errors.append(std)
+                else:
+                    change_errors.append(0)
+    
+    if change_data:
+        bars = ax4.bar(range(len(change_labels)), change_data, 
+                      color=change_colors, alpha=0.7, edgecolor='black', linewidth=1.5,
+                      yerr=change_errors if has_multitrial else None,
+                      capsize=5)
+        
+        # Add value labels
+        for bar, value in zip(bars, change_data):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{value:.2f}', ha='center', 
+                    va='bottom' if height > 0 else 'top',
+                    fontsize=12, fontweight='bold')
+        
+        ax4.set_xticks(range(len(change_labels)))
+        ax4.set_xticklabels(change_labels, fontsize=10)
+        ax4.set_ylabel(r'$\Delta$ Firing Rate (Hz)', fontsize=12)
+        title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+        ax4.set_title(f'Mean Rate Changes{title_suffix}', fontsize=12, fontweight='bold')
+        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=2)
+        ax4.grid(True, alpha=0.3, axis='y')
+        ax4.set_axisbelow(True)
+
+    # Panel D: Scatter plots showing correlation
+    for i, target in enumerate(targets):
+        ax = plt.subplot(3, 4, 7 + i)
+        
+        opsin_expression = results[target][stimulation_level]['opsin_expression_mean']
+        
+        if has_multitrial:
+            stim_rates = results[target][stimulation_level][f'{target}_stim_rates_mean'][opsin_expression <= 0.2]
+            baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates_mean'][opsin_expression <= 0.2]
+        else:
+            stim_rates = results[target][stimulation_level][f'{target}_stim_rates'][opsin_expression <= 0.2]
+            baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates'][opsin_expression <= 0.2]
+
+        ax.scatter(baseline_rates, stim_rates, c=colors[target], alpha=0.6, s=30, 
+                  edgecolors='black', linewidth=0.5)
+        
+        # Add correlation line
+        from scipy import stats
+        slope, intercept, r_value, p_value, std_err = stats.linregress(baseline_rates, stim_rates)
+        
+        line = slope * baseline_rates + intercept
+        ax.plot(baseline_rates, line, 'r--', alpha=0.8, linewidth=2, 
+               label=f'Fit (R={r_value:.2f})')
+
+        if hasattr(baseline_rates, 'numpy'):
+            baseline_rates = baseline_rates.numpy()
+        if hasattr(stim_rates, 'numpy'):
+            stim_rates = stim_rates.numpy()
+            
+        # Identity line
+        max_rate = max(np.max(baseline_rates), np.max(stim_rates))
+        ax.plot([0, max_rate], [0, max_rate], 'k--', alpha=0.5, linewidth=1.5, 
+               label='Identity')
+        
+        ax.set_xlabel('Baseline Rate (Hz)', fontsize=10)
+        ax.set_ylabel('Stimulation Rate (Hz)', fontsize=10)
+        title_suffix = f'\n(n={n_trials} trials)' if has_multitrial else '\n(Single Trial)'
+        ax.set_title(f'{target.upper()} Stimulation{title_suffix}\n(Non-expressing cells)', 
+                    fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=10)
+        ax.set_axisbelow(True)
+
+    # Panel E: Non-expressing cells in target populations
+    for i, target in enumerate(targets):
+        ax = plt.subplot(3, 4, 9 + i)
+
+        # Check if non-expressing cell data exists
+        if f'{target}_nonexpr_excited' in results[target][stimulation_level]:
+            nonexpr_data = results[target][stimulation_level]
+
+            # Get statistics
+            excited_nonexpr = nonexpr_data[f'{target}_nonexpr_excited']
+            n_nonexpr = nonexpr_data.get(f'{target}_nonexpr_count', 0)
+
+            if has_multitrial and f'{target}_nonexpr_excited_std' in nonexpr_data:
+                excited_std = nonexpr_data[f'{target}_nonexpr_excited_std']
+            else:
+                excited_std = 0
+
+            # Create bar plot
+            x_pos = [0]
+            bars = ax.bar(x_pos, [excited_nonexpr * 100], 
+                         yerr=[excited_std * 100] if has_multitrial else None,
+                         color='purple', alpha=0.7, edgecolor='black', linewidth=1.5,
+                         capsize=5)
+
+            # Add value label
+            height = bars[0].get_height()
+            ax.text(0, height, f'{excited_nonexpr*100:.1f}%\n(n={n_nonexpr})',
+                   ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+            ax.set_xlim(-0.5, 0.5)
+            ax.set_xticks([])
+            ax.set_ylabel('% Paradoxically Excited', fontsize=10)
+            title_suffix = f' (n={n_trials} trials)' if has_multitrial else ' (Single Trial)'
+            ax.set_title(f'{target.upper()} Non-Expressing Cells{title_suffix}',
+                        fontsize=11, fontweight='bold', color='purple')
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_ylim(0, max(100, excited_nonexpr * 120))
+        else:
+            # No data available
+            ax.text(0.5, 0.5, 'No non-expressing\ncell data available',
+                   ha='center', va='center', transform=ax.transAxes,
+                   fontsize=10, style='italic')
+            ax.axis('off')
+        
+    # Panel F: Summary text
+    ax6 = plt.subplot(3, 4, 12)
+    ax6.axis('off')
+    
+    trial_text = f'{n_trials} Trial Average' if has_multitrial else 'Single Trial'
+    summary_text = f"{trial_text} Summary\n"
+    summary_text += "=" * 30 + "\n\n"
+    
+    # Network effects
+    summary_text += "Optogenetic Effects:\n"
+    for target in targets:
+        summary_text += f"{target.upper()} stimulation:\n"
+        for pop in ['gc', 'mc']:
+            if f'{pop}_excited' in results[target][stimulation_level]:
+                excited = results[target][stimulation_level][f'{pop}_excited']
+                if has_multitrial and f'{pop}_excited_std' in results[target][stimulation_level]:
+                    std = results[target][stimulation_level][f'{pop}_excited_std']
+                    summary_text += f"  {pop.upper()}: {excited:.1%} ± {std:.1%} excited\n"
+                else:
+                    summary_text += f"  {pop.upper()}: {excited:.1%} excited\n"
+        summary_text += "\n"
+
+    summary_text += "\nNon-Expressing Cells:\n"
+    for target in targets:
+        if f'{target}_nonexpr_excited' in results[target][stimulation_level]:
+            excited_nonexpr = results[target][stimulation_level][f'{target}_nonexpr_excited']
+            n_nonexpr = results[target][stimulation_level].get(f'{target}_nonexpr_count', 0)
+
+            if has_multitrial and f'{target}_nonexpr_excited_std' in results[target][stimulation_level]:
+                std = results[target][stimulation_level][f'{target}_nonexpr_excited_std']
+                summary_text += f"{target.upper()}: {excited_nonexpr:.1%} ± {std:.1%} (n={n_nonexpr})\n"
+            else:
+                summary_text += f"{target.upper()}: {excited_nonexpr:.1%} (n={n_nonexpr})\n"
+        else:
+            summary_text += f"{target.upper()}: No data\n"
+        
+    ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes, va='top', ha='left',
+            fontsize=10, fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        
+    main_title = 'Dentate Gyrus Interneuron Stimulation Effects'
+    if has_multitrial:
+        main_title += f' (Average of {n_trials} Trials)'
+    else:
+        main_title += ' (Representative Single Trial)'
+        
+    plt.suptitle(main_title, fontsize=16, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    
+    if save_path:
+        trial_suffix = f'_n{n_trials}trials' if has_multitrial else '_single_trial'
+        plt.savefig(f"{save_path}/DG_comparative_experiment_stim_{stimulation_level}{trial_suffix}.pdf", 
+                   dpi=300, bbox_inches='tight')
+        plt.savefig(f"{save_path}/DG_comparative_experiment_stim_{stimulation_level}{trial_suffix}.png", 
+                   dpi=300, bbox_inches='tight')
+    
+    plt.show()
+
+    
 def plot_expression_level_overlay(
     results: Dict,
     save_path: Optional[str] = None,
@@ -763,7 +1196,206 @@ def plot_expression_level_results(
     
     plt.show()
 
+def export_expression_results_csv(
+    results: Dict,
+    csv_path: str,
+    target_populations: Optional[List[str]] = None,
+) -> None:
+    """
+    Export opsin expression level experiment results to CSV.
 
+    Produces one row per (config, target, expression_level, connectivity_idx)
+    in wide format, with all population metrics as columns.  When per-connectivity
+    data is available (paired mode with ``_by_conn`` keys), each connectivity
+    instance is emitted as a separate row.  For unpaired / aggregate-only data,
+    a single row is written with ``connectivity_idx`` set to NaN.
+
+    The CSV is designed for downstream analysis in R (e.g. paired mixed-effects
+    models across expression levels on identical circuit realizations).
+
+    Args:
+        results: Dictionary returned by ``test_opsin_expression_levels()``.
+            Structure: ``results[config_name][target][expr_level] -> analysis_dict``
+        csv_path: Output file path for the CSV.
+        target_populations: Subset of targets to export (default: all in results).
+
+    CSV columns (wide format):
+        config, target, expression_level, connectivity_idx,
+        {pop}_excited, {pop}_mean_change   (for each non-target population),
+        {target}_nonexpr_excited, {target}_nonexpr_mean_change,
+        {target}_nonexpr_count,
+        n_connectivity
+    """
+    import csv
+
+    config_names = list(results.keys())
+    if not config_names:
+        logger.warning("export_expression_results_csv: empty results dict")
+        return
+
+    # Determine target populations
+    if target_populations is None:
+        target_populations = sorted(results[config_names[0]].keys())
+
+    # Canonical population order for column output
+    all_pops = ['gc', 'mc', 'pv', 'sst']
+
+    # --- collect rows lazily via a generator -----------------------------------
+    def _generate_rows():
+        for config_name in config_names:
+            for target in target_populations:
+                if target not in results[config_name]:
+                    continue
+
+                expression_levels = sorted(results[config_name][target].keys())
+
+                for expr_level in expression_levels:
+                    data = results[config_name][target][expr_level]
+
+                    # Determine non-target populations for this target
+                    non_target_pops = [p for p in all_pops if p != target]
+
+                    # Check for paired (per-connectivity) data
+                    first_by_conn_key = next(
+                        (k for k in data if k.endswith('_by_conn')), None
+                    )
+                    n_conn = data.get('n_connectivity', None)
+
+                    if first_by_conn_key is not None and n_conn is not None:
+                        # --- Paired mode: one row per connectivity instance ---
+                        for conn_idx in range(n_conn):
+                            row = {
+                                'config': config_name,
+                                'target': target,
+                                'expression_level': expr_level,
+                                'connectivity_idx': conn_idx,
+                                'n_connectivity': n_conn,
+                            }
+
+                            # Non-target population metrics
+                            for pop in non_target_pops:
+                                exc_key = f'{pop}_excited_by_conn'
+                                chg_key = f'{pop}_mean_change_by_conn'
+
+                                row[f'{pop}_excited'] = (
+                                    data[exc_key][conn_idx]
+                                    if exc_key in data
+                                    and conn_idx < len(data[exc_key])
+                                    else None
+                                )
+                                row[f'{pop}_mean_change'] = (
+                                    data[chg_key][conn_idx]
+                                    if chg_key in data
+                                    and conn_idx < len(data[chg_key])
+                                    else None
+                                )
+
+                            # Non-expressing target cells
+                            ne_exc_key = f'{target}_nonexpr_excited_by_conn'
+                            ne_chg_key = f'{target}_nonexpr_mean_change_by_conn'
+                            ne_cnt_key = f'{target}_nonexpr_count_by_conn'
+
+                            row[f'{target}_nonexpr_excited'] = (
+                                data[ne_exc_key][conn_idx]
+                                if ne_exc_key in data
+                                and conn_idx < len(data[ne_exc_key])
+                                else None
+                            )
+                            row[f'{target}_nonexpr_mean_change'] = (
+                                data[ne_chg_key][conn_idx]
+                                if ne_chg_key in data
+                                and conn_idx < len(data[ne_chg_key])
+                                else None
+                            )
+                            row[f'{target}_nonexpr_count'] = (
+                                data[ne_cnt_key][conn_idx]
+                                if ne_cnt_key in data
+                                and conn_idx < len(data[ne_cnt_key])
+                                else data.get(f'{target}_nonexpr_count', None)
+                            )
+
+                            yield row
+                    else:
+                        # --- Unpaired / aggregate mode: single row -----------
+                        row = {
+                            'config': config_name,
+                            'target': target,
+                            'expression_level': expr_level,
+                            'connectivity_idx': float('nan'),
+                            'n_connectivity': n_conn if n_conn else 0,
+                        }
+
+                        for pop in non_target_pops:
+                            row[f'{pop}_excited'] = data.get(
+                                f'{pop}_excited', None
+                            )
+                            row[f'{pop}_mean_change'] = data.get(
+                                f'{pop}_mean_change', None
+                            )
+
+                        row[f'{target}_nonexpr_excited'] = data.get(
+                            f'{target}_nonexpr_excited', None
+                        )
+                        row[f'{target}_nonexpr_mean_change'] = data.get(
+                            f'{target}_nonexpr_mean_change', None
+                        )
+                        row[f'{target}_nonexpr_count'] = data.get(
+                            f'{target}_nonexpr_count', None
+                        )
+
+                        yield row
+
+    # --- build fieldnames in deterministic order --------------------------------
+    # Fixed identifier columns
+    fieldnames = [
+        'config',
+        'target',
+        'expression_level',
+        'connectivity_idx',
+    ]
+
+    # Population metric columns in canonical order
+    for pop in all_pops:
+        fieldnames.append(f'{pop}_excited')
+        fieldnames.append(f'{pop}_mean_change')
+
+    # Non-expressing target columns (one set per possible target)
+    for target in target_populations:
+        fieldnames.append(f'{target}_nonexpr_excited')
+        fieldnames.append(f'{target}_nonexpr_mean_change')
+        fieldnames.append(f'{target}_nonexpr_count')
+
+    fieldnames.append('n_connectivity')
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_fieldnames = []
+    for f in fieldnames:
+        if f not in seen:
+            seen.add(f)
+            unique_fieldnames.append(f)
+    fieldnames = unique_fieldnames
+
+    # --- write CSV ---------------------------------------------------------------
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_rows = 0
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(
+            f, fieldnames=fieldnames, extrasaction='ignore'
+        )
+        writer.writeheader()
+        for row in _generate_rows():
+            writer.writerow(row)
+            n_rows += 1
+
+    logger.info(f"Exported expression level results to: {csv_path}")
+    logger.info(f"  Rows: {n_rows}")
+    logger.info(f"  Configs: {config_names}")
+    logger.info(f"  Targets: {target_populations}")
+
+    
 # ============================================================================
 # Subcommand Handlers
 # ============================================================================
@@ -999,6 +1631,17 @@ def cmd_plot_expression(args):
         import traceback
         logger.error(traceback.format_exc())
         return 1
+    
+    if args.export_csv:
+        try:
+            export_expression_level_csv(
+                expression_results,
+                output_dir=str(output_dir),
+                intensities=[intensity]
+            )
+        except Exception as e:
+            logger.error(f"Failed to export expression level results: {e}")
+            return 1
     
     return 0
 
@@ -2143,6 +2786,98 @@ def cmd_plot_connectivity_activity(args):
     
     return 0
 
+def cmd_export_nested_csv(args):
+    """
+    Export per-(connectivity, MEC pattern) aggregate statistics to CSV.
+
+    Each row contains population-level proportions (excited / suppressed /
+    unchanged), mean firing-rate change, and log2 modulation ratio.
+    For the target population, separate columns are emitted for
+    opsin-expressing vs non-expressing cells.
+    """
+    logger.info("=" * 80)
+    logger.info("Exporting nested experiment statistics to CSV")
+    logger.info("=" * 80)
+
+    # Load and validate nested results
+    try:
+        nested_data = load_results_with_validation(args.input, 'nested')
+    except Exception as e:
+        logger.error(f"Failed to load results: {e}")
+        return 1
+
+    metadata = nested_data.get('metadata', {})
+    file_format = nested_data.get('file_format', 'pickle')
+
+    # Resolve stimulation parameters from metadata
+    stim_start = metadata.get('stim_start', args.stim_start)
+    stim_duration = metadata.get('stim_duration', args.stim_duration)
+    warmup = metadata.get('warmup', args.warmup)
+
+    # Resolve output path
+    if args.csv_path is not None:
+        csv_path = args.csv_path
+    else:
+        output_dir = setup_output_directory(args.output)
+        csv_path = str(output_dir / 'nested_experiment_stats.csv')
+
+    # Resolve target populations and intensities
+    target_populations = args.target_populations
+    intensities = args.intensities
+
+    logger.info(f"\nFile format: {file_format.upper()}")
+    logger.info(f"Stimulation parameters:")
+    logger.info(f"  stim_start   = {stim_start} ms")
+    logger.info(f"  stim_duration = {stim_duration} ms")
+    logger.info(f"  warmup       = {warmup} ms")
+    logger.info(f"  threshold_std = {args.threshold_std}")
+    logger.info(f"  expression_threshold = {args.expression_threshold}")
+    logger.info(f"Output: {csv_path}")
+
+    try:
+        if file_format == 'hdf5':
+            n_rows = export_nested_experiment_csv_from_hdf5(
+                hdf5_filepath=nested_data['hdf5_file'],
+                csv_path=csv_path,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                warmup=warmup,
+                target_populations=target_populations,
+                intensities=intensities,
+                threshold_std=args.threshold_std,
+                expression_threshold=args.expression_threshold,
+            )
+        else:
+            nested_results = nested_data['nested_results']
+            if nested_results is None:
+                logger.error(
+                    "In-memory nested_results is None. "
+                    "Use HDF5 format or re-run with save_nested_trials=True."
+                )
+                return 1
+
+            n_rows = export_nested_experiment_csv(
+                nested_results=nested_results,
+                csv_path=csv_path,
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                warmup=warmup,
+                target_populations=target_populations,
+                intensities=intensities,
+                threshold_std=args.threshold_std,
+                expression_threshold=args.expression_threshold,
+            )
+
+        logger.info(f"\nExported {n_rows} rows to {csv_path}")
+
+    except Exception as e:
+        logger.error(f"Failed to export CSV: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 1
+
+    return 0
+
 # ============================================================================
 # Argument Parser Setup
 # ============================================================================
@@ -2288,6 +3023,9 @@ Examples:
     )
     parser_expr.add_argument('input',
                             help='Expression results file (*.pkl)')
+    parser_expr.add_argument('--export-csv',
+                             action='store_true',
+                            help='Export expression level data to CSV')
     parser_expr.set_defaults(func=cmd_plot_expression)
     
     # ========== plot-combined ==========
@@ -2683,6 +3421,96 @@ Examples:
                             help='Do not sort cells by activity')
     parser_conn.set_defaults(func=cmd_plot_connectivity_activity)
 
+    # ========== export-nested-csv ==========
+    parser_csv = subparsers.add_parser(
+        'export-nested-csv',
+        help='Export per-trial aggregate statistics from nested experiments to CSV',
+        description=(
+            'Export one row per (connectivity, MEC pattern) with population-level '
+            'proportions (excited / suppressed / unchanged), mean rate change, '
+            'and log2 modulation ratio.  For the target population, separate '
+            'columns are provided for expressing vs non-expressing cells.'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Export from HDF5
+  %(prog)s nested_results.h5
+
+  # Export from pickle with explicit output path
+  %(prog)s nested_results.pkl --csv-path results/trial_stats.csv
+
+  # Export specific targets and intensities
+  %(prog)s nested_results.h5 --target-populations pv sst \\
+                             --intensities 1.0 1.5
+
+  # Custom classification threshold
+  %(prog)s nested_results.h5 --threshold-std 1.5
+        """
+    )
+    parser_csv.add_argument(
+        'input',
+        help='Nested experiment results file (*.pkl or *.h5)',
+    )
+    parser_csv.add_argument(
+        '--csv-path',
+        type=str,
+        default=None,
+        metavar='PATH',
+        help='Output CSV file path (default: <output>/nested_experiment_stats.csv)',
+    )
+    parser_csv.add_argument(
+        '--target-populations',
+        type=str,
+        nargs='+',
+        default=None,
+        metavar='POP',
+        help='Target populations to export (default: all in file)',
+    )
+    parser_csv.add_argument(
+        '--intensities',
+        type=float,
+        nargs='+',
+        default=None,
+        metavar='INTENSITY',
+        help='Intensities to export (default: all in file)',
+    )
+    parser_csv.add_argument(
+        '--threshold-std',
+        type=float,
+        default=1.0,
+        metavar='VALUE',
+        help='Classification threshold in baseline std deviations (default: 1.0)',
+    )
+    parser_csv.add_argument(
+        '--expression-threshold',
+        type=float,
+        default=0.2,
+        metavar='VALUE',
+        help='Opsin expression threshold for non-expressing classification (default: 0.2)',
+    )
+    parser_csv.add_argument(
+        '--stim-start',
+        type=float,
+        default=1500.0,
+        metavar='MS',
+        help='Stimulation start time in ms (default: from metadata, fallback 1500)',
+    )
+    parser_csv.add_argument(
+        '--stim-duration',
+        type=float,
+        default=1000.0,
+        metavar='MS',
+        help='Stimulation duration in ms (default: from metadata, fallback 1000)',
+    )
+    parser_csv.add_argument(
+        '--warmup',
+        type=float,
+        default=500.0,
+        metavar='MS',
+        help='Baseline window start in ms (default: from metadata, fallback 500)',
+    )
+    parser_csv.set_defaults(func=cmd_export_nested_csv)
     
     return parser
 

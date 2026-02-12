@@ -16,10 +16,11 @@ This allows decomposition of variance:
 
 """
 
-from typing import Dict, List, Tuple, Optional, NamedTuple
+from typing import Dict, List, Tuple, Optional, Iterator, NamedTuple
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
+import csv
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -2506,3 +2507,481 @@ def load_nested_experiment_seeds_and_opsin(
         'metadata': metadata,
         'intensities': intensities,
     }
+
+
+ALL_POPULATIONS = ('gc', 'mc', 'pv', 'sst')
+
+def _build_csv_fieldnames(
+    populations: Tuple[str, ...] = ALL_POPULATIONS,
+) -> List[str]:
+    """
+    Build the ordered list of CSV column names.
+
+    Identifier columns come first, then per-population metric columns.
+    For the target population the metrics are split into ``_expr`` and
+    ``_nonexpr`` variants; the plain (unsuffixed) columns are omitted
+    for the target because the expressing/non-expressing split is more
+    informative.  Non-target populations use unsuffixed columns only.
+
+    Because target population varies per row, we emit *all* possible
+    suffixed columns for every population and let the writer fill in
+    only the relevant ones (the rest stay empty).
+
+    Returns:
+        Ordered list of field names.
+    """
+    id_cols = [
+        'connectivity_idx',
+        'mec_pattern_idx',
+        'target_population',
+        'intensity',
+    ]
+
+    metric_suffixes = [
+        'n_cells',
+        'fraction_excited',
+        'fraction_suppressed',
+        'fraction_unchanged',
+        'mean_rate_change',
+        'mean_modulation_ratio',
+        'mean_baseline_rate',
+        'mean_stim_rate',
+    ]
+
+    pop_cols = []
+    for pop in populations:
+        # Unsuffixed columns (used for non-target pops)
+        for suffix in metric_suffixes:
+            pop_cols.append(f'{pop}_{suffix}')
+        # Expressing-cell columns (target pop only)
+        for suffix in metric_suffixes:
+            pop_cols.append(f'{pop}_expr_{suffix}')
+        # Non-expressing-cell columns (target pop only)
+        for suffix in metric_suffixes:
+            pop_cols.append(f'{pop}_nonexpr_{suffix}')
+
+    return id_cols + pop_cols
+
+
+# ============================================================================
+# Per-trial statistics
+# ============================================================================
+
+def compute_trial_population_stats(
+    activity: torch.Tensor,
+    time: np.ndarray,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    threshold_std: float = 1.0,
+    cell_mask: Optional[np.ndarray] = None,
+) -> Dict:
+    """
+    Compute aggregate statistics for a subset of cells in one population
+    for a single trial.
+
+    Classification uses the same +/- ``threshold_std`` * baseline_std
+    criterion as ``classify_cells_by_connectivity``.
+
+    Args:
+        activity: Activity tensor ``[n_cells, n_timesteps]``.
+        time: Time array (numpy, ms).
+        stim_start: Stimulation onset (ms).
+        stim_duration: Duration of stimulation (ms).
+        warmup: Start of the baseline window (ms).
+        threshold_std: Number of baseline standard deviations for
+            the excited / suppressed classification threshold.
+        cell_mask: Optional boolean mask selecting a subset of cells
+            along the first axis of *activity*.  ``None`` means use
+            all cells.
+
+    Returns:
+        Dictionary with keys ``n_cells``, ``fraction_excited``,
+        ``fraction_suppressed``, ``fraction_unchanged``,
+        ``mean_rate_change``, ``mean_modulation_ratio``,
+        ``mean_baseline_rate``, ``mean_stim_rate``.
+    """
+    baseline_mask = (time >= warmup) & (time < stim_start)
+    stim_mask = (
+        (time >= stim_start) & (time <= (stim_start + stim_duration))
+    )
+
+    # Select cells --------------------------------------------------------
+    if cell_mask is not None:
+        if not isinstance(cell_mask, torch.Tensor):
+            cell_mask_t = torch.from_numpy(cell_mask).to(activity.device)
+        else:
+            cell_mask_t = cell_mask
+        act = activity[cell_mask_t]
+    else:
+        act = activity
+
+    n_cells = act.shape[0]
+    if n_cells == 0:
+        return {
+            'n_cells': 0,
+            'fraction_excited': float('nan'),
+            'fraction_suppressed': float('nan'),
+            'fraction_unchanged': float('nan'),
+            'mean_rate_change': float('nan'),
+            'mean_modulation_ratio': float('nan'),
+            'mean_baseline_rate': float('nan'),
+            'mean_stim_rate': float('nan'),
+        }
+
+    # Per-cell rates ------------------------------------------------------
+    baseline_rate = torch.mean(act[:, baseline_mask], dim=1)  # [n_cells]
+    stim_rate = torch.mean(act[:, stim_mask], dim=1)          # [n_cells]
+    rate_change = stim_rate - baseline_rate
+    baseline_std = torch.std(baseline_rate)
+
+    # Classification ------------------------------------------------------
+    threshold = threshold_std * baseline_std
+    excited = rate_change > threshold
+    suppressed = rate_change < -threshold
+    unchanged = ~(excited | suppressed)
+
+    frac_excited = torch.mean(excited.float()).item()
+    frac_suppressed = torch.mean(suppressed.float()).item()
+    frac_unchanged = torch.mean(unchanged.float()).item()
+
+    # Aggregate rates -----------------------------------------------------
+    mean_baseline = torch.mean(baseline_rate).item()
+    mean_stim = torch.mean(stim_rate).item()
+    mean_change = torch.mean(rate_change).item()
+
+    # Modulation ratio: log2(stim / baseline), safe for near-zero baselines
+    eps = 1e-6
+    if mean_baseline > eps:
+        modulation_ratio = float(np.log2(mean_stim / mean_baseline))
+    else:
+        modulation_ratio = float('nan')
+
+    return {
+        'n_cells': n_cells,
+        'fraction_excited': frac_excited,
+        'fraction_suppressed': frac_suppressed,
+        'fraction_unchanged': frac_unchanged,
+        'mean_rate_change': mean_change,
+        'mean_modulation_ratio': modulation_ratio,
+        'mean_baseline_rate': mean_baseline,
+        'mean_stim_rate': mean_stim,
+    }
+
+
+# ============================================================================
+# Row generator
+# ============================================================================
+
+def _generate_csv_rows(
+    trials: List[NestedTrialResult],
+    target_population: str,
+    intensity: float,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    populations: Tuple[str, ...] = ALL_POPULATIONS,
+) -> Iterator[Dict]:
+    """
+    Lazily yield one CSV row dict per trial.
+
+    For the target population the row contains ``_expr`` and ``_nonexpr``
+    columns; for all other populations the unsuffixed columns are filled.
+
+    Args:
+        trials: Flat list of ``NestedTrialResult`` for a single
+            (target, intensity) condition.
+        target_population: Which population was optogenetically stimulated.
+        intensity: Light intensity for this batch of trials.
+        stim_start: Stimulation onset (ms).
+        stim_duration: Stimulation duration (ms).
+        warmup: Baseline window start (ms).
+        threshold_std: Classification threshold in baseline std units.
+        expression_threshold: Opsin expression level below which a cell
+            is considered non-expressing.
+        populations: Tuple of population names to include.
+
+    Yields:
+        One dict per trial, keyed by CSV column names.
+    """
+    for trial in trials:
+        # --- resolve activity tensor and time array ----------------------
+        if 'activity_trace_mean' in trial.results:
+            activity_dict = trial.results['activity_trace_mean']
+        elif 'activity_trace' in trial.results:
+            activity_dict = trial.results['activity_trace']
+        else:
+            raise KeyError(
+                "Trial results missing 'activity_trace' and "
+                "'activity_trace_mean'"
+            )
+
+        time = trial.results['time']
+        if isinstance(time, torch.Tensor):
+            time = time.cpu().numpy()
+        else:
+            time = np.asarray(time)
+
+        # --- opsin expression for target population ----------------------
+        opsin_expr = trial.opsin_expression
+        if isinstance(opsin_expr, torch.Tensor):
+            opsin_expr = opsin_expr.cpu().numpy()
+        else:
+            opsin_expr = np.asarray(opsin_expr)
+
+        # --- build row ---------------------------------------------------
+        row: Dict = {
+            'connectivity_idx': trial.connectivity_idx,
+            'mec_pattern_idx': trial.mec_pattern_idx,
+            'target_population': target_population,
+            'intensity': intensity,
+        }
+
+        for pop in populations:
+            pop_activity = activity_dict[pop]
+            if isinstance(pop_activity, np.ndarray):
+                pop_activity = torch.from_numpy(pop_activity)
+
+            if pop == target_population:
+                # --- expressing cells ------------------------------------
+                expr_mask = opsin_expr >= expression_threshold
+                expr_stats = compute_trial_population_stats(
+                    pop_activity, time,
+                    stim_start, stim_duration, warmup,
+                    threshold_std, cell_mask=expr_mask,
+                )
+                for key, val in expr_stats.items():
+                    row[f'{pop}_expr_{key}'] = val
+
+                # --- non-expressing cells --------------------------------
+                nonexpr_mask = opsin_expr < expression_threshold
+                nonexpr_stats = compute_trial_population_stats(
+                    pop_activity, time,
+                    stim_start, stim_duration, warmup,
+                    threshold_std, cell_mask=nonexpr_mask,
+                )
+                for key, val in nonexpr_stats.items():
+                    row[f'{pop}_nonexpr_{key}'] = val
+
+            else:
+                # --- all cells (non-target population) -------------------
+                stats = compute_trial_population_stats(
+                    pop_activity, time,
+                    stim_start, stim_duration, warmup,
+                    threshold_std,
+                )
+                for key, val in stats.items():
+                    row[f'{pop}_{key}'] = val
+
+        yield row
+
+
+def export_nested_experiment_csv(
+    nested_results: Dict,
+    csv_path: str,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    target_populations: Optional[List[str]] = None,
+    intensities: Optional[List[float]] = None,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    populations: Tuple[str, ...] = ALL_POPULATIONS,
+) -> int:
+    """
+    Export per-(connectivity, MEC pattern) aggregate statistics to CSV.
+
+    Each row represents a single trial identified by
+    ``(connectivity_idx, mec_pattern_idx, target_population, intensity)``.
+
+    For the target population, separate ``_expr`` and ``_nonexpr`` columns
+    are emitted so that direct optogenetic effects can be distinguished from
+    true network-mediated (paradoxical) responses.  Non-target populations
+    use unsuffixed columns.
+
+    Works with in-memory ``nested_results`` dictionaries of the form
+    ``{target: {intensity: [NestedTrialResult, ...], ...}, ...}``.
+    For HDF5-backed experiments, load trials first via
+    ``load_nested_trials_from_hdf5`` and construct the same dict.
+
+    Args:
+        nested_results: ``{target_pop: {intensity: [NestedTrialResult, ...]}}``
+        csv_path: Output file path.
+        stim_start: Stimulation onset (ms).
+        stim_duration: Stimulation duration (ms).
+        warmup: Baseline window start (ms).
+        target_populations: Subset of targets to export (default: all keys
+            in *nested_results*).
+        intensities: Subset of intensities to export (default: all).
+        threshold_std: Classification threshold in baseline std units.
+        expression_threshold: Opsin expression threshold.
+        populations: Tuple of population names to include.
+
+    Returns:
+        Number of rows written.
+    """
+    if target_populations is None:
+        target_populations = sorted(nested_results.keys())
+
+    fieldnames = _build_csv_fieldnames(populations)
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_rows = 0
+    with open(csv_path, 'w', newline='') as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=fieldnames,
+            extrasaction='ignore',   # silently drop unexpected keys
+            restval='',              # empty string for missing columns
+        )
+        writer.writeheader()
+
+        for target in target_populations:
+            if target not in nested_results:
+                logger.warning(
+                    f"Target '{target}' not found in nested_results, skipping"
+                )
+                continue
+
+            target_data = nested_results[target]
+            iter_intensities = (
+                sorted(target_data.keys())
+                if intensities is None
+                else [i for i in intensities if i in target_data]
+            )
+
+            for intensity in iter_intensities:
+                trials = target_data[intensity]
+                logger.info(
+                    f"  Exporting {target.upper()} intensity={intensity}: "
+                    f"{len(trials)} trials"
+                )
+
+                for row in _generate_csv_rows(
+                    trials=trials,
+                    target_population=target,
+                    intensity=intensity,
+                    stim_start=stim_start,
+                    stim_duration=stim_duration,
+                    warmup=warmup,
+                    threshold_std=threshold_std,
+                    expression_threshold=expression_threshold,
+                    populations=populations,
+                ):
+                    writer.writerow(row)
+                    n_rows += 1
+
+    logger.info(f"Exported {n_rows} rows to {csv_path}")
+    return n_rows
+
+
+def export_nested_experiment_csv_from_hdf5(
+    hdf5_filepath: str,
+    csv_path: str,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    target_populations: Optional[List[str]] = None,
+    intensities: Optional[List[float]] = None,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    populations: Tuple[str, ...] = ALL_POPULATIONS,
+) -> int:
+    """
+    Export nested experiment CSV directly from an HDF5 file.
+
+    Loads trials one (target, intensity) block at a time to limit memory
+    usage, then delegates to the row generator.
+
+    Args:
+        hdf5_filepath: Path to the nested experiment HDF5 file.
+        csv_path: Output CSV path.
+        stim_start: Stimulation onset (ms).
+        stim_duration: Stimulation duration (ms).
+        warmup: Baseline window start (ms).
+        target_populations: Targets to export (default: ``['pv', 'sst']``).
+        intensities: Intensities to export (default: all in file).
+        threshold_std: Classification threshold in baseline std units.
+        expression_threshold: Opsin expression threshold.
+        populations: Tuple of population names to include.
+
+    Returns:
+        Number of rows written.
+    """
+    import h5py
+    from hdf5_storage import load_metadata_from_hdf5, load_nested_trials_from_hdf5
+
+    metadata = load_metadata_from_hdf5(hdf5_filepath)
+    n_connectivity = metadata['n_connectivity_instances']
+    n_mec_patterns = metadata['n_mec_patterns_per_connectivity']
+
+    if target_populations is None:
+        target_populations = ['pv', 'sst']
+
+    fieldnames = _build_csv_fieldnames(populations)
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_rows = 0
+    with (
+        open(csv_path, 'w', newline='') as fh,
+        h5py.File(hdf5_filepath, 'r') as f,
+    ):
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=fieldnames,
+            extrasaction='ignore',
+            restval='',
+        )
+        writer.writeheader()
+
+        for target in target_populations:
+            if target not in f:
+                logger.warning(
+                    f"Target '{target}' not in HDF5, skipping"
+                )
+                continue
+
+            # Discover intensities in this target group
+            available = [
+                float(k.split('_')[1])
+                for k in f[target].keys()
+                if k.startswith('intensity_')
+            ]
+            iter_intensities = (
+                sorted(available)
+                if intensities is None
+                else [i for i in intensities if i in available]
+            )
+
+            for intensity in iter_intensities:
+                trials = load_nested_trials_from_hdf5(
+                    f, target, intensity,
+                    n_connectivity, n_mec_patterns,
+                    require_full_activity=True,
+                )
+                logger.info(
+                    f"  Exporting {target.upper()} intensity={intensity}: "
+                    f"{len(trials)} trials from HDF5"
+                )
+
+                for row in _generate_csv_rows(
+                    trials=trials,
+                    target_population=target,
+                    intensity=intensity,
+                    stim_start=stim_start,
+                    stim_duration=stim_duration,
+                    warmup=warmup,
+                    threshold_std=threshold_std,
+                    expression_threshold=expression_threshold,
+                    populations=populations,
+                ):
+                    writer.writerow(row)
+                    n_rows += 1
+
+    logger.info(f"Exported {n_rows} rows to {csv_path}")
+    return n_rows
