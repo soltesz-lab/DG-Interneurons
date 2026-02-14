@@ -17,6 +17,7 @@ Available Commands:
     bootstrap-analysis       Bootstrap effect size analysis
     nested-weights-analysis  Analyze weights by response in nested experiments
     decision-analysis        Effect size decision framework
+    export-per-cell-csv      Export per-cell weights and firing rates to CSV
 
 Usage Examples:
     # Basic plotting
@@ -36,6 +37,13 @@ Usage Examples:
 
     # Combined figures
     python DG_analysis.py plot-combined results.pkl ablation.pkl expression.pkl
+
+    # Export per-cell data to CSV
+    python DG_analysis.py export-per-cell-csv nested_results.h5
+    python DG_analysis.py export-per-cell-csv nested_results.h5 \\
+        --csv-filename my_data.csv \\
+        --target-populations pv \\
+        --intensities 1.0 1.5
     
     # Show help for specific command
     python DG_analysis.py plot-comparative --help
@@ -94,6 +102,7 @@ from DG_protocol import (
 from nested_experiment import (
     export_nested_experiment_csv,
     export_nested_experiment_csv_from_hdf5,
+    export_per_cell_weights_from_hdf5
 )
 from nested_weights_analysis import (
     analyze_weights_by_average_response_nested,
@@ -391,7 +400,8 @@ def filter_trials_for_connectivity(nested_data: Dict,
             all_trials = load_nested_trials_from_hdf5(
                 f, target_population, intensity, 
                 n_connectivity, n_mec_patterns,
-                require_full_activity=True
+                require_full_activity=True,
+                conn_idx_filter=[connectivity_idx]
             )
         
         # Filter for specific connectivity
@@ -2878,6 +2888,111 @@ def cmd_export_nested_csv(args):
 
     return 0
 
+
+
+def cmd_export_per_cell_csv(args):
+    """
+    Handle per-cell weights and firing rates CSV export
+    
+    Exports detailed per-cell data including:
+    - Response classification (excited/suppressed/unchanged)
+    - Baseline and stimulation firing rates
+    - Incoming synaptic weights from all source populations
+    - Opsin expression levels
+    """
+    logger.info("="*80)
+    logger.info("Exporting per-cell weights and firing rates to CSV")
+    logger.info("="*80)
+    
+    # Load and validate results
+    try:
+        nested_data = load_results_with_validation(args.input, 'nested')
+    except Exception as e:
+        logger.error(f"Failed to load results: {e}")
+        return 1
+    
+    # Extract metadata
+    metadata = nested_data.get('metadata', {})
+    file_format = nested_data.get('file_format', 'pickle')
+    
+    # Setup output directory
+    try:
+        output_dir = setup_output_directory(args.output)
+    except Exception as e:
+        logger.error(f"Failed to setup output directory: {e}")
+        return 1
+    
+    # Determine CSV path
+    csv_path = output_dir / args.csv_filename
+    
+    # Extract experiment parameters
+    stim_start = metadata.get('stim_start', 1500.0)
+    stim_duration = metadata.get('stim_duration', 1000.0)
+    warmup = metadata.get('warmup', 500.0)
+    optimization_file = metadata.get('optimization_file')
+    
+    # Determine populations to export
+    source_populations = args.source_populations or ('gc', 'mc', 'pv', 'sst')
+    post_populations = args.post_populations or ('gc', 'mc', 'pv', 'sst')
+    target_populations = args.target_populations or ['pv', 'sst']
+    intensities = args.intensities or metadata.get('intensities')
+    
+    logger.info(f"\nExport configuration:")
+    logger.info(f"  File format: {file_format.upper()}")
+    logger.info(f"  Output CSV: {csv_path}")
+    logger.info(f"  Target populations: {target_populations}")
+    logger.info(f"  Post populations: {post_populations}")
+    logger.info(f"  Source populations: {source_populations}")
+    logger.info(f"  Intensities: {intensities}")
+    logger.info(f"  Classification threshold: {args.threshold_std} std")
+    logger.info(f"  Expression threshold: {args.expression_threshold}")
+    
+    # Handle HDF5 format (memory-efficient streaming)
+    if file_format == 'hdf5':
+        hdf5_file = nested_data['hdf5_file']
+        
+        logger.info(f"\nProcessing HDF5 file: {hdf5_file}")
+        logger.info("Using memory-efficient streaming approach...")
+        
+        try:
+            n_rows = export_per_cell_weights_from_hdf5(
+                hdf5_filepath=hdf5_file,
+                csv_path=str(csv_path),
+                stim_start=stim_start,
+                stim_duration=stim_duration,
+                warmup=warmup,
+                optimization_json_file=optimization_file,
+                threshold_std=args.threshold_std,
+                expression_threshold=args.expression_threshold,
+                source_populations=tuple(source_populations),
+                post_populations=tuple(post_populations),
+                target_populations=target_populations,
+                intensities=intensities,
+                device=None,  # Auto-detect
+            )
+            
+            logger.info(f"\nExport complete!")
+            logger.info(f"  Total rows: {n_rows}")
+            logger.info(f"  Output file: {csv_path}")
+            logger.info(f"  File size: {csv_path.stat().st_size / 1024 / 1024:.2f} MB")
+            
+        except Exception as e:
+            logger.error(f"Failed to export CSV: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 1
+    
+    else:  # Pickle format
+        logger.error("CSV export for pickle format not yet implemented")
+        logger.error("Please convert to HDF5 format first, or use HDF5-based nested experiments")
+        return 1
+    
+    logger.info("\n" + "="*80)
+    logger.info("Per-cell CSV export complete")
+    logger.info("="*80)
+    
+    return 0
+
 # ============================================================================
 # Argument Parser Setup
 # ============================================================================
@@ -2909,7 +3024,6 @@ Examples:
   # Get help for specific subcommand
   %(prog)s plot-comparative --help
 
-For more information, see the documentation in the project memory bank.
         """
     )
     
@@ -3511,6 +3625,95 @@ Examples:
         help='Baseline window start in ms (default: from metadata, fallback 500)',
     )
     parser_csv.set_defaults(func=cmd_export_nested_csv)
+
+    # ========== export-per-cell-csv ==========
+    parser_export = subparsers.add_parser(
+        'export-per-cell-csv',
+        help='Export per-cell weights and firing rates to CSV',
+        description='Export detailed per-cell data for statistical analysis in R or Python',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic export with defaults
+  %(prog)s nested_results.h5
+  
+  # Custom output location and filename
+  %(prog)s nested_results.h5 -o analysis/ \\
+                             --csv-filename per_cell_data.csv
+  
+  # Export specific populations and intensities
+  %(prog)s nested_results.h5 \\
+      --target-populations pv \\
+      --post-populations gc mc \\
+      --source-populations gc mc pv sst mec \\
+      --intensities 1.0 1.5
+  
+  # Custom classification thresholds
+  %(prog)s nested_results.h5 \\
+      --threshold-std 1.5 \\
+      --expression-threshold 0.3
+
+Output CSV structure:
+  One row per (connectivity_idx, mec_pattern_idx, intensity, 
+               post_population, post_cell_idx)
+  
+  Columns include:
+  - Identifiers: connectivity_idx, mec_pattern_idx, intensity, 
+                  post_population, post_cell_idx
+  - Response: classification, baseline_rate, stim_rate, 
+              rate_change, modulation_ratio
+  - Opsin: post_opsin_expression, post_has_opsin (if target pop)
+  - Weights: For each source population:
+      - {source}_weight_sum, _mean, _median, _n_synapses
+      - If source == target: _opsin_plus and _opsin_minus variants
+
+Memory usage:
+  HDF5 format uses streaming approach (peak ~500 MB)
+  Processes one connectivity instance at a time
+        """
+    )
+    parser_export.add_argument('input',
+                               help='Nested experiment results file (*.h5)')
+    parser_export.add_argument('--csv-filename',
+                               type=str,
+                               default='per_cell_weights_and_rates.csv',
+                               metavar='FILENAME',
+                               help='Output CSV filename (default: per_cell_weights_and_rates.csv)')
+    parser_export.add_argument('--target-populations',
+                               type=str,
+                               nargs='+',
+                               default=None,
+                               metavar='POP',
+                               help='Target populations to export (default: pv sst)')
+    parser_export.add_argument('--post-populations',
+                               type=str,
+                               nargs='+',
+                               default=None,
+                               metavar='POP',
+                               help='Post-synaptic populations (default: gc mc pv sst)')
+    parser_export.add_argument('--source-populations',
+                               type=str,
+                               nargs='+',
+                               default=None,
+                               metavar='POP',
+                               help='Source populations for weights (default: gc mc pv sst)')
+    parser_export.add_argument('--intensities',
+                               type=float,
+                               nargs='+',
+                               default=None,
+                               metavar='INTENSITY',
+                               help='Intensities to export (default: all)')
+    parser_export.add_argument('--threshold-std',
+                               type=float,
+                               default=1.0,
+                               metavar='VALUE',
+                               help='Classification threshold in std (default: 1.0)')
+    parser_export.add_argument('--expression-threshold',
+                               type=float,
+                               default=0.2,
+                               metavar='VALUE',
+                               help='Opsin expression threshold (default: 0.2)')
+    parser_export.set_defaults(func=cmd_export_per_cell_csv)
     
     return parser
 

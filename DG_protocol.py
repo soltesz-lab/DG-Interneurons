@@ -52,6 +52,8 @@ from nested_experiment import (
     plot_variance_decomposition,
     plot_connectivity_instance_variance,
     plot_connectivity_instance_variance_detailed,
+    load_nested_experiment_seeds_and_opsin
+
 )
 from nested_effect_size import (
     analyze_effect_size_all_sources_nested,
@@ -1302,6 +1304,344 @@ def _run_paired_expression_condition(
     # Aggregate across connectivity instances
     return _aggregate_paired_ablation_results(per_conn_analyses, target)
 
+def _run_paired_failure_rate_condition(
+    circuit_params: CircuitParams,
+    synaptic_params: PerConnectionSynapticParams,
+    opsin_params: OpsinParams,  # Contains the failure_rate being tested
+    target: str,
+    intensity: float,
+    connectivity_seeds: List[int],
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    mec_current: float,
+    opsin_current: float,
+    optimization_json_file: Optional[str],
+    device: torch.device,
+    condition_label: str = '',
+    **optogenetic_experiment_kwargs,
+) -> Dict:
+    """
+    Run one failure rate condition across all connectivity instances (paired design).
+    
+    Similar to _run_paired_expression_condition, but generates fresh opsin
+    expressions at the failure rate specified in opsin_params rather than
+    varying expression levels. This allows the same circuit topology to be 
+    tested across different failure rates while keeping connectivity fixed.
+    
+    Args:
+        circuit_params: Circuit parameters
+        synaptic_params: Synaptic parameters (may include ablation modulations)
+        opsin_params: Opsin parameters with the desired failure_rate
+        target: Target population to stimulate
+        intensity: Light intensity
+        connectivity_seeds: Seeds for each connectivity instance
+        stim_start: Stimulation start time (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Baseline start (ms)
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        optimization_json_file: Path to optimization results
+        device: Torch device
+        condition_label: Label for logging
+        **optogenetic_experiment_kwargs: Forwarded to OptogeneticExperiment
+        
+    Returns:
+        Aggregated analysis dict with '_mean', '_std', '_sem', '_by_conn' keys
+        produced by _aggregate_paired_ablation_results.
+    """
+    from ablation_tests import _analyze_ablation_trial, _aggregate_paired_ablation_results
+    
+    n_conn = len(connectivity_seeds)
+    per_conn_analyses = []
+    
+    for conn_idx, conn_seed in enumerate(connectivity_seeds):
+        logger.info(
+            f"      {condition_label} conn {conn_idx + 1}/{n_conn} "
+            f"(seed={conn_seed}), failure_rate={opsin_params.failure_rate:.2f}"
+        )
+        
+        # Create experiment -- opsin expression is generated fresh from opsin_params
+        experiment = OptogeneticExperiment(
+            circuit_params,
+            synaptic_params,
+            opsin_params,
+            optimization_json_file=optimization_json_file,
+            device=device,
+            base_seed=conn_seed,
+            **optogenetic_experiment_kwargs,
+        )
+        
+        # Single-trial simulation with fixed connectivity
+        result = experiment.simulate_stimulation(
+            target_population=target,
+            light_intensity=intensity,
+            stim_start=stim_start,
+            stim_duration=stim_duration,
+            plot_activity=False,
+            mec_current=mec_current,
+            opsin_current=opsin_current,
+            n_trials=1,
+            regenerate_connectivity_per_trial=False,
+        )
+        
+        # Compute time masks
+        time = result['time']
+        baseline_mask = (time >= warmup) & (time < stim_start)
+        stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+        
+        # Reuse ablation analysis helper for consistent metrics
+        analysis = _analyze_ablation_trial(result, target, baseline_mask, stim_mask)
+        per_conn_analyses.append(analysis)
+        
+        # Free memory
+        del experiment
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    
+    # Aggregate across connectivity instances
+    return _aggregate_paired_ablation_results(per_conn_analyses, target)
+
+def test_opsin_failure_rates(
+    optimization_json_file: Optional[str] = None,
+    target_populations: List[str] = ['pv', 'sst'],
+    failure_rates: List[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    expression_mean: float = 0.8,  # Keep expression constant
+    intensity: float = 1.0,
+    mec_current: float = 100.0,
+    opsin_current: float = 100.0,
+    stim_start: float = 1500.0,
+    stim_duration: float = 1000.0,
+    warmup: float = 500.0,
+    device: Optional[torch.device] = None,
+    n_trials: int = 3,  # Ignored in paired mode
+    base_seed: int = 42,  # Ignored in paired mode
+    include_ablations: bool = False,
+    save_results_file: Optional[str] = None,
+    nested_experiment_file: Optional[str] = None,  # NEW: for paired mode
+    **optogenetic_experiment_kwargs
+) -> Dict:
+    """
+    Test how paradoxical excitation varies with opsin failure rate
+    
+    This test varies the opsin failure rate while keeping expression level
+    constant, measuring how paradoxical excitation changes. Optionally 
+    includes key ablation conditions to test mechanism robustness.
+    
+    When nested_experiment_file is specified, connectivity seeds are read
+    from the HDF5 file so that each failure rate is tested on the same
+    circuit realizations used in the nested experiment (paired mode).
+    In this mode n_trials and base_seed are ignored; one trial is run per
+    connectivity instance.
+    
+    Args:
+        optimization_json_file: Path to optimization results (optional)
+        target_populations: List of populations to stimulate
+        failure_rates: List of failure rates to test (0-1, 0=no failure, 1=complete failure)
+        expression_mean: Mean expression level (kept constant across failure rates)
+        intensity: Light intensity for stimulation
+        mec_current: MEC drive current (pA)
+        opsin_current: Optogenetic current (pA)
+        stim_start: When to start stimulation (ms)
+        stim_duration: Duration of stimulation (ms)
+        warmup: Pre-stimulation period (ms)
+        device: Device to run on (None for auto-detect)
+        n_trials: Number of trials to average per condition (ignored in paired mode)
+        base_seed: Base random seed (ignored in paired mode)
+        include_ablations: Whether to test ablation conditions
+        save_results_file: If provided, save results to this file
+        nested_experiment_file: Path to nested experiment HDF5 file.
+            When specified, connectivity seeds are loaded from this file
+            for paired comparisons across failure rates.
+            
+    Returns:
+        Dictionary with results for each failure rate and condition
+    """
+    if device is None:
+        device = get_default_device()
+
+    # Load connectivity seeds from nested experiment if specified
+    connectivity_seeds = None
+    paired_mode = False
+
+    if nested_experiment_file is not None:
+        logger.info(f"\nLoading connectivity from nested experiment: "
+                    f"{nested_experiment_file}")
+        nested_data = load_nested_experiment_seeds_and_opsin(
+            nested_experiment_file, target_populations
+        )
+        connectivity_seeds = nested_data['connectivity_seeds']
+        paired_mode = True
+        # Discard opsin_expressions - we're varying failure rates
+        logger.info(f"  Paired mode: {len(connectivity_seeds)} connectivity "
+                    f"instances (opsin expressions will be generated fresh)")
+
+    # Print header
+    logger.info("\n" + "="*80)
+    logger.info("TEST: Opsin Failure Rate Dependence")
+    logger.info("="*80)
+    logger.info(f"\nTesting {len(failure_rates)} failure rates:")
+    logger.info(f"  Failure rates: {failure_rates}")
+    logger.info(f"  Expression mean (constant): {expression_mean}")
+    if paired_mode:
+        logger.info(f"  Mode: PAIRED ({len(connectivity_seeds)} "
+                    f"connectivity instances)")
+    else:
+        logger.info(f"  Trials per condition: {n_trials}")
+    if include_ablations:
+        logger.info(f"  Including key ablation conditions")
+    logger.info("="*80 + "\n")
+
+    # Setup circuit parameters
+    circuit_params = CircuitParams()
+    base_synaptic_params = PerConnectionSynapticParams()
+
+    # Define ablation configurations if requested
+    ablation_configs = {'full_network': base_synaptic_params}
+
+    if include_ablations:
+        # Key ablation: Block excitation to interneurons (disinhibition test)
+        ablation_configs['blocked_exc_to_int'] = PerConnectionSynapticParams(
+            **{k: v for k, v in base_synaptic_params.__dict__.items()
+               if k != 'connection_modulation'},
+            connection_modulation={
+                **base_synaptic_params.connection_modulation,
+                'mec_pv': 0.01,
+                'gc_pv': 0.01,
+                'mc_pv': 0.01,
+                'gc_sst': 0.01,
+                'mc_sst': 0.01,
+            }
+        )
+
+    # Initialize results dictionary
+    results = {
+        config_name: {target: {} for target in target_populations}
+        for config_name in ablation_configs.keys()
+    }
+
+    for target in target_populations:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Testing {target.upper()} stimulation")
+        logger.info('='*60)
+        
+        for config_name, synaptic_params in ablation_configs.items():
+            logger.info(f"\n{config_name.replace('_', ' ').title()}")
+            logger.info('-'*60)
+            
+            for failure_rate in failure_rates:
+                logger.info(f"  Failure rate: {failure_rate:.2f}")
+                
+                # Create opsin parameters with this failure rate
+                opsin_params = OpsinParams(
+                    expression_mean=expression_mean,  # CONSTANT
+                    expression_std=0.05,
+                    failure_rate=failure_rate,  # VARYING
+                    light_decay=0.4,
+                    hill_coeff=2.5,
+                    half_sat=0.4
+                )
+                
+                # ---- paired-mode branch ----
+                if paired_mode:
+                    analysis = _run_paired_failure_rate_condition(
+                        circuit_params=circuit_params,
+                        synaptic_params=synaptic_params,
+                        opsin_params=opsin_params,
+                        target=target,
+                        intensity=intensity,
+                        connectivity_seeds=connectivity_seeds,
+                        stim_start=stim_start,
+                        stim_duration=stim_duration,
+                        warmup=warmup,
+                        mec_current=mec_current,
+                        opsin_current=opsin_current,
+                        optimization_json_file=optimization_json_file,
+                        device=device,
+                        condition_label=f'[{config_name}]',
+                        **optogenetic_experiment_kwargs,
+                    )
+                    analysis['failure_rate'] = failure_rate
+                    results[config_name][target][failure_rate] = analysis
+                
+                # ---- unpaired branch ----
+                else:
+                    # Create experiment
+                    experiment = OptogeneticExperiment(
+                        circuit_params, synaptic_params, opsin_params,
+                        optimization_json_file=optimization_json_file,
+                        device=device,
+                        base_seed=base_seed + int(failure_rate * 10000),
+                        **optogenetic_experiment_kwargs
+                    )
+                    
+                    # Run stimulation
+                    result = experiment.simulate_stimulation(
+                        target, intensity,
+                        stim_start=stim_start,
+                        stim_duration=stim_duration,
+                        plot_activity=False,
+                        mec_current=mec_current,
+                        opsin_current=opsin_current,
+                        n_trials=n_trials
+                    )
+                    
+                    # Analyze results
+                    time = result['time']
+                    activity_mean = result['activity_trace_mean']
+                    baseline_mask = (time >= warmup) & (time < stim_start)
+                    stim_mask = (time >= stim_start) & (
+                        time <= (stim_start + stim_duration))
+                    
+                    analysis = {'failure_rate': failure_rate}
+                    
+                    for pop in ['gc', 'mc', 'pv', 'sst']:
+                        if pop == target:
+                            continue
+                        
+                        baseline_rate = torch.mean(
+                            activity_mean[pop][:, baseline_mask], dim=1)
+                        stim_rate = torch.mean(
+                            activity_mean[pop][:, stim_mask], dim=1)
+                        rate_change = stim_rate - baseline_rate
+                        baseline_std = torch.std(baseline_rate)
+                        
+                        excited_fraction = torch.mean(
+                            (rate_change > baseline_std).float())
+                        
+                        analysis[f'{pop}_excited'] = excited_fraction.item()
+                        analysis[f'{pop}_mean_change'] = torch.mean(
+                            rate_change).item()
+                        
+                        # Get trial-to-trial variability
+                        if n_trials > 1:
+                            excited_fractions = []
+                            for trial_result in result['trial_results']:
+                                trial_activity = (
+                                    trial_result['activity_trace'][pop])
+                                trial_baseline = torch.mean(
+                                    trial_activity[:, baseline_mask], dim=1)
+                                trial_stim = torch.mean(
+                                    trial_activity[:, stim_mask], dim=1)
+                                trial_change = trial_stim - trial_baseline
+                                trial_baseline_std = torch.std(trial_baseline)
+                                trial_excited = torch.mean(
+                                    (trial_change > trial_baseline_std
+                                     ).float()).item()
+                                excited_fractions.append(trial_excited)
+                            
+                            analysis[f'{pop}_excited_std'] = np.std(
+                                excited_fractions)
+                    
+                    results[config_name][target][failure_rate] = analysis
+
+    # Save results if requested
+    if save_results_file:
+        with open(save_results_file, 'wb') as f:
+            pickle.dump(results, f)
+        logger.info(f"\nResults saved to: {save_results_file}")
+
+    return results
 
 def test_opsin_expression_levels(
     optimization_json_file: Optional[str] = None,
@@ -1366,7 +1706,6 @@ def test_opsin_expression_levels(
     paired_mode = False
 
     if nested_experiment_file is not None:
-        from nested_experiment import load_nested_experiment_seeds_and_opsin
 
         logger.info(f"\nLoading connectivity from nested experiment: "
                     f"{nested_experiment_file}")
@@ -3186,12 +3525,22 @@ For detailed analysis options, see: python DG_analysis.py --help
                        default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
                        help='Expression levels to test (default: 0.1 - 1.0 at 0.1 increments)')
     
+
+    # Failure rate test options
+    parser.add_argument('--failure-rates', action='store_true',
+                        help='Run failure rate tests')
+    parser.add_argument('--failure-rate-values', type=float, nargs='+',
+                        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+                        help='Failure rates to test (0-1, default: 0.0 to 0.9 at 0.1 increments)')
+    parser.add_argument('--expression-mean', type=float, default=0.8,
+                        help='Mean opsin expression for failure rate tests (default: 0.8)')
+
     args = parser.parse_args()
-    
+
     # Validate that at least one experiment type is selected
-    if not any([args.comparative, args.nested, args.ablations, args.expression, args.all]):
+    if not any([args.comparative, args.nested, args.ablations, args.expression, args.failure_rates, args.all]):
         parser.error("No experiment selected. Use --comparative, --nested, --ablations, "
-                    "--expression, or --all")
+                    "--expression, --failure, or --all")
     
     # Setup
     output_dir = args.output_dir
@@ -3358,7 +3707,7 @@ For detailed analysis options, see: python DG_analysis.py --help
             device=device,
             n_trials=args.n_trials,
             base_seed=args.base_seed,
-            include_ablations=True,
+            include_ablations=False,
             save_results_file=str(expression_output / "expression_results.pkl"),
             nested_experiment_file=args.nested_file,
             use_time_varying_mec=args.time_varying_mec,
@@ -3371,7 +3720,44 @@ For detailed analysis options, see: python DG_analysis.py --help
             mec_gamma_preferred_phase=args.mec_gamma_phase,
             mec_rotation_groups=args.mec_rotation_groups
         )
-    
+
+    # Failure rate tests
+    if args.failure_rates or args.all:
+        logger.info("\n" + "="*80)
+        logger.info("Running Failure Rate Tests")
+        logger.info("="*80)
+        
+        failure_output = output_path / "failure_rate_tests"
+        failure_output.mkdir(exist_ok=True)
+        
+        failure_results = test_opsin_failure_rates(
+            optimization_json_file=args.optimization_file,
+            target_populations=['pv', 'sst'],
+            failure_rates=args.failure_rate_values,
+            expression_mean=args.expression_mean,
+            intensity=1.5,
+            mec_current=args.mec_current,
+            opsin_current=args.opsin_current,
+            stim_start=args.stim_start,
+            stim_duration=args.stim_duration,
+            device=device,
+            n_trials=args.n_trials,
+            base_seed=args.base_seed,
+            include_ablations=True,
+            save_results_file=str(failure_output / "failure_rate_results.pkl"),
+            nested_experiment_file=args.nested_file,
+            # Forward time-varying MEC arguments if enabled
+            use_time_varying_mec=args.time_varying_mec,
+            mec_pattern_type=args.mec_pattern_type,
+            mec_theta_freq=args.mec_theta_freq,
+            mec_theta_amplitude=args.mec_theta_amplitude,
+            mec_gamma_freq=args.mec_gamma_freq,
+            mec_gamma_amplitude=args.mec_gamma_amplitude,
+            mec_gamma_coupling_strength=args.mec_gamma_coupling,
+            mec_gamma_preferred_phase=args.mec_gamma_phase,
+            mec_rotation_groups=args.mec_rotation_groups
+        )
+        
     # Summary
     logger.info("\n" + "="*80)
     logger.info("All experiments complete!")

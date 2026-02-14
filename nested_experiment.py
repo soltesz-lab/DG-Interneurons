@@ -25,6 +25,8 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import logging
+import time
+import tqdm
 
 import h5py
 from hdf5_storage import (
@@ -32,6 +34,7 @@ from hdf5_storage import (
     save_trial_to_hdf5,
     load_trial_from_hdf5,
     load_metadata_from_hdf5,
+    load_nested_trials_from_hdf5,
     extract_trial_statistics_from_hdf5
 )
 
@@ -2472,7 +2475,7 @@ def load_nested_experiment_seeds_and_opsin(
             intensity_key = intensity_keys[0]
             
             for conn_idx in range(len(connectivity_seeds)):
-                conn_key = f'conn_{conn_idx}'
+                conn_key = f'connectivity_{conn_idx}'
                 if conn_key not in f[target][intensity_key]:
                     logger.warning(
                         f"Missing conn_{conn_idx} for {target}/{intensity_key}"
@@ -2912,8 +2915,6 @@ def export_nested_experiment_csv_from_hdf5(
     Returns:
         Number of rows written.
     """
-    import h5py
-    from hdf5_storage import load_metadata_from_hdf5, load_nested_trials_from_hdf5
 
     metadata = load_metadata_from_hdf5(hdf5_filepath)
     n_connectivity = metadata['n_connectivity_instances']
@@ -2985,3 +2986,814 @@ def export_nested_experiment_csv_from_hdf5(
 
     logger.info(f"Exported {n_rows} rows to {csv_path}")
     return n_rows
+
+
+def export_per_cell_weights_to_csv(
+    classifications: Dict,
+    circuit,
+    source_populations: List[str],
+    post_population: str,
+    target_population: str,
+    trials_by_connectivity: Dict,
+    expression_threshold: float,
+    csv_path: str
+) -> None:
+    """
+    Export per-cell weight statistics to CSV.
+    
+    Each row represents one post-synaptic cell with:
+    - Connectivity instance ID
+    - Post-synaptic cell information (population, unit ID, opsin expression, classification)
+    - For each presynaptic source: sum, mean, median of incoming weights
+    - If presynaptic source is stimulated (opsin-expressing), separate stats for opsin+/- sources
+    
+    Args:
+        classifications: Output from classify_cells_by_connectivity()
+        circuit: DentateCircuit instance
+        source_populations: List of source populations to analyze
+        post_population: Post-synaptic population name
+        target_population: Stimulated population name
+        trials_by_connectivity: Organized trials by connectivity
+        expression_threshold: Opsin expression threshold
+        csv_path: Path to save CSV file
+    """
+    import csv
+    
+    # Collect all cell data
+    cell_records = []
+    
+    for conn_idx in sorted(classifications.keys()):
+        conn_data = classifications[conn_idx]
+
+        # Get all cell indices for this connectivity
+        all_cell_indices = set()
+        all_cell_indices.update(conn_data['excited_cells'])
+        all_cell_indices.update(conn_data['suppressed_cells'])
+        all_cell_indices.update(conn_data['unchanged_cells'])
+        
+        # Get opsin expression from trials for this connectivity
+        trials = trials_by_connectivity[conn_idx]
+        if len(trials) == 0:
+            continue
+        
+        # Get opsin expression from first trial (same for all trials in connectivity)
+        opsin_expression = trials[0].opsin_expression
+        if hasattr(opsin_expression, 'cpu'):
+            opsin_expression = opsin_expression.cpu().numpy()
+        
+        for cell_idx in sorted(all_cell_indices):
+            # Determine classification
+            if cell_idx in conn_data['excited_cells']:
+                classification = 'excited'
+            elif cell_idx in conn_data['suppressed_cells']:
+                classification = 'suppressed'
+            else:
+                classification = 'unchanged'
+            
+            # Determine opsin expression for post-synaptic cell
+            post_opsin_expr = None
+            post_has_opsin = None
+            if post_population == target_population:
+                post_opsin_expr = float(opsin_expression[cell_idx])
+                post_has_opsin = post_opsin_expr >= expression_threshold
+            
+            # Build record
+            record = {
+                'connectivity_idx': conn_idx,
+                'post_population': post_population,
+                'post_cell_idx': cell_idx,
+                'classification': classification
+            }
+            
+            # Add opsin expression if applicable
+            if post_population == target_population:
+                record['post_opsin_expression'] = post_opsin_expr
+                record['post_has_opsin'] = post_has_opsin
+            
+            # For each source population, get weight statistics
+            for source_pop in source_populations:
+                # Get weights from source to this target cell
+                conn_name = f'{source_pop}_{post_population}'
+                
+                if conn_name not in circuit.connectivity.conductance_matrices:
+                    # No connection from this source to post population
+                    record[f'{source_pop}_weight_sum'] = 0.0
+                    record[f'{source_pop}_weight_mean'] = 0.0
+                    record[f'{source_pop}_weight_median'] = 0.0
+                    record[f'{source_pop}_n_synapses'] = 0
+                    
+                    if source_pop == target_population:
+                        record[f'{source_pop}_opsin_plus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_plus_n_synapses'] = 0
+                        record[f'{source_pop}_opsin_minus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_minus_n_synapses'] = 0
+                    continue
+                
+                cond_matrix = circuit.connectivity.conductance_matrices[conn_name]
+                weight_matrix = cond_matrix.conductances  # [n_pre, n_post]
+                
+                # Convert to numpy for easier indexing
+                if hasattr(weight_matrix, 'cpu'):
+                    weight_matrix_np = weight_matrix.cpu().numpy()
+                else:
+                    weight_matrix_np = np.array(weight_matrix)
+                
+                weights_to_cell = weight_matrix_np[:, cell_idx]
+                
+                # Filter non-zero weights
+                weights_to_cell = weights_to_cell[weights_to_cell > 0]
+                
+                # Basic statistics
+                if len(weights_to_cell) > 0:
+                    record[f'{source_pop}_weight_sum'] = float(np.sum(weights_to_cell))
+                    record[f'{source_pop}_weight_mean'] = float(np.mean(weights_to_cell))
+                    record[f'{source_pop}_weight_median'] = float(np.median(weights_to_cell))
+                    record[f'{source_pop}_n_synapses'] = int(len(weights_to_cell))
+                else:
+                    record[f'{source_pop}_weight_sum'] = 0.0
+                    record[f'{source_pop}_weight_mean'] = 0.0
+                    record[f'{source_pop}_weight_median'] = 0.0
+                    record[f'{source_pop}_n_synapses'] = 0
+                
+                # If source is stimulated population, separate by opsin expression
+                if source_pop == target_population:
+                    # Create opsin masks
+                    opsin_plus_mask = opsin_expression >= expression_threshold
+                    opsin_minus_mask = opsin_expression < expression_threshold
+                    
+                    # Get weights from opsin+ sources
+                    weights_from_opsin_plus = weight_matrix_np[opsin_plus_mask, cell_idx]
+                    weights_from_opsin_plus = weights_from_opsin_plus[weights_from_opsin_plus > 0]
+                    
+                    if len(weights_from_opsin_plus) > 0:
+                        record[f'{source_pop}_opsin_plus_weight_sum'] = float(np.sum(weights_from_opsin_plus))
+                        record[f'{source_pop}_opsin_plus_weight_mean'] = float(np.mean(weights_from_opsin_plus))
+                        record[f'{source_pop}_opsin_plus_weight_median'] = float(np.median(weights_from_opsin_plus))
+                        record[f'{source_pop}_opsin_plus_n_synapses'] = int(len(weights_from_opsin_plus))
+                    else:
+                        record[f'{source_pop}_opsin_plus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_plus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_plus_n_synapses'] = 0
+                    
+                    # Get weights from opsin- sources
+                    weights_from_opsin_minus = weight_matrix_np[opsin_minus_mask, cell_idx]
+                    weights_from_opsin_minus = weights_from_opsin_minus[weights_from_opsin_minus > 0]
+                    
+                    if len(weights_from_opsin_minus) > 0:
+                        record[f'{source_pop}_opsin_minus_weight_sum'] = float(np.sum(weights_from_opsin_minus))
+                        record[f'{source_pop}_opsin_minus_weight_mean'] = float(np.mean(weights_from_opsin_minus))
+                        record[f'{source_pop}_opsin_minus_weight_median'] = float(np.median(weights_from_opsin_minus))
+                        record[f'{source_pop}_opsin_minus_n_synapses'] = int(len(weights_from_opsin_minus))
+                    else:
+                        record[f'{source_pop}_opsin_minus_weight_sum'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_mean'] = 0.0
+                        record[f'{source_pop}_opsin_minus_weight_median'] = 0.0
+                        record[f'{source_pop}_opsin_minus_n_synapses'] = 0
+            
+            cell_records.append(record)
+    
+    # Write to CSV
+    if len(cell_records) > 0:
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Get all field names (some records may have opsin fields, others may not)
+        all_fieldnames = set()
+        for record in cell_records:
+            all_fieldnames.update(record.keys())
+        
+        # Order fieldnames logically
+        fieldnames = ['connectivity_idx', 'post_population', 'post_cell_idx', 'classification']
+        
+        # Add opsin fields if present
+        if 'post_opsin_expression' in all_fieldnames:
+            fieldnames.extend(['post_opsin_expression', 'post_has_opsin'])
+        
+        # Add source population fields in order
+        for source_pop in source_populations:
+            source_fields = [f for f in all_fieldnames if f.startswith(f'{source_pop}_')]
+            # Sort to get: weight_sum, weight_mean, weight_median, n_synapses, then opsin variants
+            source_fields_sorted = sorted(source_fields, key=lambda x: (
+                'opsin' in x,  # Regular fields first, then opsin fields
+                'minus' in x,  # opsin_plus before opsin_minus
+                x.split('_')[-1]  # Then by statistic type
+            ))
+            fieldnames.extend(source_fields_sorted)
+        
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(cell_records)
+        
+        print(f"Exported per-cell weight data to: {csv_path}")
+        print(f"  Total cells: {len(cell_records)}")
+        print(f"  Connectivity instances: {len(set(r['connectivity_idx'] for r in cell_records))}")
+
+
+
+def _build_per_cell_csv_fieldnames(
+    source_populations: Tuple[str, ...],
+    target_population: str,
+) -> List[str]:
+    """
+    Build ordered list of CSV column names for per-cell export.
+    
+    Structure:
+    - Identifiers: connectivity_idx, mec_pattern_idx, intensity, 
+                   post_population, post_cell_idx
+    - Response: classification, baseline_rate, stim_rate, rate_change, 
+                modulation_ratio
+    - Opsin (if target): post_opsin_expression, post_has_opsin
+    - For each source population:
+        - Overall: sum, mean, median, n_synapses
+        - If source == target: separate opsin_plus and opsin_minus stats
+    
+    Args:
+        source_populations: Pre-synaptic populations to analyze
+        target_population: Which population is optogenetically stimulated
+        
+    Returns:
+        Ordered list of field names
+    """
+    # Identifier columns
+    id_cols = [
+        'connectivity_idx',
+        'mec_pattern_idx', 
+        'intensity',
+        'post_population',
+        'post_cell_idx',
+    ]
+    
+    # Response columns
+    response_cols = [
+        'classification',  # excited, suppressed, unchanged
+        'baseline_rate',
+        'stim_rate',
+        'rate_change',
+        'modulation_ratio',
+    ]
+    
+    # Opsin columns (for target population cells)
+    opsin_cols = [
+        'post_opsin_expression',
+        'post_has_opsin',
+    ]
+    
+    # Weight statistics columns (per source population)
+    weight_stats = [
+        'weight_sum',
+        'weight_mean', 
+        'weight_median',
+        'n_synapses',
+    ]
+    
+    # Build source population columns
+    source_cols = []
+    for source_pop in source_populations:
+        # Overall weight statistics
+        for stat in weight_stats:
+            source_cols.append(f'{source_pop}_{stat}')
+        
+        # If this source is the target, add opsin-specific columns
+        if source_pop == target_population:
+            for stat in weight_stats:
+                source_cols.append(f'{source_pop}_opsin_plus_{stat}')
+            for stat in weight_stats:
+                source_cols.append(f'{source_pop}_opsin_minus_{stat}')
+    
+    # Combine all fieldnames
+    return id_cols + response_cols + opsin_cols + source_cols
+
+
+def _compute_per_cell_response_stats(
+    activity: torch.Tensor,
+    time: np.ndarray,
+    cell_idx: int,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    threshold_std: float = 1.0,
+) -> Dict:
+    """
+    Compute response statistics for a single cell.
+    
+    Args:
+        activity: Activity tensor [n_cells, n_timesteps]
+        time: Time array (ms)
+        cell_idx: Index of cell to analyze
+        stim_start: Stimulation onset (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Baseline window start (ms)
+        threshold_std: Classification threshold in baseline std units
+        
+    Returns:
+        Dict with baseline_rate, stim_rate, rate_change, 
+        modulation_ratio, classification
+    """
+    baseline_mask = (time >= warmup) & (time < stim_start)
+    stim_mask = (time >= stim_start) & (time <= (stim_start + stim_duration))
+    
+    # Extract single cell activity
+    cell_activity = activity[cell_idx, :]
+    
+    # Compute rates
+    baseline_rate = torch.mean(cell_activity[baseline_mask]).item()
+    stim_rate = torch.mean(cell_activity[stim_mask]).item()
+    rate_change = stim_rate - baseline_rate
+    
+    # Modulation ratio: log2(stim / baseline)
+    eps = 1e-6
+    if baseline_rate > eps:
+        modulation_ratio = float(np.log2(stim_rate / baseline_rate))
+    else:
+        modulation_ratio = float('nan')
+    
+    # Classification (using population-level baseline std for consistency)
+    population_baseline = torch.mean(activity[:, baseline_mask], dim=1)
+    baseline_std = torch.std(population_baseline).item()
+    threshold = threshold_std * baseline_std
+    
+    if rate_change > threshold:
+        classification = 'excited'
+    elif rate_change < -threshold:
+        classification = 'suppressed'
+    else:
+        classification = 'unchanged'
+    
+    return {
+        'baseline_rate': baseline_rate,
+        'stim_rate': stim_rate,
+        'rate_change': rate_change,
+        'modulation_ratio': modulation_ratio,
+        'classification': classification,
+    }
+
+
+def _extract_incoming_weights(
+    circuit,
+    source_pop: str,
+    post_pop: str,
+    post_cell_idx: int,
+    source_opsin_expression: Optional[np.ndarray] = None,
+    expression_threshold: float = 0.2,
+) -> Dict:
+    """
+    Extract incoming synaptic weights for a single post-synaptic cell.
+    
+    Args:
+        circuit: DentateCircuit instance
+        source_pop: Pre-synaptic population name
+        post_pop: Post-synaptic population name
+        post_cell_idx: Index of post-synaptic cell
+        source_opsin_expression: Opsin expression levels for source population
+                                 (if source is target population)
+        expression_threshold: Threshold for opsin-expressing classification
+        
+    Returns:
+        Dict with weight statistics (sum, mean, median, n_synapses)
+        and optionally opsin_plus/opsin_minus variants
+    """
+    conn_name = f'{source_pop}_{post_pop}'
+    
+    # Check if connection exists
+    if conn_name not in circuit.connectivity.conductance_matrices:
+        stats = {
+            'weight_sum': 0.0,
+            'weight_mean': 0.0,
+            'weight_median': 0.0,
+            'n_synapses': 0,
+        }
+        
+        # Add opsin variants if source has opsin expression
+        if source_opsin_expression is not None:
+            for suffix in ['opsin_plus', 'opsin_minus']:
+                stats[f'{suffix}_weight_sum'] = 0.0
+                stats[f'{suffix}_weight_mean'] = 0.0
+                stats[f'{suffix}_weight_median'] = 0.0
+                stats[f'{suffix}_n_synapses'] = 0
+        
+        return stats
+    
+    # Get conductance matrix [n_pre, n_post]
+    cond_matrix = circuit.connectivity.conductance_matrices[conn_name]
+    weight_matrix = cond_matrix.conductances
+    
+    # Convert to numpy
+    if hasattr(weight_matrix, 'cpu'):
+        weight_matrix_np = weight_matrix.cpu().numpy()
+    else:
+        weight_matrix_np = np.array(weight_matrix)
+    
+    # Extract weights to this post-synaptic cell
+    weights_to_cell = weight_matrix_np[:, post_cell_idx]
+    
+    # Filter non-zero weights (actual synapses)
+    nonzero_mask = weights_to_cell > 0
+    weights_to_cell = weights_to_cell[nonzero_mask]
+    
+    # Overall statistics
+    stats = {}
+    if len(weights_to_cell) > 0:
+        stats['weight_sum'] = float(np.sum(weights_to_cell))
+        stats['weight_mean'] = float(np.mean(weights_to_cell))
+        stats['weight_median'] = float(np.median(weights_to_cell))
+        stats['n_synapses'] = int(len(weights_to_cell))
+    else:
+        stats['weight_sum'] = 0.0
+        stats['weight_mean'] = 0.0
+        stats['weight_median'] = 0.0
+        stats['n_synapses'] = 0
+    
+    # Opsin-specific statistics (if source is target population)
+    if source_opsin_expression is not None:
+        # Create masks for opsin-expressing vs non-expressing sources
+        opsin_plus_mask = (source_opsin_expression >= expression_threshold) & nonzero_mask
+        opsin_minus_mask = (source_opsin_expression < expression_threshold) & nonzero_mask
+        
+        # Opsin-expressing sources
+        weights_opsin_plus = weight_matrix_np[opsin_plus_mask, post_cell_idx]
+        if len(weights_opsin_plus) > 0:
+            stats['opsin_plus_weight_sum'] = float(np.sum(weights_opsin_plus))
+            stats['opsin_plus_weight_mean'] = float(np.mean(weights_opsin_plus))
+            stats['opsin_plus_weight_median'] = float(np.median(weights_opsin_plus))
+            stats['opsin_plus_n_synapses'] = int(len(weights_opsin_plus))
+        else:
+            stats['opsin_plus_weight_sum'] = 0.0
+            stats['opsin_plus_weight_mean'] = 0.0
+            stats['opsin_plus_weight_median'] = 0.0
+            stats['opsin_plus_n_synapses'] = 0
+        
+        # Non-expressing sources
+        weights_opsin_minus = weight_matrix_np[opsin_minus_mask, post_cell_idx]
+        if len(weights_opsin_minus) > 0:
+            stats['opsin_minus_weight_sum'] = float(np.sum(weights_opsin_minus))
+            stats['opsin_minus_weight_mean'] = float(np.mean(weights_opsin_minus))
+            stats['opsin_minus_weight_median'] = float(np.median(weights_opsin_minus))
+            stats['opsin_minus_n_synapses'] = int(len(weights_opsin_minus))
+        else:
+            stats['opsin_minus_weight_sum'] = 0.0
+            stats['opsin_minus_weight_mean'] = 0.0
+            stats['opsin_minus_weight_median'] = 0.0
+            stats['opsin_minus_n_synapses'] = 0
+    
+    return stats
+
+
+def _generate_per_cell_rows_for_trial(
+    trial_data: Dict,
+    circuit,
+    connectivity_idx: int,
+    mec_pattern_idx: int,
+    target_population: str,
+    intensity: float,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    threshold_std: float,
+    expression_threshold: float,
+    source_populations: Tuple[str, ...],
+    post_populations: Tuple[str, ...],
+    opsin_expression: np.ndarray,
+) -> Iterator[Dict]:
+    """
+    Generate CSV rows for all cells in a single trial.
+    
+    Yields one row per (post_population, cell_idx) combination.
+    
+    Args:
+        trial_data: Trial results from load_trial_from_hdf5
+        circuit: Reconstructed DentateCircuit for this connectivity
+        connectivity_idx: Connectivity instance index
+        mec_pattern_idx: MEC pattern index
+        target_population: Stimulated population
+        intensity: Light intensity
+        stim_start: Stimulation onset (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Baseline window start (ms)
+        threshold_std: Classification threshold
+        expression_threshold: Opsin threshold
+        source_populations: Pre-synaptic populations to analyze
+        post_populations: Post-synaptic populations to analyze
+        opsin_expression: Opsin expression for target population
+        
+    Yields:
+        One dict per cell (CSV row)
+    """
+    # Get activity traces
+    if 'activity_trace_mean' in trial_data:
+        activity_dict = trial_data['activity_trace_mean']
+    elif 'activity_trace' in trial_data:
+        activity_dict = trial_data['activity_trace']
+    else:
+        raise KeyError("Trial data missing activity traces")
+    
+    time = trial_data['time']
+    if isinstance(time, torch.Tensor):
+        time = time.cpu().numpy()
+    else:
+        time = np.asarray(time)
+    
+    # Process each post-synaptic population
+    for post_pop in post_populations:
+        pop_activity = activity_dict[post_pop]
+        if isinstance(pop_activity, np.ndarray):
+            pop_activity = torch.from_numpy(pop_activity)
+        
+        n_cells = pop_activity.shape[0]
+        
+        # Determine if this is the target population
+        is_target_pop = (post_pop == target_population)
+        
+        # Process each cell
+        for cell_idx in range(n_cells):
+            # Base row data
+            row = {
+                'connectivity_idx': connectivity_idx,
+                'mec_pattern_idx': mec_pattern_idx,
+                'intensity': intensity,
+                'post_population': post_pop,
+                'post_cell_idx': cell_idx,
+            }
+            
+            # Compute response statistics
+            response_stats = _compute_per_cell_response_stats(
+                pop_activity, time, cell_idx,
+                stim_start, stim_duration, warmup, threshold_std
+            )
+            row.update(response_stats)
+            
+            # Add opsin expression if target population
+            if is_target_pop:
+                post_opsin_expr = float(opsin_expression[cell_idx])
+                row['post_opsin_expression'] = post_opsin_expr
+                row['post_has_opsin'] = post_opsin_expr >= expression_threshold
+            else:
+                row['post_opsin_expression'] = float('nan')
+                row['post_has_opsin'] = False
+            
+            # Extract incoming weights from each source population
+            for source_pop in source_populations:
+                # Determine if source has opsin expression data
+                source_opsin_expr = (
+                    opsin_expression if source_pop == target_population
+                    else None
+                )
+                
+                # Get weight statistics
+                weight_stats = _extract_incoming_weights(
+                    circuit, source_pop, post_pop, cell_idx,
+                    source_opsin_expr, expression_threshold
+                )
+                
+                # Add to row with source population prefix
+                for key, value in weight_stats.items():
+                    row[f'{source_pop}_{key}'] = value
+            
+            yield row
+
+
+def export_per_cell_weights_from_hdf5(
+    hdf5_filepath: str,
+    csv_path: str,
+    stim_start: float,
+    stim_duration: float,
+    warmup: float,
+    optimization_json_file: Optional[str] = None,
+    threshold_std: float = 1.0,
+    expression_threshold: float = 0.2,
+    source_populations: Tuple[str, ...] = ('gc', 'mc', 'pv', 'sst'),
+    post_populations: Tuple[str, ...] = ('gc', 'mc', 'pv', 'sst'),
+    target_populations: Optional[List[str]] = None,
+    intensities: Optional[List[float]] = None,
+    device: Optional[torch.device] = None,
+) -> int:
+    """
+    Export per-cell weights and firing rates to CSV from HDF5 nested experiment.
+    
+    Memory-efficient streaming approach that processes one connectivity 
+    instance at a time, reconstructing circuits on-demand and loading 
+    trials incrementally from HDF5.
+    
+    Output CSV structure:
+    - One row per (connectivity_idx, mec_pattern_idx, intensity, 
+                   post_population, post_cell_idx)
+    - Columns: identifiers, response stats, opsin info (if target), 
+               incoming weights from each source population
+    
+    Args:
+        hdf5_filepath: Path to nested experiment HDF5 file
+        csv_path: Output CSV file path
+        stim_start: Stimulation onset (ms)
+        stim_duration: Stimulation duration (ms)
+        warmup: Baseline window start (ms)
+        optimization_json_file: Path to optimization results 
+                                (overrides HDF5 metadata)
+        threshold_std: Classification threshold in baseline std units
+        expression_threshold: Opsin expression threshold
+        source_populations: Pre-synaptic populations to analyze
+        post_populations: Post-synaptic populations to include
+        target_populations: Targets to export (default: all in HDF5)
+        intensities: Intensities to export (default: all in HDF5)
+        device: PyTorch device for circuit reconstruction
+        
+    Returns:
+        Number of rows written
+        
+    Example:
+        >>> n_rows = export_per_cell_weights_from_hdf5(
+        ...     'results/nested_experiment.h5',
+        ...     'analysis/per_cell_weights.csv',
+        ...     stim_start=1500.0,
+        ...     stim_duration=1000.0,
+        ...     warmup=500.0,
+        ...     optimization_json_file='protocol/optimization_results.json'
+        ... )
+        >>> print(f"Exported {n_rows} rows")
+    """
+    from DG_protocol import (
+        OptogeneticExperiment, CircuitParams, PerConnectionSynapticParams,
+        OpsinParams, set_random_seed, get_default_device
+    )
+    
+    # Setup
+    if device is None:
+        device = get_default_device()
+    
+    # Load metadata
+    metadata = load_metadata_from_hdf5(hdf5_filepath)
+    seed_structure = metadata['seed_structure']
+    connectivity_seeds = seed_structure['connectivity_seeds']
+    n_connectivity = metadata['n_connectivity_instances']
+    n_mec_patterns = metadata['n_mec_patterns_per_connectivity']
+    
+    # Get optimization file from metadata if not provided
+    if optimization_json_file is None:
+        optimization_json_file = metadata.get('optimization_file')
+    
+    # Determine which targets and intensities to process
+    if target_populations is None:
+        target_populations = ['pv', 'sst']
+    
+    logger.info(
+        f"\nExporting per-cell weights and firing rates from {hdf5_filepath}\n"
+        f"  Connectivity instances: {n_connectivity}\n"
+        f"  MEC patterns per connectivity: {n_mec_patterns}\n"
+        f"  Target populations: {target_populations}\n"
+        f"  Source populations: {source_populations}\n"
+        f"  Post populations: {post_populations}"
+    )
+    
+    # Open HDF5 and CSV files
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    n_rows = 0
+    batch_size = 5000  # Write in batches for better performance
+    row_batch = []
+    
+    with h5py.File(hdf5_filepath, 'r') as hdf5_file:
+        # We'll write to CSV for the first target to determine fieldnames
+        # Then we know the structure for subsequent targets
+        
+        # Determine fieldnames from first target
+        first_target = target_populations[0]
+        fieldnames = _build_per_cell_csv_fieldnames(
+            source_populations, first_target
+        )
+        
+        with open(csv_path, 'w', newline='') as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=fieldnames,
+                extrasaction='ignore',
+                restval='',
+            )
+            writer.writeheader()
+            
+            # Process each connectivity instance
+            for conn_idx in range(n_connectivity):
+                connectivity_seed = connectivity_seeds[conn_idx]
+                
+                logger.info(
+                    f"\nProcessing connectivity instance {conn_idx + 1}/{n_connectivity} "
+                    f"(seed: {connectivity_seed})"
+                )
+                
+                # Reconstruct circuit with this connectivity seed
+                circuit_params = CircuitParams()
+                synaptic_params = PerConnectionSynapticParams()
+                opsin_params = OpsinParams()
+                
+                experiment = OptogeneticExperiment(
+                    circuit_params,
+                    synaptic_params,
+                    opsin_params,
+                    optimization_json_file=optimization_json_file,
+                    device=device,
+                    base_seed=connectivity_seed,
+                )
+
+                # Process each target population
+                for target in target_populations:
+                    if target not in hdf5_file:
+                        logger.warning(f"  Target '{target}' not in HDF5, skipping")
+                        continue
+                    
+                    # Discover available intensities
+                    available_intensities = [
+                        float(k.split('_')[1])
+                        for k in hdf5_file[target].keys()
+                        if k.startswith('intensity_')
+                    ]
+                    
+                    iter_intensities = (
+                        sorted(available_intensities)
+                        if intensities is None
+                        else [i for i in intensities if i in available_intensities]
+                    )
+                    
+                    # Get opsin expression for target population (same across all trials)
+                    # Load from first available trial
+                    if iter_intensities:
+                        intensity_key = f'intensity_{iter_intensities[0]}'
+                        conn_key = f'connectivity_{conn_idx}'
+                        pattern_key = 'pattern_0'
+                        
+                        if (conn_key in hdf5_file[target][intensity_key] and
+                            pattern_key in hdf5_file[target][intensity_key][conn_key]):
+                            trial_grp = hdf5_file[target][intensity_key][conn_key][pattern_key]
+                            if 'opsin_expression' in trial_grp:
+                                opsin_expression = trial_grp['opsin_expression'][:]
+                            else:
+                                # Fallback: create zero array
+                                n_target_cells = getattr(circuit_params, f'n_{target}')
+                                opsin_expression = np.zeros(n_target_cells)
+                        else:
+                            n_target_cells = getattr(circuit_params, f'n_{target}')
+                            opsin_expression = np.zeros(n_target_cells)
+
+                    else:
+                        n_target_cells = getattr(circuit_params, f'n_{target}')
+                        opsin_expression = np.zeros(n_target_cells)
+                    
+                    # Process each intensity
+                    for intensity in iter_intensities:
+                        logger.info(f"  {target.upper()} intensity={intensity}")
+                        
+                        # Process each MEC pattern
+                        for mec_idx in range(n_mec_patterns):
+                            # Load trial from HDF5
+                            trial_data = load_trial_from_hdf5(
+                                hdf5_file, target, intensity, conn_idx, mec_idx
+                            )
+                            
+                            # Generate rows for all cells in this trial
+                            for row in tqdm.tqdm(_generate_per_cell_rows_for_trial(
+                                trial_data=trial_data,
+                                circuit=experiment.circuit,
+                                connectivity_idx=conn_idx,
+                                mec_pattern_idx=mec_idx,
+                                target_population=target,
+                                intensity=intensity,
+                                stim_start=stim_start,
+                                stim_duration=stim_duration,
+                                warmup=warmup,
+                                threshold_std=threshold_std,
+                                expression_threshold=expression_threshold,
+                                source_populations=source_populations,
+                                post_populations=post_populations,
+                                opsin_expression=opsin_expression,
+                            )):
+                                row_batch.append(row)
+                                n_rows += 1
+
+                                # Write batch when it reaches batch_size
+                                if len(row_batch) >= batch_size:
+                                    writer.writerows(row_batch)
+                                    row_batch = []
+                                    csv_file.flush()
+                            
+                            # Periodic progress update
+                            if (mec_idx + 1) % 5 == 0:
+                                logger.info(
+                                    f"    Completed {mec_idx + 1}/{n_mec_patterns} "
+                                    f"MEC patterns ({n_rows} total rows)"
+                                )
+
+                # Write any remaining rows in batch
+                if row_batch:
+                    writer.writerows(row_batch)
+                    row_batch = []
+                    csv_file.flush()
+                # Clean up circuit to free memory
+                del experiment
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+    
+    logger.info(f"\nExport complete: {n_rows} rows written to {csv_path}")
+    return n_rows        

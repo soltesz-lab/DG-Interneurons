@@ -12,6 +12,7 @@ import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import logging
+from collections import namedtuple
 
 logger = logging.getLogger('hdf5_storage')
 logger.setLevel(logging.INFO)
@@ -245,7 +246,8 @@ def load_nested_trials_from_hdf5(
     intensity: float,
     n_connectivity: int,
     n_mec_patterns: int,
-    require_full_activity: bool = True
+    require_full_activity: bool = True,
+    conn_idx_filter: Optional[List] = None
 ) -> List:
     """
     Load all trials for a given condition as NestedTrialResult objects
@@ -264,7 +266,6 @@ def load_nested_trials_from_hdf5(
     Raises:
         ValueError: If require_full_activity=True and traces not available
     """
-    from collections import namedtuple
     
     # Define minimal NestedTrialResult structure
     NestedTrialResult = namedtuple('NestedTrialResult', 
@@ -280,6 +281,9 @@ def load_nested_trials_from_hdf5(
     has_full_activity = None  # Will be determined from first trial
     
     for conn_idx in range(n_connectivity):
+        if (conn_idx_filter is not None) and conn_idx not in conn_idx_filter:
+            continue
+        
         conn_key = f"connectivity_{conn_idx}"
         
         if conn_key not in f[target][intensity_key]:
