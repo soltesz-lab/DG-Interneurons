@@ -9,6 +9,7 @@ Available Commands:
     plot-ablations           Plot ablation test results
     plot-weights             Plot synaptic weight distributions
     plot-expression          Plot expression level dependence
+    plot-failure             Plot failure rate dependence
     plot-combined            Generate combined ablation + expression figure
     plot-currents            Plot synaptic currents
     plot-connectivity-activity  Plot aggregated activity for specific connectivity instance
@@ -764,8 +765,8 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
         ax = plt.subplot(3, 4, 7 + i)
         
         opsin_expression = results[target][stimulation_level]['opsin_expression_mean']
-        
-        if has_multitrial:
+
+        if has_multitrial or (f'{target}_stim_rates_mean' in results[target][stimulation_level]):
             stim_rates = results[target][stimulation_level][f'{target}_stim_rates_mean'][opsin_expression <= 0.2]
             baseline_rates = results[target][stimulation_level][f'{target}_baseline_rates_mean'][opsin_expression <= 0.2]
         else:
@@ -903,6 +904,194 @@ def plot_comparative_experiment_results(results: Dict, conn_analysis: Dict,
                    dpi=300, bbox_inches='tight')
     
     plt.show()
+
+
+def plot_failure_rate_overlay(
+    results: Dict,
+    save_path: Optional[str] = None,
+    error_type: str = 'sem',
+    figsize: Optional[Tuple[float, float]] = None,
+    show_legend: bool = True,
+) -> plt.Figure:
+    """
+    Plot failure rate results with all cell types overlaid on the same axes.
+    
+    Shows fraction excited (%) vs fraction of opsin-expressing cells with 
+    functional opsins (%).  The x-axis represents the effective expression
+    accounting for failure rate: (1 - failure_rate) * expression_mean * 100.
+
+    For each target population (PV, SST), creates one panel per ablation
+    config showing fraction excited vs effective expression for all cell 
+    types as colored lines.
+
+    Args:
+        results: Dictionary from test_opsin_failure_rates().
+            Structure: results[config_name][target][failure_rate] -> analysis dict
+        save_path: Optional directory path to save figure (PDF + PNG).
+        error_type: 'std' for standard deviation, 'sem' for standard error,
+            or 'none' to suppress error bands.
+        figsize: Override default figure size (width, height) in inches.
+        show_legend: Whether to display a legend on the first panel.
+
+    Returns:
+        matplotlib Figure object.
+    """
+    # --- extract structure ---
+    config_names = list(results.keys())[:1]
+    targets = list(results[config_names[0]].keys())
+    failure_rates = sorted(results[config_names[0]][targets[0]].keys())
+
+    n_configs = len(config_names)
+    n_targets = len(targets)
+
+    # --- colors matching the reference figure ---
+    pop_colors = {
+        'pv': '#CC00CC',   # magenta
+        'sst': '#00AA44',  # green
+        'gc': '#DDBB00',   # gold / yellow
+        'mc': '#AA0000',   # dark red
+    }
+    pop_markers = {'pv': 's', 'sst': '^', 'gc': 'o', 'mc': 'D'}
+    pop_labels = {'pv': 'PV', 'sst': 'SST', 'gc': 'GC', 'mc': 'MC'}
+
+    config_labels = {
+        'full_network': 'Full Network',
+        'blocked_exc_to_int': 'Block Exc$\\to$Int',
+    }
+
+    # --- populations to plot per target ---
+    pop_order = {
+        'pv': ['pv_nonexpr', 'sst', 'gc', 'mc'],
+        'sst': ['pv', 'sst_nonexpr', 'gc', 'mc'],
+    }
+
+    # --- layout ---
+    if figsize is None:
+        figsize = (4.0 * n_configs + 0.5, 3.5 * n_targets + 0.5)
+    fig, axes = plt.subplots(
+        n_targets, n_configs, figsize=figsize,
+        squeeze=False, sharex=True, sharey=True,
+    )
+
+    # Convert failure rates to fraction with functional opsins
+    # Assume constant expression_mean across failure rates
+    # (extract from first available result)
+    expression_mean = None
+    for config_name in config_names:
+        for target in targets:
+            for failure_rate in failure_rates:
+                # Try to get expression_mean from metadata if stored
+                # Otherwise infer from the experimental design (typically 0.5)
+                data = results[config_name][target].get(failure_rate, {})
+                if 'expression_mean' in data:
+                    expression_mean = data['expression_mean']
+                    break
+            if expression_mean is not None:
+                break
+        if expression_mean is not None:
+            break
+    
+    if expression_mean is None:
+        expression_mean = 0.8
+        logger.warning(f"Could not determine expression_mean from results, "
+                      f"assuming {expression_mean}")
+
+    # Calculate effective expression: (1 - failure_rate)
+    # This represents the fraction of cells with functional opsins
+    x_vals = np.array([(1.0 - fr) * 100.0 for fr in failure_rates])
+
+    for row_idx, target in enumerate(targets):
+        populations = pop_order.get(target, ['gc', 'mc', 'pv', 'sst'])
+
+        for col_idx, config_name in enumerate(config_names):
+            ax = axes[row_idx, col_idx]
+
+            for pop in populations:
+                # --- resolve data keys ---
+                is_nonexpr = pop.endswith('_nonexpr')
+                if is_nonexpr:
+                    base_pop = pop.replace('_nonexpr', '')
+                    excited_key = f'{base_pop}_nonexpr_excited'
+                    std_key = f'{base_pop}_nonexpr_excited_std'
+                    sem_key = f'{base_pop}_nonexpr_excited_sem'
+                    display_pop = base_pop
+                else:
+                    excited_key = f'{pop}_excited'
+                    std_key = f'{pop}_excited_std'
+                    sem_key = f'{pop}_excited_sem'
+                    display_pop = pop
+
+                # --- collect values across failure rates ---
+                y_vals = []
+                y_errs = []
+                for failure_rate in failure_rates:
+                    data = results[config_name][target].get(failure_rate, {})
+                    y_vals.append(data.get(excited_key, 0.0) * 100.0)
+
+                    if error_type == 'sem' and sem_key in data:
+                        y_errs.append(data[sem_key] * 100.0)
+                    elif error_type == 'std' and std_key in data:
+                        y_errs.append(data[std_key] * 100.0)
+                    else:
+                        y_errs.append(0.0)
+
+                y_vals = np.array(y_vals)
+                y_errs = np.array(y_errs)
+
+                color = pop_colors.get(display_pop, 'gray')
+                marker = pop_markers.get(display_pop, 'o')
+                label_suffix = ' (non-expr)' if is_nonexpr else ''
+                label = pop_labels.get(display_pop, display_pop.upper()) + label_suffix
+
+                # --- plot line + optional error band ---
+                ax.plot(
+                    x_vals, y_vals,
+                    color=color, marker=marker, markersize=5,
+                    linewidth=1.8, label=label, alpha=0.9,
+                )
+                if error_type != 'none' and np.any(y_errs > 0):
+                    ax.fill_between(
+                        x_vals, y_vals - y_errs, y_vals + y_errs,
+                        color=color, alpha=0.15,
+                    )
+
+            # --- formatting ---
+            ax.set_xlabel(r'Functional opsin expression (%)', fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(r'Fraction excited (%)', fontsize=10)
+
+            config_title = config_labels.get(config_name, config_name)
+            ax.set_title(
+                f'{target.upper()} stim - {config_title}',
+                fontsize=10, fontweight='bold',
+            )
+            ax.set_axisbelow(True)
+
+            if show_legend and row_idx == 0 and col_idx == 0:
+                ax.legend(fontsize=8, loc='best', framealpha=0.8)
+
+    fig.suptitle(
+        f'Fraction Excited vs. Opsin Expression\n'
+        f'(Expression mean = {expression_mean:.1%}, varying failure rate)',
+        fontsize=12, fontweight='bold',
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    if save_path:
+        save_dir = Path(save_path)
+        save_dir.mkdir(exist_ok=True, parents=True)
+        fig.savefig(
+            save_dir / 'failure_rate_overlay.pdf',
+            dpi=300, bbox_inches='tight',
+        )
+        fig.savefig(
+            save_dir / 'failure_rate_overlay.png',
+            dpi=300, bbox_inches='tight',
+        )
+        logger.info(f"Saved failure rate overlay plots to {save_dir}")
+
+    plt.show()
+    return fig
 
     
 def plot_expression_level_overlay(
@@ -1071,6 +1260,7 @@ def plot_expression_level_overlay(
 
     plt.show()
     return fig
+
 
 def plot_expression_level_results(
     results: Dict,
@@ -1655,6 +1845,48 @@ def cmd_plot_expression(args):
     
     return 0
 
+
+def cmd_plot_failure(args):
+    """
+    Handle failure rate plotting
+    
+    Plots how paradoxical excitation varies with opsin failure rate,
+    showing effective expression (accounting for failures) on x-axis
+    """
+    logger.info("="*80)
+    logger.info("Plotting failure rate dependence")
+    logger.info("="*80)
+    
+    # Load and validate results
+    try:
+        failure_results = load_results_with_validation(args.input, 'expression')
+    except Exception as e:
+        logger.error(f"Failed to load results: {e}")
+        return 1
+    
+    # Setup output directory
+    try:
+        output_dir = setup_output_directory(args.output)
+    except Exception as e:
+        logger.error(f"Failed to setup output directory: {e}")
+        return 1
+    
+    # Generate plot
+    logger.info("\nGenerating failure rate plots...")
+    
+    try:
+        plot_failure_rate_overlay(
+            failure_results,
+            save_path=str(output_dir)
+        )
+        logger.info(f"Saved to {output_dir}")
+    except Exception as e:
+        logger.error(f"Failed to plot failure rate results: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 1
+    
+    return 0
 
 def cmd_plot_combined(args):
     """
@@ -3141,6 +3373,29 @@ Examples:
                              action='store_true',
                             help='Export expression level data to CSV')
     parser_expr.set_defaults(func=cmd_plot_expression)
+
+    # ========== plot-failure ==========
+    parser_fail = subparsers.add_parser(
+        'plot-failure',
+        help='Plot failure rate dependence',
+        description='Plot how paradoxical excitation varies with opsin failure rate',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Plot failure rate results
+  %(prog)s failure_rate_results.pkl
+  
+  # Specify output directory
+  %(prog)s failure_rate_results.pkl -o failure_plots/
+  
+Note:
+  X-axis shows "functional opsin expression" = (1 - failure_rate) * expression_mean
+  This represents the fraction of cells with working opsins.
+    """
+)
+    parser_fail.add_argument('input',
+                             help='Failure rate results file (*.pkl)')
+    parser_fail.set_defaults(func=cmd_plot_failure)
     
     # ========== plot-combined ==========
     parser_comb = subparsers.add_parser(
