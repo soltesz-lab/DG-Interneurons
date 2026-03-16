@@ -118,8 +118,8 @@ configurable half-saturation and exponent. Key arguments:
 
 | Argument | Description | Default |
 |---|---|---|
-| `target_population` | `'pv'` or `'sst'` | — |
-| `light_intensity` | Normalized intensity (0–2+) | — |
+| `target_population` | `'pv'` or `'sst'` | -- |
+| `light_intensity` | Normalized intensity (0–2+) | -- |
 | `stim_start` | Pulse onset (ms) | 1500.0 |
 | `stim_duration` | Pulse duration (ms) | 1000.0 |
 | `mec_current` | External MEC drive (pA) | 40.0 |
@@ -256,8 +256,8 @@ comparisons:
 
 1. Opsin+ -> excited vs. suppressed (direct pathway)
 2. Opsin- -> excited vs. suppressed (indirect/disinhibitory pathway)
-3. Opsin+/opsin− difference -> excited cells
-4. Opsin+/opsin− difference -> suppressed cells
+3. Opsin+/opsin- difference -> excited cells
+4. Opsin+/opsin- difference -> suppressed cells
 
 ```python
 from nested_weights_analysis import analyze_weights_by_average_response_nested
