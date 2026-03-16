@@ -464,7 +464,7 @@ protocol/
 
 ## Key References
 
-- Hainmueller et al. (2026): paradoxical excitation in dentate gyrus
-- Pofahl et al. (2025): excitation-inhibition balance measurements
-- Savanthrapadian et al. (2014): interneuron connectivity parameters
-- GoodSmith et al. (2025): mossy cell and granule cell functional roles
+- Hainmueller et al. (2026): Paradoxical excitation in dentate gyrus
+- Pofahl et al. (2025): Excitation-inhibition balance measurements
+- Savanthrapadian et al. (2014): Interneuron connectivity parameters
+- GoodSmith et al. (2025): Mossy cell and granule cell functional roles in memory
