@@ -26,7 +26,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import logging
 import time
-import tqdm
 
 import h5py
 from hdf5_storage import (
@@ -3753,7 +3752,7 @@ def export_per_cell_weights_from_hdf5(
                             )
                             
                             # Generate rows for all cells in this trial
-                            for row in tqdm.tqdm(_generate_per_cell_rows_for_trial(
+                            for row in _generate_per_cell_rows_for_trial(
                                 trial_data=trial_data,
                                 circuit=experiment.circuit,
                                 connectivity_idx=conn_idx,
@@ -3768,7 +3767,7 @@ def export_per_cell_weights_from_hdf5(
                                 source_populations=source_populations,
                                 post_populations=post_populations,
                                 opsin_expression=opsin_expression,
-                            )):
+                            ):
                                 row_batch.append(row)
                                 n_rows += 1
 

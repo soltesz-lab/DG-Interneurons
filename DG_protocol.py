@@ -33,6 +33,7 @@ from DG_circuit_dendritic_somatic_transfer import (
     OpsinParams
 )
 from optogenetic_experiment import (
+    CurrentRecordingConfig,
     OptogeneticExperiment
     )
 from ablation_tests import (
@@ -1355,7 +1356,7 @@ def _run_paired_failure_rate_condition(
     n_conn = len(connectivity_seeds)
     per_conn_analyses = []
     
-    for conn_idx, conn_seed in enumerate(connectivity_seeds):
+    for conn_idx, conn_seed in enumerate(connectivity_seeds[:2]):
         logger.info(
             f"      {condition_label} conn {conn_idx + 1}/{n_conn} "
             f"(seed={conn_seed}), failure_rate={opsin_params.failure_rate:.2f}"
@@ -1378,7 +1379,7 @@ def _run_paired_failure_rate_condition(
             light_intensity=intensity,
             stim_start=stim_start,
             stim_duration=stim_duration,
-            plot_activity=False,
+            plot_activity=True,
             mec_current=mec_current,
             opsin_current=opsin_current,
             n_trials=1,
@@ -1412,7 +1413,7 @@ def test_opsin_failure_rates(
     opsin_current: float = 100.0,
     stim_start: float = 1500.0,
     stim_duration: float = 1000.0,
-    warmup: float = 500.0,
+    warmup: float = 250.0,
     device: Optional[torch.device] = None,
     n_trials: int = 3,  # Ignored in paired mode
     base_seed: int = 42,  # Ignored in paired mode
@@ -1562,6 +1563,7 @@ def test_opsin_failure_rates(
                         **optogenetic_experiment_kwargs,
                     )
                     analysis['failure_rate'] = failure_rate
+                    analysis['expression_mean'] = expression_mean
                     results[config_name][target][failure_rate] = analysis
                 
                 # ---- unpaired branch ----
@@ -1593,7 +1595,10 @@ def test_opsin_failure_rates(
                     stim_mask = (time >= stim_start) & (
                         time <= (stim_start + stim_duration))
                     
-                    analysis = {'failure_rate': failure_rate}
+                    analysis = {'failure_rate': failure_rate,
+                                'expression_mean': expression_mean,
+                                }
+
                     
                     for pop in ['gc', 'mc', 'pv', 'sst']:
                         if pop == target:
@@ -3630,7 +3635,7 @@ For detailed analysis options, see: python DG_analysis.py --help
         
         experiment, results, conn_analysis, cond_analysis = run_comparative_experiment(
             optimization_json_file=args.optimization_file,
-            intensities=[0.5, 1.0, 1.5],
+            intensities=[1.5],
             mec_current=args.mec_current,
             opsin_current=args.opsin_current,
             device=device,
@@ -3743,7 +3748,7 @@ For detailed analysis options, see: python DG_analysis.py --help
             device=device,
             n_trials=args.n_trials,
             base_seed=args.base_seed,
-            include_ablations=True,
+            include_ablations=False,
             save_results_file=str(failure_output / "failure_rate_results.pkl"),
             nested_experiment_file=args.nested_file,
             # Forward time-varying MEC arguments if enabled

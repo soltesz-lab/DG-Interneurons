@@ -1543,10 +1543,13 @@ def _analyze_ablation_trial(
 
             if n_nonexpr > 0:
                 change_nonexpr = rate_change[non_stim_idx]
-                baseline_std_nonexpr = torch.std(baseline_rate[non_stim_idx])
+                print(f"{pop} change_nonexpr = {change_nonexpr}")
+                baseline_std_nonexpr = torch.std(baseline_rate[non_stim_idx], dim=0)
+                print(f"{pop} baseline_std_nonexpr = {baseline_std_nonexpr}")
                 excited_nonexpr = torch.mean(
                     (change_nonexpr > baseline_std_nonexpr).float()
                 ).item()
+                print(f"{pop} excited_nonexpr vector = {(change_nonexpr > baseline_std_nonexpr).float().tolist()}")
                 analysis[f'{pop}_nonexpr_excited'] = excited_nonexpr
                 analysis[f'{pop}_nonexpr_mean_change'] = torch.mean(change_nonexpr).item()
                 analysis[f'{pop}_nonexpr_count'] = n_nonexpr
